@@ -25,3 +25,9 @@ zbus.workspace = true
 # The integration test serves a fake daemon on its own runtime thread.
 tempfile.workspace = true
 tokio.workspace = true
+
+# cargo binstall: use the archives the release workflow publishes.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/gpaperd-v{ version }-{ target-arch }-linux-gnu.tar.gz"
+bin-dir = "gpaperd-v{ version }-{ target-arch }-linux-gnu/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

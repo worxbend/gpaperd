@@ -1,0 +1,88 @@
+name: Release
+
+# Builds gpaperd and gpaperctl for each architecture when a version tag is
+# pushed, and publishes them as a GitHub release. scripts/install.sh and
+# cargo-binstall download these archives.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libglib2.0-dev libseccomp-dev libfontconfig-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Check the tag matches the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            sed -n 's/.*"name":"gpaperd-daemon","version":"\([^"]*\)".*/\1/p')
+          test "v$version" = "$GITHUB_REF_NAME" ||
+            { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      - name: Build
+        run: cargo build --release --locked -p gpaperd-daemon -p gpaperd-ctl
+      - name: Package
+        run: |
+          name="gpaperd-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux-gnu"
+          mkdir -p "pkg/$name"
+          install -m755 target/release/gpaperd target/release/gpaperctl "pkg/$name/"
+          strip "pkg/$name/gpaperd" "pkg/$name/gpaperctl"
+          cp -r dist README.md LICENSE-MIT LICENSE-APACHE "pkg/$name/"
+          cp -r docs "pkg/$name/"
+          tar -C pkg -czf "$name.tar.gz" "$name"
+          "pkg/$name/gpaperd" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpaperd-${{ matrix.arch }}
+          path: gpaperd-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        working-directory: assets
+        run: sha256sum gpaperd-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      # Versions before 1.0 are pre-releases. A release made by hand for this
+      # tag gets the built archives added.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$GITHUB_REF_NAME" in v0.*) prerelease=(--prerelease) ;; esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* "${prerelease[@]}" \
+              --title "gpaperd ${GITHUB_REF_NAME#v}" --generate-notes
+          fi

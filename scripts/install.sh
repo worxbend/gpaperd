@@ -1,0 +1,241 @@
+#!/bin/sh
+# Installs gpaperd and gpaperctl from a GitHub release.
+#
+#   curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --version v0.1.1 --no-start
+#
+# Everything goes into your home directory; no root is needed:
+#   ~/.local/bin/{gpaperd,gpaperctl}           (--prefix changes ~/.local)
+#   ~/.local/share/man/man{1,5}/                man pages
+#   ~/.config/systemd/user/gpaperd.service      user unit
+#   ~/.config/gpaperd/config.toml               starter config, only if absent
+#
+# Run with --help for the options.
+set -eu
+
+repo="worxbend/gpaperd"
+version=""
+prefix="$HOME/.local"
+start="auto"
+action="install"
+purge=0
+
+usage() {
+    cat <<'EOF'
+Usage: install.sh [options]
+
+  --version TAG   install this release, e.g. v0.1.1 (default: the newest)
+  --prefix DIR    install binaries to DIR/bin, man pages to DIR/share/man
+                  (default: ~/.local)
+  --start         enable and start the user unit even outside GNOME
+  --no-start      install only; do not enable or start the unit
+  --uninstall     stop the unit and remove what this script installed;
+                  config, state and cache stay
+  --purge         with --uninstall: also remove config, state, slots, cache
+  -h, --help      show this help
+EOF
+}
+
+say() { printf '%s\n' "gpaperd: $*"; }
+warn() { printf '%s\n' "gpaperd: warning: $*" >&2; }
+die() {
+    printf '%s\n' "gpaperd: error: $*" >&2
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --version)
+        [ $# -ge 2 ] || die "--version needs a tag"
+        version=$2
+        shift 2
+        ;;
+    --prefix)
+        [ $# -ge 2 ] || die "--prefix needs a directory"
+        prefix=$2
+        shift 2
+        ;;
+    --start) start="yes"; shift ;;
+    --no-start) start="no"; shift ;;
+    --uninstall) action="uninstall"; shift ;;
+    --purge) purge=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) die "unknown option: $1 (see --help)" ;;
+    esac
+done
+
+[ "$(id -u)" -ne 0 ] || die "run this as your own user, not as root: gpaperd is a per-user service"
+
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+state_home=${XDG_STATE_HOME:-$HOME/.local/state}
+cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+bin_dir="$prefix/bin"
+man_dir="$prefix/share/man"
+unit_dir="$config_home/systemd/user"
+unit="$unit_dir/gpaperd.service"
+
+has() { command -v "$1" >/dev/null 2>&1; }
+have_systemd() { has systemctl && systemctl --user show-environment >/dev/null 2>&1; }
+
+in_gnome() {
+    case ":${XDG_CURRENT_DESKTOP:-}:" in
+    *:GNOME:*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+uninstall() {
+    if [ -x "$bin_dir/gpaperctl" ] && "$bin_dir/gpaperctl" status >/dev/null 2>&1; then
+        say "putting your original wallpaper back (gpaperctl restore)"
+        "$bin_dir/gpaperctl" restore || warn "gpaperctl restore failed"
+    fi
+    if have_systemd; then
+        systemctl --user disable --now gpaperd.service >/dev/null 2>&1 || true
+    fi
+    rm -f "$unit" "$bin_dir/gpaperd" "$bin_dir/gpaperctl" \
+        "$man_dir/man1/gpaperd.1" "$man_dir/man1/gpaperctl.1" "$man_dir/man5/gpaperd.toml.5"
+    if have_systemd; then systemctl --user daemon-reload || true; fi
+    if [ "$purge" -eq 1 ]; then
+        rm -rf "$config_home/gpaperd" "$data_home/gpaperd" "$state_home/gpaperd" "$cache_home/gpaperd"
+        say "removed gpaperd, its config, state, slots and cache"
+    else
+        say "removed gpaperd; config ($config_home/gpaperd) and state stay (use --purge to remove them)"
+    fi
+}
+
+if [ "$action" = "uninstall" ]; then
+    uninstall
+    exit 0
+fi
+
+# --- download ---------------------------------------------------------------
+
+case "$(uname -m)" in
+x86_64 | amd64) arch="x86_64" ;;
+aarch64 | arm64) arch="aarch64" ;;
+*) die "no release build for $(uname -m); build from source: cargo install --git https://github.com/$repo --locked gpaperd-daemon gpaperd-ctl" ;;
+esac
+[ "$(uname -s)" = "Linux" ] || die "gpaperd runs on Linux only"
+
+if has curl; then
+    fetch() { curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
+    fetch_text() { curl --proto '=https' --tlsv1.2 -fsSL "$1"; }
+elif has wget; then
+    fetch() { wget -q --https-only -O "$2" "$1"; }
+    fetch_text() { wget -q --https-only -O - "$1"; }
+else
+    die "curl or wget is needed"
+fi
+for tool in tar sha256sum; do
+    has "$tool" || die "$tool is needed"
+done
+
+if [ -z "$version" ]; then
+    # The newest release, pre-releases included (gpaperd is still 0.x).
+    version=$(fetch_text "https://api.github.com/repos/$repo/releases?per_page=1" |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    [ -n "$version" ] || die "could not find the newest release of $repo"
+fi
+case "$version" in v*) ;; *) version="v$version" ;; esac
+
+name="gpaperd-$version-$arch-linux-gnu"
+base="https://github.com/$repo/releases/download/$version"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+
+say "downloading $name"
+fetch "$base/$name.tar.gz" "$work/$name.tar.gz" ||
+    die "no $arch build in release $version (see https://github.com/$repo/releases)"
+fetch "$base/SHA256SUMS" "$work/SHA256SUMS" || die "release $version has no SHA256SUMS"
+(cd "$work" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c --status) ||
+    die "checksum mismatch for $name.tar.gz"
+tar -C "$work" -xzf "$work/$name.tar.gz"
+src="$work/$name"
+
+# --- install ----------------------------------------------------------------
+
+was_running=0
+if have_systemd && systemctl --user is-active --quiet gpaperd.service; then
+    was_running=1
+fi
+
+mkdir -p "$bin_dir" "$man_dir/man1" "$man_dir/man5" "$unit_dir"
+# A fresh name then rename, so a running gpaperd keeps its old file.
+for bin in gpaperd gpaperctl; do
+    cp "$src/$bin" "$bin_dir/.$bin.new"
+    chmod 755 "$bin_dir/.$bin.new"
+    mv -f "$bin_dir/.$bin.new" "$bin_dir/$bin"
+done
+cp "$src/dist/man/gpaperd.1" "$src/dist/man/gpaperctl.1" "$man_dir/man1/"
+cp "$src/dist/man/gpaperd.toml.5" "$man_dir/man5/"
+sed "s|^ExecStart=.*|ExecStart=$bin_dir/gpaperd|" "$src/dist/gpaperd.service" >"$unit"
+say "installed $("$bin_dir/gpaperd" --version) to $bin_dir"
+
+mkdir -p "$config_home/gpaperd"
+cp "$src/dist/config.example.toml" "$config_home/gpaperd/config.example.toml"
+if [ ! -e "$config_home/gpaperd/config.toml" ]; then
+    cat >"$config_home/gpaperd/config.toml" <<'EOF'
+# gpaperd config. Every key: man 5 gpaperd.toml, or config.example.toml here.
+# Edits apply while gpaperd runs; `gpaperd check-config` validates this file.
+
+[general]
+interval = "15m"        # 1m ..= 1h
+order = "random"        # or "alphabetical"
+
+[light]
+sources = ["~/Pictures/Wallpapers/light"]
+
+[dark]
+sources = ["~/Pictures/Wallpapers/dark"]
+EOF
+    mkdir -p "$HOME/Pictures/Wallpapers/light" "$HOME/Pictures/Wallpapers/dark"
+    say "wrote a starter config: $config_home/gpaperd/config.toml"
+    say "put images into ~/Pictures/Wallpapers/light and ~/Pictures/Wallpapers/dark"
+else
+    say "kept your config: $config_home/gpaperd/config.toml"
+fi
+
+# --- checks -----------------------------------------------------------------
+
+missing=$(ldd "$bin_dir/gpaperd" 2>/dev/null | sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' | tr '\n' ' ')
+[ -z "$missing" ] || warn "missing shared libraries: $missing(install GLib, libseccomp and fontconfig from your distribution)"
+has bwrap || warn "bwrap (bubblewrap) is not installed: images are checked by their magic bytes only"
+loaders=0
+for dir in /usr/lib/glycin-loaders /usr/lib64/glycin-loaders /usr/libexec/glycin-loaders /usr/lib/*/glycin-loaders; do
+    [ -d "$dir" ] && loaders=1
+done
+if [ "$loaders" -eq 0 ]; then
+    warn "no glycin loaders found (package glycin-loaders): images are checked by their magic bytes only"
+fi
+case ":$PATH:" in
+*":$bin_dir:"*) ;;
+*) warn "$bin_dir is not on your PATH; add it to use gpaperctl" ;;
+esac
+"$bin_dir/gpaperd" --config "$config_home/gpaperd/config.toml" check-config >/dev/null ||
+    warn "your config has errors: run gpaperd check-config"
+
+# --- start ------------------------------------------------------------------
+
+if ! have_systemd; then
+    warn "no systemd user manager here: start gpaperd yourself inside your GNOME session"
+    exit 0
+fi
+systemctl --user daemon-reload
+if [ "$start" = "auto" ]; then
+    if in_gnome; then start="yes"; else start="no"; fi
+    [ "$start" = "yes" ] || say "not a GNOME session (XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-unset}): the unit is installed but not started"
+fi
+if [ "$start" = "yes" ]; then
+    systemctl --user enable gpaperd.service >/dev/null 2>&1
+    if [ "$was_running" -eq 1 ]; then
+        systemctl --user restart gpaperd.service
+        say "restarted gpaperd"
+    else
+        systemctl --user start gpaperd.service
+        say "started gpaperd; it starts with every GNOME login from now on"
+    fi
+    say "check it: gpaperctl status   logs: journalctl --user -u gpaperd -f"
+else
+    say "to start it: systemctl --user enable --now gpaperd.service"
+fi

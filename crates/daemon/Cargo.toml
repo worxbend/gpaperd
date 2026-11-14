@@ -48,3 +48,9 @@ zbus.workspace = true
 gpaperd-ctl.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true
+
+# cargo binstall: use the archives the release workflow publishes.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/gpaperd-v{ version }-{ target-arch }-linux-gnu.tar.gz"
+bin-dir = "gpaperd-v{ version }-{ target-arch }-linux-gnu/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

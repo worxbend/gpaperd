@@ -145,8 +145,9 @@ pub struct Daemon<'a> {
     replied_in_step: BTreeSet<u64>,
     /// Whether the step in progress saves the state.
     saved_in_step: bool,
-    /// The styles whose `Previous` the step in progress replied to: a probe
-    /// after that reply starts a rotation of its own.
+    /// The styles whose `Previous` the step in progress replies to: the walk
+    /// is over, so any probe of the step starts a rotation of its own. The
+    /// refill of a lost slot comes before the reply.
     walks_ended: PerStyle<bool>,
     /// The id of the next control request.
     next_request: u64,
@@ -289,9 +290,10 @@ impl<'a> Daemon<'a> {
             let is_locked_elsewhere = self.locked[style] && !names_slot;
             self.disabled[style] = self.key(style).is_none() || is_locked_elsewhere;
             let was_taken = mem::take(&mut self.taken[style]);
-            // A lock or a missing key replaces the pause, and a key that
-            // names the slot again ends it.
-            self.taken[style] = was_taken && !self.disabled[style] && !names_slot;
+            // A missing key ends the pause, and so does a key that names the
+            // slot again. A lock elsewhere only holds it: the pause waits
+            // under the lock, is saved, and holds again once it is lifted.
+            self.taken[style] = was_taken && self.key(style).is_some() && !names_slot;
             // The slot URI counts as the daemon's own write when the key is
             // locked on it, when the last run was paused by an external
             // change, and when the user paused it with the key on the slot.
@@ -988,7 +990,16 @@ impl<'a> Daemon<'a> {
                 _ => None,
             })
             .collect();
-        self.walks_ended = PerStyle::default();
+        self.walks_ended = PerStyle::from_fn(|style| {
+            let ends_walk = |id: &u64| {
+                self.stepping_back.contains(id)
+                    && self
+                        .waiting
+                        .get(id)
+                        .is_some_and(|styles| styles.contains(&style))
+            };
+            self.replied_in_step.iter().any(ends_walk)
+        });
         self.saved_in_step = effects.contains(&Effect::Persist);
         for effect in &effects {
             self.check(&event, effect)?;
@@ -1165,11 +1176,7 @@ impl<'a> Daemon<'a> {
             Effect::Reply { id, .. } => {
                 let waited = self.waiting.remove(&id.0);
                 prop_assert!(waited.is_some(), "a second reply, or one nobody asked for");
-                if self.stepping_back.remove(&id.0) {
-                    for style in waited.into_iter().flatten() {
-                        self.walks_ended[style] = true;
-                    }
-                }
+                self.stepping_back.remove(&id.0);
             }
             Effect::RestoreKeys { id, keys } => {
                 let is_restore = matches!(

@@ -52,6 +52,24 @@ every slide's texture, and the order is fixed when the file is generated.
 
 ## Install
 
+The [user guide](docs/USER_GUIDE.md) walks through installing, starting,
+configuring and removing gpaperd.
+
+Quick install from the newest GitHub release (x86_64 or aarch64, glibc 2.39+;
+no root needed):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh
+```
+
+It puts `gpaperd` and `gpaperctl` in `~/.local/bin`, installs the man pages
+and the user unit, writes a starter config if you have none, and starts the
+unit in a GNOME session. `sh install.sh --help` lists the options, including
+`--uninstall`. `cargo binstall --git https://github.com/worxbend/gpaperd
+gpaperd-daemon gpaperd-ctl` downloads the same archives.
+
+### From source
+
 Build dependencies: a Rust toolchain with edition 2024 (developed on
 1.99.1), `pkg-config`, and the development files for GLib/GIO, libseccomp
 and fontconfig. On Debian or Ubuntu:
@@ -262,7 +280,12 @@ network changes are not covered: they need privileges or a real session.
 
 Workspace: `crates/core` (pure state machine), `crates/daemon` (adapters,
 binary `gpaperd`), `crates/ctl` (binary `gpaperctl`), `dist/` (unit, example
-config, man pages).
+config, man pages), `docs/` (user guide), `scripts/install.sh` (installer).
+
+Releases: push a tag `vX.Y.Z` that matches the workspace version.
+`.github/workflows/release.yml` builds x86_64 and aarch64 archives, writes
+`SHA256SUMS` and publishes the GitHub release that `install.sh` and
+cargo-binstall download from.
 
 ## License
 
