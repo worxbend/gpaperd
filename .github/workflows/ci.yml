@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the workspace is developed with.
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Licences, advisories, bans and sources, as configured in deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # GLib/GIO for GSettings, libseccomp and fontconfig for glycin;
+      # dbus-daemon for the control tests, groff for the man page check.
+      # glycin's loaders are not packaged here: the image checks fall back to
+      # magic bytes, and the tests assert that fallback.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libglib2.0-dev libglib2.0-bin libseccomp-dev \
+            libfontconfig-dev dbus groff-base shellcheck
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+      # A runaway test must hit a cap, not the runner's memory: 8 GiB of
+      # address space and 15 minutes.
+      - name: Test
+        run: |
+          ulimit -v 8388608
+          timeout 900 cargo test --workspace --locked
+      - name: Docs match the code
+        run: .github/scripts/check-docs.sh target/debug
+      - name: Shell scripts
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh')
+          if (( ${#scripts[@]} > 0 )); then shellcheck "${scripts[@]}"; fi

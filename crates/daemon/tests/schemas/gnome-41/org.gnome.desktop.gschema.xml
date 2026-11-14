@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The schemas as GNOME 41 shipped them: no picture-uri-dark and no
+  color-scheme. Both keys arrived in GNOME 42.
+-->
+<schemalist>
+  <enum id="org.gnome.desktop.GDesktopBackgroundStyle">
+    <value nick="none" value="0"/>
+    <value nick="wallpaper" value="1"/>
+    <value nick="centered" value="2"/>
+    <value nick="scaled" value="3"/>
+    <value nick="stretched" value="4"/>
+    <value nick="zoom" value="5"/>
+    <value nick="spanned" value="6"/>
+  </enum>
+  <schema id="org.gnome.desktop.background" path="/org/gnome/desktop/background/">
+    <key name="picture-options" enum="org.gnome.desktop.GDesktopBackgroundStyle">
+      <default>'zoom'</default>
+    </key>
+    <key name="picture-uri" type="s">
+      <default>'file:///schema-default/light.png'</default>
+    </key>
+  </schema>
+  <schema id="org.gnome.desktop.interface" path="/org/gnome/desktop/interface/">
+    <key name="gtk-theme" type="s">
+      <default>'Adwaita'</default>
+    </key>
+  </schema>
+</schemalist>

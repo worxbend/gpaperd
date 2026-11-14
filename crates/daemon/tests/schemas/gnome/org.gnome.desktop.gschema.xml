@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The part of the GNOME 42+ desktop schemas that gpaperd uses.
+  The URI defaults differ from the real ones, so a test that reads them
+  proves it is not reading the system schema.
+-->
+<schemalist>
+  <enum id="org.gnome.desktop.GDesktopBackgroundStyle">
+    <value nick="none" value="0"/>
+    <value nick="wallpaper" value="1"/>
+    <value nick="centered" value="2"/>
+    <value nick="scaled" value="3"/>
+    <value nick="stretched" value="4"/>
+    <value nick="zoom" value="5"/>
+    <value nick="spanned" value="6"/>
+  </enum>
+  <enum id="org.gnome.desktop.GDesktopColorScheme">
+    <value nick="default" value="0"/>
+    <value nick="prefer-dark" value="1"/>
+    <value nick="prefer-light" value="2"/>
+  </enum>
+  <schema id="org.gnome.desktop.background" path="/org/gnome/desktop/background/">
+    <key name="picture-options" enum="org.gnome.desktop.GDesktopBackgroundStyle">
+      <default>'zoom'</default>
+    </key>
+    <key name="picture-uri" type="s">
+      <default>'file:///schema-default/light.png'</default>
+    </key>
+    <key name="picture-uri-dark" type="s">
+      <default>'file:///schema-default/dark.png'</default>
+    </key>
+  </schema>
+  <schema id="org.gnome.desktop.interface" path="/org/gnome/desktop/interface/">
+    <key name="color-scheme" enum="org.gnome.desktop.GDesktopColorScheme">
+      <default>'default'</default>
+    </key>
+  </schema>
+</schemalist>

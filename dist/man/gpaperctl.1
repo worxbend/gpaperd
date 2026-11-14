@@ -1,0 +1,120 @@
+.TH GPAPERCTL 1 2026-11-14 "gpaperd 0.1.0" "User Commands"
+.SH NAME
+gpaperctl \- control a running gpaperd
+.SH SYNOPSIS
+.B gpaperctl
+.RB ( next | previous | pause | resume )
+.RB [ \-\-style
+.IR STYLE ]
+.br
+.B gpaperctl
+.RB ( reload | refresh | restore )
+.br
+.B gpaperctl status
+.RB [ \-\-json ]
+.SH DESCRIPTION
+.B gpaperctl
+sends one command to
+.BR gpaperd (1)
+over the session bus, at the name and interface
+.BR io.github.worxbend.Gpaperd1 ,
+object
+.BR /io/github/worxbend/Gpaperd1 ,
+and waits for the answer.
+.SH COMMANDS
+.TP
+.B next
+Rotate now.
+.TP
+.B previous
+Show the previous image again.
+Each style remembers the last 20 images it showed.
+.TP
+.B pause
+Stop the timer of a style.
+The pause is saved and survives a restart of the daemon.
+.TP
+.B resume
+End a pause by
+.B gpaperctl
+and a pause that an external key change caused; that key is written back.
+A style whose change is overdue rotates at once; any other keeps its
+deadline.
+.TP
+.B reload
+Read the config file again and apply it.
+An invalid file is refused with its line and column, and the running config
+stays.
+.TP
+.B refresh
+Revalidate every remote image now.
+.TP
+.B restore
+Write back the background keys the user had before
+.B gpaperd
+first wrote them, and pause both styles.
+.B resume
+hands the keys back to
+.BR gpaperd .
+Fails when no original keys are saved.
+.TP
+.B status
+Print the style on screen, the next change in local time, and for each
+style the image in its slot, its catalog size, its usable and bad images,
+and why it is paused.
+A remote image is shown by its URL without credentials and without the
+query string.
+.SH OPTIONS
+.TP
+.BI \-\-style " STYLE"
+The style a command acts on:
+.BR light ,
+.BR dark ,
+.B visible
+(the style on screen, the default) or
+.BR both .
+.TP
+.B \-\-json
+.RB ( status )
+Print the daemon's JSON document as it is sent:
+.BR version ,
+.BR visible ,
+.B next_change
+(Unix seconds or null), and per style
+.BR current ,
+.BR paused ,
+.BR items ,
+.B usable
+and
+.BR bad .
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+The daemon carried out the command.
+.TP
+.B 1
+The daemon is not running or did not answer, the session bus cannot be
+reached, the reload was refused, or the daemon reported an error.
+The reason goes to stderr.
+.TP
+.B 2
+A usage error, such as an unknown command or style.
+.SH EXAMPLES
+.RS
+.EX
+gpaperctl next \-\-style both
+gpaperctl pause \-\-style dark
+gpaperctl status
+gpaperctl status \-\-json | jq .styles.light.current
+.EE
+.RE
+.SH SEE ALSO
+.BR gpaperd (1),
+.BR gpaperd.toml (5),
+.BR busctl (1)

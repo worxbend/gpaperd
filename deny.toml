@@ -1,0 +1,55 @@
+# cargo-deny configuration. Run: cargo deny check
+# CI runs the same command (.github/workflows/ci.yml).
+
+[graph]
+# gpaperd runs on Linux only: the Windows and macOS crates in Cargo.lock
+# are never built, so their licences and advisories do not apply.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+# Any advisory that applies fails the check, unmaintained and unsound
+# crates included. Add an `ignore` entry with a reason only after reading it.
+yanked = "deny"
+ignore = [
+    # Unmaintained, no fix: each comes in through glycin 4.0.5, the latest
+    # release, which still uses zbus 5. Drop these when glycin moves on.
+    { id = "RUSTSEC-2024-0436", reason = "paste, a proc macro of glycin-common and gufo-common" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5, merged into zbus 6; used by glycin" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 4, merged into zbus 6; used by glycin" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5, merged into zbus 6; used by glycin" },
+]
+
+[licenses]
+# Permissive licences, plus MPL-2.0 for glycin (MPL-2.0 OR LGPL-2.1-or-later).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# The workspace crates are `publish = false` and carry no licence field.
+ignore = true
+
+[bans]
+# glycin still pulls zbus 5 next to our zbus 6: report duplicates, do not
+# fail on them.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

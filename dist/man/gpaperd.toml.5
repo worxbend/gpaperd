@@ -1,0 +1,246 @@
+.TH GPAPERD.TOML 5 2026-11-14 "gpaperd 0.1.0" "File Formats"
+.SH NAME
+gpaperd.toml \- gpaperd configuration file
+.SH SYNOPSIS
+.I $XDG_CONFIG_HOME/gpaperd/config.toml
+.SH DESCRIPTION
+.BR gpaperd (1)
+reads one TOML file, by default
+.I ~/.config/gpaperd/config.toml
+(override with
+.BR \-\-config ).
+The tables
+.BR [general] ,
+.B [light]
+and
+.B [dark]
+are all optional, and so is every key.
+An unknown table or key is an error.
+Every error names the line and column of the offending key or value.
+.PP
+The daemon applies an edit while it runs, including an edit through a
+symlink into a dotfiles repository; relative paths resolve against the
+directory of the real file, every symlink followed.
+An invalid edit is logged and the running config stays.
+A missing file at start is not an error: the daemon idles until it appears.
+An invalid file at start ends the daemon with exit status 78.
+.PP
+Check a file without a running daemon with
+.BR "gpaperd check\-config" .
+A commented example ships as
+.IR dist/config.example.toml .
+.SH [general]
+.TP
+.BR interval " = \(dq15m\(dq"
+Time between two changes of the style on screen, as a duration such as
+.BR 90s ,
+.B 15m
+or
+.BR 1h ,
+from 1 minute to 1 hour inclusive.
+.TP
+.BR order " = \(dqrandom\(dq"
+.B random
+is a shuffle bag: every image once per round, in a fresh order, and a new
+round never starts with the image on screen.
+.B alphabetical
+is a natural, case-insensitive sort on the file name (a URL's last path
+segment); after a deleted image it goes on with the next name.
+.TP
+.BR picture_options " = unset"
+One of
+.BR wallpaper ,
+.BR centered ,
+.BR scaled ,
+.BR stretched ,
+.B zoom
+or
+.BR spanned ,
+written to GNOME's
+.B picture\-options
+key.
+Unset leaves the key alone, except that
+.B none
+(which shows no image) is turned into
+.BR zoom .
+.B none
+is refused here.
+.TP
+.BR on_external_change " = \(dqpause\(dq"
+What happens when something else changes a style's background key, for
+example a wallpaper picked in Settings.
+.B pause
+stops that style until
+.BR "gpaperctl resume" ,
+a config reload, or the key points at
+.B gpaperd
+again.
+.B reassert\-next\-tick
+writes the key back at the next change.
+.B reassert\-now
+writes it back after 1 second; more than 3 changes within a minute mean
+another tool is fighting over the key, and the style pauses.
+.TP
+.BR rotate_hidden " = false"
+Rotate the style that is not on screen too.
+When false its slot keeps the last image it showed, and its interval counts
+only the time it is on screen.
+.TP
+.BR empty_style " = \(dquse\-other\-style\(dq"
+What a style without any usable image shows.
+.B use\-other\-style
+gives it the other style's current image;
+.B keep\-current
+leaves its slot as it is.
+.TP
+.BR remote_refresh " = \(dqstartup\(dq"
+When cached remote images are checked for a new version.
+.B startup
+once per daemon start;
+a duration of at least 1 hour, such as
+.BR 24h ,
+at start and then that often;
+.B never
+downloads only what is not cached.
+.TP
+.BR link " = true"
+Fill a slot by hardlink, else reflink, else copy.
+.B false
+always copies, so editing an original in place never changes the desktop.
+.TP
+.BR apply_mode " = \(dqslots\(dq"
+.B slots
+points the background keys at two slot files once and rotates by replacing
+the files.
+.B uri
+writes each image's own
+.B file://
+URI to the keys instead: the fallback for a GNOME release that does not
+reload a replaced slot file.
+.TP
+.BR max_pixels " = 100_000_000"
+Skip images whose width times height is larger.
+A whole number greater than zero.
+.TP
+.BR pause_when_locked " = false"
+Stop the timers of both styles while the screen is locked, as
+.B org.gnome.ScreenSaver
+reports it on the session bus.
+A change that fell due meanwhile happens at unlock.
+A session without that service is no error: the daemon logs it once and
+keeps listening.
+.SH [light] AND [dark]
+.TP
+.B interval
+.TQ
+.B order
+Override the
+.B [general]
+value for this style.
+.TP
+.BR sources " = []"
+A list of sources, in any mix.
+A style with no sources is valid; see
+.BR empty_style .
+.SH SOURCES
+A plain string is classified by its prefix:
+.TP
+.B http://\fR...\fP, https://\fR...\fP
+A remote image, downloaded into
+.IR $XDG_CACHE_HOME/gpaperd/remote .
+A cached copy is shown at once, even offline, and revalidated in the
+background.
+.TP
+.B file://\fR...\fP
+A percent-decoded absolute path on this machine.
+.TP
+.I anything else
+A path. Whether it is a directory or a file is decided when it is scanned,
+so a path that does not exist yet is not an error; its images join when it
+appears.
+.PP
+Any other
+.B scheme://
+is an error. A table gives options:
+.TP
+.B { dir = \(dq\fIpath\fP\(dq }
+A directory, with the optional keys
+.B recursive
+(false; descend up to 16 levels),
+.B hidden
+(false; include names starting with a dot),
+.B follow_symlinks
+(true) and
+.B poll
+(unset; a period of at least 1 second, for a file system where inotify does
+not see changes).
+NFS, CIFS, SMB2 and FUSE file systems are polled every 5 minutes without it.
+.TP
+.B { file = \(dq\fIpath\fP\(dq }
+One file, taken whatever its name.
+.TP
+.B { url = \(dq\fIurl\fP\(dq }
+A remote image.
+.PP
+In a directory, files count by extension:
+.BR jpg ,
+.BR jpeg ,
+.BR png ,
+.BR webp ,
+.BR jxl ,
+.BR avif ,
+.BR heic ,
+.BR heif ,
+.BR tif ,
+.BR tiff ,
+.BR bmp ,
+.B gif
+and
+.BR qoi ,
+in any case.
+Each image is still checked before use, by its magic bytes and a decode in
+glycin's sandbox.
+A file reached through two sources, a symlink or a hardlink counts once.
+.SH PATHS
+A leading
+.B \(ti
+becomes
+.BR $HOME .
+.B $VAR
+and
+.B ${VAR}
+are expanded from the environment, and an undefined variable is an error.
+A relative path resolves against the directory of the real config file.
+A
+.B $
+that starts no name stands for itself.
+Write a path that holds a literal
+.B $NAME
+as a
+.B file://
+URI.
+.SH EXAMPLE
+.EX
+[general]
+interval = "15m"
+order = "random"
+pause_when_locked = true
+
+[light]
+sources = [
+  "\(ti/Pictures/Wallpapers/light",
+  { dir = "\(ti/Pictures/Wallpapers/shared", recursive = true },
+  "https://example.com/wallpapers/dawn.jpg",
+]
+
+[dark]
+interval = "30m"
+order = "alphabetical"
+sources = [
+  { dir = "/mnt/nas/wallpapers/dark", poll = "5m" },
+  "file:///srv/wall/aurora%20night.png",
+]
+.EE
+.SH SEE ALSO
+.BR gpaperd (1),
+.BR gpaperctl (1)

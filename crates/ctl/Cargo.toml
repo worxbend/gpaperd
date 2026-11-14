@@ -1,0 +1,27 @@
+[package]
+name = "gpaperd-ctl"
+description = "gpaperctl: command-line client of the gpaperd D-Bus control interface."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gpaperctl"
+path = "src/main.rs"
+
+[dependencies]
+# Only for the bus names and the `Status` JSON shape (`gpaperd_core::control`).
+gpaperd-core.workspace = true
+
+clap.workspace = true
+# `status` prints the next change in local time.
+jiff.workspace = true
+serde_json.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+# The integration test serves a fake daemon on its own runtime thread.
+tempfile.workspace = true
+tokio.workspace = true

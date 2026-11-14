@@ -1,0 +1,241 @@
+.TH GPAPERD 1 2026-11-14 "gpaperd 0.1.0" "User Commands"
+.SH NAME
+gpaperd \- rotate GNOME light and dark wallpapers
+.SH SYNOPSIS
+.B gpaperd
+.RB [ \-\-config
+.IR FILE ]
+.br
+.B gpaperd check\-config
+.RB [ \-\-config
+.IR FILE ]
+.br
+.B gpaperd
+.RB ( \-\-help | \-\-version )
+.SH DESCRIPTION
+.B gpaperd
+is a user daemon that rotates the wallpaper of GNOME's light style and of
+its dark style, each from its own list of folders, files and
+.B http(s)
+URLs.
+.PP
+In the default
+.B slots
+apply mode it writes the background keys
+.B picture\-uri
+and
+.B picture\-uri\-dark
+once, pointing them at two files it owns,
+.I $XDG_DATA_HOME/gpaperd/slots/light
+and
+.IR .../slots/dark .
+A rotation atomically replaces the content of a slot with
+.BR rename (2);
+gnome\-shell's own file monitor then reloads the background.
+No key is written during rotation, so GNOME Shell 51 keeps one cached texture
+per slot instead of one per image shown.
+With
+.B apply_mode = \(dquri\(dq
+each rotation writes the image's own
+.B file://
+URI to the keys instead.
+.PP
+Only the style on screen rotates, unless
+.B rotate_hidden
+is set; the interval counts the time a style is on screen.
+Deadlines are wall-clock instants on a
+.B timerfd
+on
+.BR CLOCK_REALTIME ,
+so a change that fell due during suspend happens right after resume,
+and a clock step re-arms the timer.
+.PP
+Each style has a catalog that inotify keeps current (or a poll, for network
+and FUSE file systems and with a
+.B poll
+period).
+An image is checked just before use: it must exist, its magic bytes must be
+an image, and glycin, the sandboxed loader that gnome-shell uses, must
+decode it.
+Where glycin's sandbox cannot start, the magic bytes alone decide.
+Random order is a shuffle bag: every image once per round.
+Alphabetical order is a natural, case-insensitive sort on the file name.
+.PP
+Remote images are downloaded into
+.IR $XDG_CACHE_HOME/gpaperd/remote .
+A cached copy is used at once and revalidated in the background; no
+rotation waits for the network.
+.PP
+When something else changes a background key, for example the user picks a
+wallpaper in Settings, the
+.B on_external_change
+policy decides; by default the affected style pauses until
+.BR "gpaperctl resume" ,
+a config reload, or the key points at the slot again.
+.PP
+The config file is reloaded when it changes, including through a symlink
+into a dotfiles repository.
+An invalid edit is logged with line and column and the running config stays.
+See
+.BR gpaperd.toml (5).
+.PP
+.B gpaperd
+owns the session bus name
+.B io.github.worxbend.Gpaperd1
+and serves the control interface that
+.BR gpaperctl (1)
+uses.
+A second instance finds the name owned, tells systemd it is ready, so that a
+.B Type=notify
+unit simply goes inactive instead of being restarted, and exits 0.
+.SH COMMANDS
+.TP
+.B check\-config
+Load the config file as the daemon would, scan each local source and look
+each URL up in the remote cache, print one line per source, and exit.
+A local source line gives the number of image files found by name and
+lists what the scan skipped; a URL line says whether the cache holds a copy.
+URLs are printed without credentials or query.
+It talks to neither GNOME nor the session bus, and creates no slot, state
+file, cache entry or directory, so it can run in dotfile CI.
+It does not decode images: a counted file may still be rejected at run time.
+A source that does not exist is not an error.
+.SH OPTIONS
+.TP
+.BI \-\-config " FILE"
+Read
+.I FILE
+instead of
+.IR $XDG_CONFIG_HOME/gpaperd/config.toml .
+Accepted before or after
+.BR check\-config .
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Stopped by
+.B SIGTERM
+or
+.BR SIGINT ,
+another instance already runs, or
+.B check\-config
+found the config valid.
+.TP
+.B 1
+Any other failure.
+.TP
+.B 66
+.RB ( check\-config
+only) The config file does not exist.
+The daemon itself runs idle without one and starts when it appears.
+.TP
+.B 69
+Not a GNOME session: the
+.B org.gnome.desktop.background
+schema is missing, or GSettings uses a backend that does not persist
+.RB ( GSETTINGS_BACKEND=memory ).
+.TP
+.B 78
+The config file cannot be read or is invalid; the message has line and
+column.
+.PP
+The systemd unit lists 69 and 78 in
+.BR RestartPreventExitStatus= :
+a restart cannot help.
+.SH SIGNALS
+.TP
+.BR SIGTERM ", " SIGINT
+Send
+.B STOPPING=1
+to systemd, save the state and exit 0.
+.SH SYSTEMD
+Run it as a
+.B Type=notify
+user service bound to
+.BR graphical\-session.target .
+.B READY=1
+follows the config load, the GNOME check and the first apply, which uses the
+images saved in the state file, so a large folder does not delay it.
+Before the first apply
+.B gpaperd
+extends the start timeout by up to five minutes.
+.B STATUS=
+carries a one-line summary: the style on screen, the image in each slot,
+the next change and each paused style.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Required. Expands
+.B \(ti
+in the config.
+.TP
+.BR XDG_CONFIG_HOME ", " XDG_DATA_HOME ", " XDG_STATE_HOME ", " XDG_CACHE_HOME
+Base directories, with the XDG fallbacks under
+.BR HOME .
+.TP
+.BR HTTP_PROXY ", " HTTPS_PROXY
+Proxy for downloads. GNOME's own proxy settings are not read.
+.TP
+.B JOURNAL_STREAM
+When it names stderr, logs go to the journal with the fields
+.BR STYLE= ,
+.BR ITEM= ,
+.BR METHOD= ,
+.B REASON=
+and
+.BR PATH= .
+Otherwise logs go to stderr.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/gpaperd/config.toml
+The config file; see
+.BR gpaperd.toml (5).
+.TP
+.IR $XDG_DATA_HOME/gpaperd/slots/light ", " .../slots/dark
+The slot files the background keys point at.
+.TP
+.I $XDG_STATE_HOME/gpaperd/state.json
+Current images, bags, cursors, deadlines, pauses, history and the user's
+original background keys.
+.TP
+.I $XDG_CACHE_HOME/gpaperd/remote/
+Downloaded images, one directory per URL.
+.TP
+.I ~/.config/systemd/user/gpaperd.service
+The user unit, shipped as
+.IR dist/gpaperd.service .
+.SH EXAMPLES
+Check a config from a dotfiles repository in CI:
+.PP
+.RS
+.EX
+gpaperd check\-config \-\-config gpaperd/config.toml
+.EE
+.RE
+.PP
+Follow the log:
+.PP
+.RS
+.EX
+journalctl \-\-user \-u gpaperd \-f
+.EE
+.RE
+.SH NOTES
+Slot mode relies on gnome-shell reloading a background file that is
+replaced by
+.BR rename (2).
+The source code says it does, but it has not yet been verified on a live
+GNOME 50 or 51 session.
+If the wallpaper does not change on rotation, set
+.B apply_mode = \(dquri\(dq
+in the config.
+.SH SEE ALSO
+.BR gpaperctl (1),
+.BR gpaperd.toml (5),
+.BR systemd.service (5),
+.BR gsettings (1)

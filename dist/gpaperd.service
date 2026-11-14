@@ -1,0 +1,41 @@
+# ~/.config/systemd/user/gpaperd.service
+#
+# Install the daemon and its control client from the workspace root:
+#   cargo install --path crates/daemon --locked   # gpaperd
+#   cargo install --path crates/ctl --locked      # gpaperctl
+#   install -Dm644 dist/gpaperd.service ~/.config/systemd/user/gpaperd.service
+[Unit]
+Description=GNOME light/dark wallpaper rotator
+Documentation=man:gpaperd(1) man:gpaperd.toml(5)
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Exit 1-254 here means "skip", not "fail" (systemd >= 243).
+ExecCondition=/bin/sh -c 'case ":$XDG_CURRENT_DESKTOP:" in *:GNOME:*) exit 0;; esac; exit 1'
+ExecStart=%h/.cargo/bin/gpaperd
+Restart=on-failure
+RestartSec=3
+# 69 = not GNOME / volatile GSettings, 78 = bad config: restarting cannot help.
+RestartPreventExitStatus=69 78
+# READY=1 follows the config load, the GNOME probe and the first apply.
+# gpaperd asks for up to 5 more minutes (EXTEND_TIMEOUT_USEC) before that
+# first apply, for an image on a slow network mount.
+TimeoutStartSec=30
+# On SIGTERM gpaperd sends STOPPING=1, saves its state and exits 0.
+TimeoutStopSec=5
+Slice=background.slice
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+# Optional, test first: in user units these imply PrivateUsers=yes and
+# need unprivileged user namespaces.
+#ProtectSystem=strict
+#ReadWritePaths=%h/.local/share/gpaperd %h/.local/state/gpaperd %h/.cache/gpaperd
+
+[Install]
+WantedBy=graphical-session.target
