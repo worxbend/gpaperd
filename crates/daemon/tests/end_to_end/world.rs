@@ -935,3 +935,30 @@ impl Clock for FakeClock {
         Ok(Fired::Deadline)
     }
 }
+
+/// Whether glycin can decode in its sandbox here: asked of glycin itself,
+/// once, on a thread and in a runtime of its own (glycin keeps its thread on
+/// the first runtime that uses it, so that runtime is never dropped). Without
+/// it the daemon checks magic bytes only, and a test that needs a decode
+/// (pixel counts, a cut-off file) skips; tests/probe.rs covers that fallback.
+pub fn glycin_decodes() -> bool {
+    static DECODES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let ask = || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a tokio runtime");
+            let tiny = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.png");
+            let mut loader = glycin::Loader::new(gio::File::for_path(tiny));
+            loader.sandbox_selector(glycin::SandboxSelector::Bwrap);
+            let decodes = runtime.block_on(async { loader.load().await.is_ok() });
+            std::mem::forget(runtime);
+            decodes
+        };
+        std::thread::spawn(ask).join().expect("ask glycin")
+    });
+    if !*DECODES {
+        eprintln!("skipped: glycin cannot decode in its sandbox here");
+    }
+    *DECODES
+}

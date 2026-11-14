@@ -65,7 +65,7 @@ jobs:
       - name: Test
         run: |
           ulimit -v 8388608
-          timeout 900 cargo test --workspace --locked
+          timeout 900 cargo test --workspace --locked --no-fail-fast
       - name: Docs match the code
         run: .github/scripts/check-docs.sh target/debug
       - name: Shell scripts

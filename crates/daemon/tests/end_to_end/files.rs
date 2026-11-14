@@ -194,6 +194,9 @@ fn a_deleted_slot_file_is_restored() {
 
 #[test]
 fn an_image_above_max_pixels_is_skipped() {
+    if !crate::world::glycin_decodes() {
+        return;
+    }
     scenario(async {
         let world = World::new();
         world.add_huge_image(Style::Light, "a.png");
@@ -210,6 +213,9 @@ fn an_image_above_max_pixels_is_skipped() {
 
 #[test]
 fn an_image_that_is_still_copied_in_is_shown_once_it_is_whole() {
+    if !crate::world::glycin_decodes() {
+        return;
+    }
     scenario(async {
         let world = World::new();
         world.add_images(Style::Light, &["a.png"]);
