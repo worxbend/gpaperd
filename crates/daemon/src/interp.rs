@@ -8,17 +8,19 @@
 //! remote image runs as a task of its own. So a stalled network mount or a
 //! slow server cannot hold up a style switch or a shutdown.
 //!
-//! A state save runs on the blocking pool, but the loop awaits it, so a
-//! healthy save finishes before a key write that waits on it. The loop
-//! reads no event while a save runs: a stalled `fsync` delays the next
-//! event, a shutdown included.
+//! A state save runs on the blocking pool, and its end comes back to the
+//! loop like an event: a stalled `fsync` delays no other event. One save
+//! runs at a time. What the daemon tells the outside world after a save,
+//! key writes included, waits until that save ends, so the user's original
+//! keys are on disk before the first key write. A shutdown, and a restore
+//! of the user's keys, wait for the saves in flight.
 //!
 //! Control requests from the D-Bus server come in through the
 //! [`ControlPort`]. Each one gets a [`ReplyId`] from [`PendingReplies`],
 //! which keeps its reply channel until the core's `Effect::Reply` answers
 //! it; the core itself never sees a channel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -153,6 +155,7 @@ pub struct Interpreter<G, C> {
     /// The reply channels of the control requests the core has not
     /// answered yet.
     pending: PendingReplies,
+    saves: Saves,
 }
 
 /// What a run starts from, as read from disk.
@@ -265,6 +268,94 @@ impl Fetches {
     }
 }
 
+/// The state save in flight, and the effects that wait for it.
+///
+/// One save runs at a time, so a later save never lands before an earlier
+/// one. A `Persist` that comes while one runs is folded into the next save,
+/// which starts when the running one ends and writes the model as it is
+/// then.
+#[derive(Default)]
+struct Saves {
+    running: Option<RunningSave>,
+    /// How many `Persist` effects the core asked for so far.
+    asked: u64,
+    /// Effects that tell the outside world something, in order, each with
+    /// the count of `Persist` asked for before it: the save that covers
+    /// that count must end first.
+    held: VecDeque<(u64, Effect)>,
+}
+
+struct RunningSave {
+    /// The count of `Persist` asked for when the save took its snapshot.
+    covers: u64,
+    task: JoinHandle<Result<(), state::StateError>>,
+}
+
+impl Saves {
+    /// Counts one more `Persist`. Whether a save must start now: none runs.
+    fn ask(&mut self) -> bool {
+        self.asked += 1;
+        self.running.is_none()
+    }
+
+    fn start(&mut self, task: JoinHandle<Result<(), state::StateError>>) {
+        self.running = Some(RunningSave {
+            covers: self.asked,
+            task,
+        });
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// Whether a `Persist` came after the save that covers `covers` started.
+    fn is_owed_after(&self, covers: u64) -> bool {
+        self.asked > covers
+    }
+
+    /// Keeps `effect` until the saves asked for so far have ended.
+    fn hold(&mut self, effect: Effect) {
+        self.held.push_back((self.asked, effect));
+    }
+
+    /// The next held effect that only waited for the saves up to `covers`.
+    fn release(&mut self, covers: u64) -> Option<Effect> {
+        let (_, effect) = self
+            .held
+            .pop_front_if(|(waits_for, _)| *waits_for <= covers)?;
+        Some(effect)
+    }
+
+    /// Waits for the running save to end, and returns what it covers and
+    /// how it went. Waits forever when no save runs. Cancel-safe.
+    async fn finished(&mut self) -> (u64, Result<(), state::StateError>) {
+        let Some(running) = &mut self.running else {
+            return future::pending().await;
+        };
+        // Only a panic ends the task early. A panic is a defect: pass it on.
+        let written = (&mut running.task)
+            .await
+            .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()));
+        let covers = running.covers;
+        self.running = None;
+        (covers, written)
+    }
+}
+
+/// Whether `effect` tells the outside world something that must follow the
+/// saves asked for before it.
+fn waits_for_saves(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SetKeys { .. }
+            | Effect::Ready
+            | Effect::Report(_)
+            | Effect::Reply { .. }
+            | Effect::Changed { .. }
+    )
+}
+
 /// The watch on each style's local sources, as the core last asked for it.
 #[derive(Default)]
 struct SourceWatches {
@@ -340,9 +431,8 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     ///
     /// I/O on an existing state file is fatal: that file is the only copy of
     /// the user's original keys, and a failed read must not be replaced. A
-    /// corrupt file or an unsupported version is logged and the daemon
-    /// starts without state; the next save replaces it. A missing file is
-    /// no state.
+    /// corrupt file or an unsupported version is logged, moved aside, and
+    /// the daemon starts without state. A missing file is no state.
     ///
     /// `config` is the running config until `run` is told of another. `None`
     /// when there is no config file: the daemon then idles, and touches no
@@ -406,6 +496,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             fetches: Fetches::new(),
             cached,
             pending: PendingReplies::default(),
+            saves: Saves::default(),
         })
     }
 
@@ -473,6 +564,10 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                     }
                 }
                 () = &mut shutdown => Event::Shutdown,
+                saved = self.saves.finished() => {
+                    self.save_finished(saved, &config_file).await?;
+                    continue;
+                }
             };
             if lock_watch_stopped {
                 self.screen_lock_open = false;
@@ -536,7 +631,8 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     }
 
     /// Shutdown is `Arm(None)` then `Persist`. A failed disarm is logged and
-    /// the save still runs. Any other arm error still fails the loop.
+    /// the save still runs. Any other arm error still fails the loop. The
+    /// run ends once every save has ended.
     async fn execute_shutdown(
         &mut self,
         effects: Vec<Effect>,
@@ -552,10 +648,24 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 other => self.execute(other, config_file).await?,
             }
         }
-        Ok(())
+        self.settle_saves(config_file).await
     }
 
+    /// Executes `effect`, or holds it while a save runs when it must follow
+    /// that save.
     async fn execute(&mut self, effect: Effect, config_file: &ConfigFile) -> Result<(), RunError> {
+        if self.saves.is_running() && waits_for_saves(&effect) {
+            self.saves.hold(effect);
+            return Ok(());
+        }
+        self.run_effect(effect, config_file).await
+    }
+
+    async fn run_effect(
+        &mut self,
+        effect: Effect,
+        config_file: &ConfigFile,
+    ) -> Result<(), RunError> {
         match effect {
             Effect::Probe {
                 style,
@@ -582,7 +692,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             Effect::Republish(style) => self.republish_later(style),
             Effect::Watch { style, sources } => self.sources.replace(style, sources),
             Effect::Arm(deadline) => self.ports.clock.arm(deadline)?,
-            Effect::Persist => self.persist().await,
+            Effect::Persist => self.persist(),
             Effect::Ready => (self.ports.notify)(Notice::Ready),
             Effect::Report(status) => {
                 self.ports.control.tell(BusNews::Status(status.clone()));
@@ -643,17 +753,21 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     /// `RestoreKeys`, so the feed does not re-enter this method. The feed
     /// is boxed: `feed` reaches here through `execute`, and an async cycle
     /// needs a heap step to have a finite size.
+    ///
+    /// The saves in flight end first, and the key writes held for them go
+    /// out before the restore, as they would have without a save.
     async fn restore_keys(
         &mut self,
         id: ReplyId,
         keys: BackgroundKeys,
         config_file: &ConfigFile,
     ) -> Result<(), RunError> {
+        self.settle_saves(config_file).await?;
         let result = self.ports.gnome.restore_keys(keys).await;
         match &result {
             Ok(()) => tracing::info!("the user's background keys are restored"),
             Err(error) => {
-                tracing::error!(reason = %error, "the user's background keys not restored");
+                tracing::error!(reason = %error, "not every one of the user's background keys was restored");
             }
         }
         let restored = Event::KeysRestored {
@@ -740,11 +854,12 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             Ok(()) => tracing::info!(?styles, "background keys written"),
             Err(error) => {
                 tracing::error!(reason = %error, "background keys not written");
+                // A write that settings did not answer may still land: the
+                // core treats it as a failed write until GNOME reports it.
                 match &error {
                     GnomeError::Write { unstored, .. } => {
                         self.fail_key_write(&write, Some(unstored))
                     }
-                    GnomeError::NoAnswer => self.leave_key_write_unconfirmed(&write),
                     _ => self.fail_key_write(&write, None),
                 }
             }
@@ -764,39 +879,55 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             picture_options: named(PICTURE_OPTIONS)
                 .then_some(write.picture_options)
                 .flatten(),
-            unconfirmed: false,
         };
         let _ = self.answer_sender.send(failed);
     }
 
-    /// Tells the core that settings did not answer `write`. It is not
-    /// refused: it may still land, and GNOME then reports it as any other
-    /// change.
-    fn leave_key_write_unconfirmed(&self, write: &KeyWrite) {
-        let unconfirmed = Event::KeyWriteFailed {
-            uris: write.uris.clone(),
-            picture_options: write.picture_options,
-            unconfirmed: true,
-        };
-        let _ = self.answer_sender.send(unconfirmed);
+    /// Saves the model on the blocking pool. While a save runs, this one
+    /// waits for it and then saves the model as it is at that time.
+    fn persist(&mut self) {
+        if self.saves.ask() {
+            self.start_save();
+        }
     }
 
-    /// Saves the model as it is after the step that asked for it. The save
-    /// runs on the blocking pool and is awaited, so a healthy one finishes
-    /// before a later key write in this step. Spawned tasks go on while it
-    /// runs, but the loop reads no event until it ends, so a stalled
-    /// `sync_all` delays the next event, a shutdown included. It does not
-    /// flush a key write that was refused because an earlier save failed.
-    async fn persist(&mut self) {
+    fn start_save(&mut self) {
         let path = self.paths.state_file.clone();
         let saved = self.model.persisted();
-        let written = tokio::task::spawn_blocking(move || state::save(&path, &saved))
-            .await
-            .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()));
+        let task = tokio::task::spawn_blocking(move || state::save(&path, &saved));
+        self.saves.start(task);
+    }
+
+    /// Records how the save that covers `covers` went, starts the save owed
+    /// since, and executes the effects that waited only for it. A held key
+    /// write still needs the user's original keys on disk: after a failed
+    /// first save it is refused, and a later save does not flush it. The
+    /// call is boxed: `run_effect` reaches here through `restore_keys`.
+    async fn save_finished(
+        &mut self,
+        (covers, written): (u64, Result<(), state::StateError>),
+        config_file: &ConfigFile,
+    ) -> Result<(), RunError> {
         match written {
             Ok(()) => self.originals_saved = true,
             Err(error) => tracing::error!(reason = %error, "state not saved"),
         }
+        if self.saves.is_owed_after(covers) {
+            self.start_save();
+        }
+        while let Some(effect) = self.saves.release(covers) {
+            Box::pin(self.run_effect(effect, config_file)).await?;
+        }
+        Ok(())
+    }
+
+    /// Waits until no save runs, and executes every effect held for one.
+    async fn settle_saves(&mut self, config_file: &ConfigFile) -> Result<(), RunError> {
+        while self.saves.is_running() {
+            let saved = self.saves.finished().await;
+            self.save_finished(saved, config_file).await?;
+        }
+        Ok(())
     }
 }
 
@@ -821,6 +952,7 @@ fn lay_groundwork(
         restored,
         seed,
         slot_uris: PerStyle::from_fn(|style| slot_uri(paths, style)),
+        remote_cache_dir: paths.remote_cache_dir.clone(),
     });
     Ok(Groundwork {
         model,
@@ -840,19 +972,38 @@ fn cached_blobs(cache: &Cache) -> Vec<RemoteBlob> {
 }
 
 /// The saved state of the last run. A missing file is no state. Corrupt
-/// JSON and an unsupported version are logged and start as no state; the
-/// next save replaces them. Any other error, including I/O on a file that
-/// exists, is returned and the file is left as it is.
+/// JSON and an unsupported version are logged and start as no state, after
+/// the file is moved to `state.json.corrupt`. Any other error, including I/O
+/// on a file that exists, is returned and the file is left as it is.
 fn restore_state(state_file: &Path) -> Result<Option<Persisted>, state::StateError> {
     match state::load(state_file) {
         Ok(saved) => Ok(saved),
         Err(
             error @ (state::StateError::Corrupt(_) | state::StateError::UnsupportedVersion { .. }),
         ) => {
-            tracing::warn!(reason = %error, "state file ignored");
+            set_unreadable_state_aside(state_file, &error);
             Ok(None)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Keeps the bytes of a state file that this build cannot read, corrupt or
+/// of another version, out of the way of the next save. A failed rename is
+/// logged: the daemon still starts.
+fn set_unreadable_state_aside(state_file: &Path, error: &state::StateError) {
+    match state::set_aside(state_file) {
+        Ok(aside) => {
+            let path = aside.display();
+            tracing::warn!(reason = %error, %path, "state file ignored: kept aside");
+        }
+        Err(failure) => {
+            tracing::warn!(
+                reason = %error,
+                cause = %failure,
+                "state file ignored and not kept aside: the next save replaces it"
+            );
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use gpaperd_core::catalog::ItemId;
-use gpaperd_core::config::{Config, Source};
+use gpaperd_core::config::{Config, EmptyStylePolicy, Source};
 use gpaperd_core::event::{Effect, Event, Status};
 use gpaperd_core::model::{Model, ModelInit, Persisted, STATE_VERSION, StylePersisted};
 use gpaperd_core::step::step;
@@ -654,6 +654,63 @@ fn a_scan_that_finds_only_the_image_on_screen_ends_a_restore_from_before_m2() {
     let persisted = restored.persisted().styles.light;
     assert_eq!(persisted.bag, [id("https://cdn.example/a.jpg")]);
     assert_eq!(persisted.shown, Some(Vec::new()));
+}
+
+#[test]
+fn a_scan_that_leaves_nothing_to_pick_from_ends_a_restore_from_before_m2() {
+    let mut saved = light_showing("/l/3.jpg", &["https://cdn.example/a.jpg"], &[]);
+    saved.styles.light.shown = None;
+    let mut config = Config::default();
+    config.general.empty_style = EmptyStylePolicy::KeepCurrent;
+
+    let restored = Model::new(ModelInit {
+        restored: Some(saved),
+        ..init(config, &[], &["/d/only.jpg"])
+    });
+
+    let persisted = restored.persisted().styles.light;
+    assert_eq!(persisted.bag, [id("https://cdn.example/a.jpg")]);
+    assert_eq!(persisted.shown, Some(Vec::new()));
+}
+
+#[test]
+fn a_style_that_borrows_after_its_scan_learns_what_a_round_from_before_m2_showed() {
+    // Dark's scan came while light was still unscanned and borrowed nothing.
+    let mut saved = light_showing("/l/3.jpg", &["/d/b.jpg"], &[]);
+    saved.styles.light.shown = None;
+    let mut world = World::new(ModelInit {
+        restored: Some(saved),
+        ..unscanned(Config::default())
+    });
+    world.slots.light = foreign_slot();
+    world.start(at(0), Style::Light);
+    world.run(at(1), scanned(Style::Dark, &["/d/a.jpg", "/d/b.jpg"]));
+
+    world.run(at(2), scanned(Style::Light, &[]));
+
+    let persisted = world.model.persisted().styles.light;
+    assert_eq!(persisted.bag, [id("/d/b.jpg")]);
+    assert_eq!(persisted.shown, Some(vec![id("/d/a.jpg")]));
+}
+
+#[test]
+fn a_style_that_borrows_before_the_other_scan_learns_what_a_round_from_before_m2_showed() {
+    // Light's empty scan comes while dark is still unscanned.
+    let mut saved = light_showing("/l/3.jpg", &["/d/b.jpg"], &[]);
+    saved.styles.light.shown = None;
+    let mut world = World::new(ModelInit {
+        restored: Some(saved),
+        ..unscanned(Config::default())
+    });
+    world.slots.light = foreign_slot();
+    world.start(at(0), Style::Light);
+    world.run(at(1), scanned(Style::Light, &[]));
+
+    world.run(at(2), scanned(Style::Dark, &["/d/a.jpg", "/d/b.jpg"]));
+
+    let persisted = world.model.persisted().styles.light;
+    assert_eq!(persisted.bag, [id("/d/b.jpg")]);
+    assert_eq!(persisted.shown, Some(vec![id("/d/a.jpg")]));
 }
 
 #[test]

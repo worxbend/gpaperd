@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpaperd_core::config::Config;
-use gpaperd_core::event::{BackgroundKeys, Status};
+use gpaperd_core::event::{BackgroundKeys, Pause, Status};
 use gpaperd_core::style::{PerStyle, Style};
 use gpaperd_daemon::config_watch::ConfigWatch;
 use gpaperd_daemon::gnome::GnomeError;
@@ -48,7 +48,7 @@ use url::Url;
 use bus::PrivateBus;
 use world::{
     ALPHABETICAL, DARK_INTERVAL, LIGHT_INTERVAL, MINUTE, PATIENCE, SEED, World, eventually,
-    has_a_deadline, scenario, start_time, users_keys,
+    has_a_deadline, scenario, scenario_with_one_blocking_thread, start_time, users_keys,
 };
 
 /// The `[general]` table of a config with the default order.
@@ -410,19 +410,42 @@ fn io_on_an_existing_state_file_fails_startup_and_leaves_the_file() {
 }
 
 #[test]
-fn a_corrupt_state_file_lets_start_succeed_and_leaves_the_bytes() {
+fn a_corrupt_state_file_lets_start_succeed_and_is_kept_aside() {
     scenario(async {
         let world = World::new();
         let state_file = world.paths().state_file;
+        let aside = state_file.with_added_extension("corrupt");
         fs::create_dir_all(state_file.parent().expect("a state directory"))
             .expect("create the state directory");
+        fs::write(&aside, b"older corrupt state").expect("an older copy");
         fs::write(&state_file, b"not json").expect("corrupt state");
         let (ports, _notices) = world.ports();
 
         let started = Interpreter::start(None, world.paths(), SEED, ports).await;
 
         assert!(started.is_ok(), "{:?}", started.as_ref().err());
-        assert_eq!(fs::read(&state_file).expect("the state file"), b"not json");
+        assert_eq!(fs::read(&aside).expect("the kept copy"), b"not json");
+        assert!(!state_file.exists(), "the next save starts a new file");
+    });
+}
+
+#[test]
+fn a_state_file_of_another_version_lets_start_succeed_and_is_kept_aside() {
+    scenario(async {
+        let world = World::new();
+        let state_file = world.paths().state_file;
+        let aside = state_file.with_added_extension("corrupt");
+        let newer = br#"{ "version": 999, "layout": "from a newer gpaperd" }"#;
+        fs::create_dir_all(state_file.parent().expect("a state directory"))
+            .expect("create the state directory");
+        fs::write(&state_file, newer).expect("state of another version");
+        let (ports, _notices) = world.ports();
+
+        let started = Interpreter::start(None, world.paths(), SEED, ports).await;
+
+        assert!(started.is_ok(), "{:?}", started.as_ref().err());
+        assert_eq!(fs::read(&aside).expect("the kept copy"), newer);
+        assert!(!state_file.exists(), "the next save starts a new file");
     });
 }
 
@@ -502,6 +525,53 @@ fn a_failed_shutdown_disarm_still_saves() {
         let saved = world.saved_state();
         assert_eq!(saved.styles.light.remaining, Some(10 * MINUTE));
         assert_eq!(saved.original_keys, Some(users_keys()));
+    });
+}
+
+#[test]
+fn a_stalled_save_does_not_hold_up_the_event_loop() {
+    scenario_with_one_blocking_thread(async {
+        let world = World::new();
+        world.add_images(Style::Light, &["a.png", "b.png"]);
+        world.add_images(Style::Dark, &["x.png", "y.png"]);
+        let mut daemon = world.start_daemon(world.config(ALPHABETICAL), SEED);
+        world.showing(&mut daemon, "a.png", "x.png").await;
+        // Hold the one blocking thread: the next save waits behind it.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered, holding) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = entered.send(());
+            let _ = held.recv_timeout(PATIENCE);
+        });
+        holding.await.expect("the blocking thread is held");
+
+        // A pause is saved. Its step also clears the alarm.
+        world
+            .gnome
+            .set_key_from_outside(Style::Light, "file:///user/picked.png");
+        eventually("the alarm to be cleared while the save waits", || {
+            world.clock.armed().is_none()
+        })
+        .await;
+        // The core answers a clock step with an alarm, always.
+        let arms_before_step = world.clock.times_armed();
+        world.clock.step_to(world.clock.time());
+        eventually("the next event to be read while the save waits", || {
+            world.clock.times_armed() > arms_before_step
+        })
+        .await;
+        let saved_before_release = world.saved_state().styles.light.paused;
+        release.send(()).expect("release the blocking thread");
+        let paused = daemon
+            .status_where("light paused", |status| status.paused.light.is_some())
+            .await;
+        let saved_at_status = world.saved_state().styles.light.paused;
+
+        assert!(!saved_before_release, "the stalled save landed early");
+        // A status waits for the save that came before it.
+        assert!(saved_at_status, "the status went out before the save");
+        assert_eq!(paused.paused.light, Some(Pause::ExternalChange));
+        daemon.terminate().await;
     });
 }
 

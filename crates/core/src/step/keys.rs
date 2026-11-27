@@ -68,14 +68,24 @@ impl Turn<'_> {
     }
 
     /// Compares what the background keys hold with what the daemon wrote to
-    /// them. A key that this run cannot use is left out.
+    /// them, and with what GNOME reported before. A key that this run cannot
+    /// use is left out.
     pub(super) fn follow_keys(&mut self, keys: &BackgroundKeys) {
         for style in Style::ALL {
             let key = &self.model.styles[style].key;
             if key.is_disabled() {
                 continue;
             }
-            let change = keys.uri(style).and_then(|value| key.change(value));
+            let Some(value) = keys.uri(style) else {
+                continue;
+            };
+            let reported = self
+                .model
+                .gnome_keys
+                .as_ref()
+                .and_then(|held| held.uri(style));
+            let change = key.change(value, reported);
+            self.model.styles[style].key.hear(value, reported);
             match change {
                 Some(KeyChange::Taken) => self.on_external_change(style),
                 Some(KeyChange::Returned) => {
@@ -119,7 +129,7 @@ impl Turn<'_> {
         } else {
             Reassert::AtNextTick
         };
-        self.model.styles[style].key.reassert = Some(reassert);
+        self.model.styles[style].key.plan_write_back(reassert);
     }
 
     /// A hidden style has no clock of its own. It needs a deadline when it
@@ -141,19 +151,19 @@ impl Turn<'_> {
             && !self.model.is_held_by_lock()
     }
 
-    /// The GNOME write failed. The keys still hold what they held. Each style
-    /// whose recorded URI is still the one that failed goes back to the URI
-    /// on record before it, and is tried again after [`KEY_WRITE_RETRY`]. An
-    /// `unconfirmed` write keeps that URI on record instead: when it lands
-    /// late, the retry is called off. A style that already moved on is left
-    /// alone. A failure that names only `picture-options` arms the same
-    /// retry on every key this run still holds. The failed options are owed
-    /// again only while the running config still asks for them.
+    /// The GNOME write failed, or settings did not answer it. The keys still
+    /// hold what GNOME last reported. Each style whose recorded URI is still
+    /// the one that failed keeps it on record, and is tried again after
+    /// [`KEY_WRITE_RETRY`]: a value other than the reported one is an
+    /// external change meanwhile, and a write that lands late calls the
+    /// retry off. A style that already moved on is left alone. A failure
+    /// that names only `picture-options` arms the same retry on every key
+    /// this run still holds. The failed options are owed again only while
+    /// the daemon would still write them.
     pub(super) fn on_key_write_failed(
         &mut self,
         uris: PerStyle<Option<String>>,
         picture_options: Option<PictureOptions>,
-        unconfirmed: bool,
     ) {
         let due = self.now.checked_add(KEY_WRITE_RETRY);
         let reassert = due.map_or(Reassert::Now, Reassert::Retry);
@@ -164,11 +174,6 @@ impl Turn<'_> {
             };
             let key = &mut self.model.styles[style].key;
             if key.written.as_deref() == Some(uri) {
-                // An unconfirmed write may still land. Its report then settles
-                // the key, and a later change of it stays an external change.
-                if !unconfirmed {
-                    key.written = key.before_write.clone();
-                }
                 key.reassert = Some(reassert);
                 matched = true;
             }
@@ -185,12 +190,14 @@ impl Turn<'_> {
         }
     }
 
-    /// Whether the running config still asks for `options`: a reload may
-    /// have dropped it while the failed write was out. Without a value of its
-    /// own the config still owes the `zoom` that replaces `none`.
+    /// Whether the daemon would still write `options`: a reload may have
+    /// dropped it while the failed write was out. Without a value of its own
+    /// the config owes only the `zoom` that replaces a `none` GNOME holds.
     fn config_owes(&self, options: PictureOptions) -> bool {
-        let configured = self.model.config().general.picture_options;
-        configured.map_or(options == PictureOptions::Zoom, |wanted| wanted == options)
+        let Some(keys) = &self.model.gnome_keys else {
+            return false;
+        };
+        picture_options_to_write(self.model.config(), keys) == Some(options)
     }
 
     /// Arms [`KEY_WRITE_RETRY`] on every key this run still holds and is not
@@ -199,7 +206,10 @@ impl Turn<'_> {
     fn arm_held_keys(&mut self, reassert: Reassert) {
         for style in Style::ALL {
             let key = &mut self.model.styles[style].key;
-            let already_waits = matches!(key.reassert, Some(Reassert::At(_) | Reassert::Retry(_)));
+            let already_waits = matches!(
+                key.reassert,
+                Some(Reassert::At(_) | Reassert::Retry(_) | Reassert::RetryNow)
+            );
             if key.written.is_some() && key.pause.is_none() && !already_waits {
                 key.before_write = key.written.clone();
                 key.reassert = Some(reassert);
@@ -218,19 +228,19 @@ impl Turn<'_> {
             return self.pause(style);
         }
         let due = self.now.checked_add(REASSERT_DELAY);
-        key.reassert = Some(due.map_or(Reassert::Now, Reassert::At));
+        key.plan_write_back(due.map_or(Reassert::Now, Reassert::At));
     }
 
-    /// Lets every key whose wait under `reassert-now` is over be written
-    /// back.
+    /// Lets every key whose wait under `reassert-now`, or for a retry, is
+    /// over be written with the next key write.
     pub(super) fn end_reassert_waits(&mut self) {
         for style in Style::ALL {
             let key = &mut self.model.styles[style].key;
-            if let Some(Reassert::At(due) | Reassert::Retry(due)) = key.reassert
-                && due <= self.now
-            {
-                key.reassert = Some(Reassert::Now);
-            }
+            key.reassert = match key.reassert {
+                Some(Reassert::At(due)) if due <= self.now => Some(Reassert::Now),
+                Some(Reassert::Retry(due)) if due <= self.now => Some(Reassert::RetryNow),
+                unchanged => unchanged,
+            };
         }
     }
 

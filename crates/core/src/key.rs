@@ -11,12 +11,17 @@ use crate::event::Pause;
 /// What the daemon knows of one style's background key.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KeyState {
-    /// The URI that the daemon put in the key, as far as this run knows.
-    /// `None` while the key is still the user's.
+    /// The URI that the daemon put in the key, as far as this run knows, or
+    /// tries again after a failed write. `None` while the key is still the
+    /// user's.
     pub(crate) written: Option<String>,
-    /// What `written` was before the last write: what the key still holds
-    /// when GNOME refuses that write.
+    /// What `written` was before the last write, or before the failed write
+    /// that a retry repeats: what the key still holds when GNOME refuses it.
     pub(crate) before_write: Option<String>,
+    /// The daemon wrote `written`, and GNOME has reported no new value of
+    /// the key since. A report sent before the write still carries what
+    /// GNOME reported before, which is no news.
+    pub(crate) awaits_report: bool,
     /// Why the style idles.
     pub(crate) pause: Option<Pause>,
     /// Something else changed the key, and the daemon is to write it back.
@@ -36,10 +41,14 @@ pub(crate) enum Reassert {
     Now,
     /// At this instant.
     At(SystemTime),
-    /// At this instant, because the last key write did not land. The key
-    /// holds `before_write` meanwhile: another value of it is an external
-    /// change.
+    /// At this instant, because the last key write did not land. `written`
+    /// stays on record. The key holds what GNOME reported before meanwhile:
+    /// another value of it is an external change.
     Retry(SystemTime),
+    /// With the next key write, because the wait of a `Retry` is over. The
+    /// write is the daemon's own, not an answer to an external change: the
+    /// key still holds what GNOME reported before, and another value is one.
+    RetryNow,
     /// When the next rotation of any style is due.
     AtNextTick,
 }
@@ -82,17 +91,19 @@ impl KeyState {
 
     /// What it means that the key holds `value` now. `None` when that
     /// changes nothing: the key was never the daemon's in this run, or it is
-    /// as the daemon knew it. During a retry the key may still hold what it
-    /// held before the write, which is no news. The daemon's URI is
-    /// `Returned` then: an unconfirmed write landed late, so the retry is
-    /// called off.
-    pub(crate) fn change(&self, value: &str) -> Option<KeyChange> {
+    /// as the daemon knew it. During a retry, or before GNOME reports the
+    /// last write, the key may still hold what GNOME `reported` before,
+    /// which is no news. During a retry the daemon's URI is `Returned`: an
+    /// unconfirmed write landed late, so the retry is called off.
+    pub(crate) fn change(&self, value: &str, reported: Option<&str>) -> Option<KeyChange> {
         let written = self.written.as_deref()?;
-        let is_retry = matches!(self.reassert, Some(Reassert::Retry(_)));
-        if is_retry && self.before_write.as_deref() == Some(value) {
+        let is_retry = self.waits_for_retry();
+        let is_written = value == written;
+        let may_hold_reported = is_retry || self.awaits_report;
+        if may_hold_reported && !is_written && reported == Some(value) {
             return None;
         }
-        match (self.is_foreign(), value == written) {
+        match (self.is_foreign(), is_written) {
             (false, false) => Some(KeyChange::Taken),
             (true, true) => Some(KeyChange::Returned),
             (false, true) if is_retry => Some(KeyChange::Returned),
@@ -100,20 +111,70 @@ impl KeyState {
         }
     }
 
+    /// The daemon's URI that the key holds, as far as this run knows: during
+    /// a retry, the one on record before the write that failed.
+    pub(crate) fn landed_uri(&self) -> Option<&str> {
+        if self.waits_for_retry() {
+            self.before_write.as_deref()
+        } else {
+            self.written.as_deref()
+        }
+    }
+
+    fn waits_for_retry(&self) -> bool {
+        matches!(self.reassert, Some(Reassert::Retry(_) | Reassert::RetryNow))
+    }
+
+    /// GNOME reported `value` for the key, after `reported` before. A new
+    /// value ends the wait for the report of the last write.
+    pub(crate) fn hear(&mut self, value: &str, reported: Option<&str>) {
+        if reported != Some(value) {
+            self.awaits_report = false;
+        }
+    }
+
+    /// Plans to write the key back, in place of a retry that waits: that
+    /// write never landed.
+    pub(crate) fn plan_write_back(&mut self, reassert: Reassert) {
+        self.drop_retry();
+        self.reassert = Some(reassert);
+    }
+
+    /// Calls off a retry that waits. The failed write never landed, so the
+    /// key holds the URI on record before it.
+    fn drop_retry(&mut self) {
+        if self.waits_for_retry() {
+            self.written = self.before_write.clone();
+        }
+    }
+
     /// Whether the daemon must write `wanted` to the key now.
     pub(crate) fn owes(&self, wanted: &str) -> bool {
         match (self.pause, self.reassert) {
             (Some(_), _) => false,
-            (None, Some(Reassert::Now)) => true,
+            (None, Some(Reassert::Now | Reassert::RetryNow)) => true,
             (None, Some(Reassert::At(_) | Reassert::Retry(_) | Reassert::AtNextTick)) => false,
             (None, None) => self.written.as_deref() != Some(wanted),
         }
     }
 
-    /// Records that the daemon wrote `uri` to the key.
+    /// Records that the daemon wrote `uri` to the key. A retry keeps
+    /// `before_write`: the write that failed never replaced it.
     pub(crate) fn record_write(&mut self, uri: String) {
-        self.before_write = self.written.replace(uri);
+        let previous = self.written.replace(uri);
+        if self.reassert != Some(Reassert::RetryNow) {
+            self.before_write = previous;
+        }
         self.reassert = None;
+        self.awaits_report = true;
+    }
+
+    /// Lets a key that waits for the next tick be written back with the next
+    /// key write.
+    pub(crate) fn end_tick_wait(&mut self) {
+        if self.reassert == Some(Reassert::AtNextTick) {
+            self.reassert = Some(Reassert::Now);
+        }
     }
 
     /// The key is the daemon's again: an external change is over.
@@ -127,11 +188,14 @@ impl KeyState {
     /// Stops the style for as long as an administrator keeps its key locked
     /// on a value that the daemon cannot use. That replaces an external
     /// change, which waits until the lock is lifted: the key is not the
-    /// daemon's to write back meanwhile.
+    /// daemon's to write back meanwhile. Once the lock is lifted, the value
+    /// GNOME reported is compared with the URI on record.
     pub(crate) fn lock_out(&mut self) {
         self.paused_under_lock = self.is_paused_by_change();
         self.pause = Some(Pause::LockedKey);
+        self.drop_retry();
         self.reassert = None;
+        self.awaits_report = false;
     }
 
     /// The lock pause is over. The external-change pause that it replaced
@@ -144,6 +208,7 @@ impl KeyState {
     /// Stops the style because something else changed its key.
     pub(crate) fn pause(&mut self) {
         self.pause = Some(Pause::ExternalChange);
+        self.drop_retry();
         self.reassert = None;
     }
 
@@ -200,15 +265,18 @@ mod tests {
     fn a_key_the_daemon_never_wrote_cannot_be_taken() {
         let key = KeyState::default();
 
-        assert_eq!(key.change("file:///picked.jpg"), None);
+        assert_eq!(key.change("file:///picked.jpg", None), None);
     }
 
     #[test]
     fn another_value_than_the_written_one_takes_the_key() {
         let key = written("file:///slot");
 
-        assert_eq!(key.change("file:///picked.jpg"), Some(KeyChange::Taken));
-        assert_eq!(key.change("file:///slot"), None);
+        assert_eq!(
+            key.change("file:///picked.jpg", None),
+            Some(KeyChange::Taken)
+        );
+        assert_eq!(key.change("file:///slot", None), None);
     }
 
     #[test]
@@ -216,29 +284,107 @@ mod tests {
         let mut key = written("file:///slot");
         key.pause();
 
-        assert_eq!(key.change("file:///other.jpg"), None);
-        assert_eq!(key.change("file:///slot"), Some(KeyChange::Returned));
+        assert_eq!(key.change("file:///other.jpg", None), None);
+        assert_eq!(key.change("file:///slot", None), Some(KeyChange::Returned));
     }
 
     #[test]
     fn a_key_waiting_for_a_retry_can_be_taken_and_landed() {
         let mut key = written("file:///slot");
         key.reassert = Some(Reassert::Retry(at(60)));
+        let reported = Some("file:///before");
 
-        assert_eq!(key.change("file:///picked.jpg"), Some(KeyChange::Taken));
-        assert_eq!(key.change("file:///slot"), Some(KeyChange::Returned));
+        assert_eq!(
+            key.change("file:///picked.jpg", reported),
+            Some(KeyChange::Taken)
+        );
+        assert_eq!(
+            key.change("file:///slot", reported),
+            Some(KeyChange::Returned)
+        );
         assert!(!key.owes("file:///slot"));
     }
 
     #[test]
-    fn a_key_waiting_for_a_retry_still_holds_what_it_held_before() {
+    fn a_key_waiting_for_a_retry_still_holds_what_gnome_reported_before() {
         let mut key = written("file:///before");
         key.record_write("file:///refused".to_owned());
-        key.written = key.before_write.clone();
         key.reassert = Some(Reassert::Retry(at(60)));
+        let reported = Some("file:///before");
 
-        assert_eq!(key.change("file:///before"), None);
-        assert_eq!(key.change("file:///picked.jpg"), Some(KeyChange::Taken));
+        assert_eq!(key.change("file:///before", reported), None);
+        assert_eq!(
+            key.change("file:///picked.jpg", reported),
+            Some(KeyChange::Taken)
+        );
+        assert_eq!(key.landed_uri(), Some("file:///before"));
+    }
+
+    #[test]
+    fn a_due_retry_is_the_daemons_own_write_and_no_external_change() {
+        let mut key = written("file:///refused");
+        key.reassert = Some(Reassert::RetryNow);
+        let reported = Some("file:///before");
+
+        assert!(!key.is_foreign());
+        assert!(key.owes("file:///refused"));
+        assert_eq!(key.change("file:///before", reported), None);
+        assert_eq!(
+            key.change("file:///picked.jpg", reported),
+            Some(KeyChange::Taken)
+        );
+    }
+
+    #[test]
+    fn a_report_sent_before_the_write_is_no_news_until_gnome_reports_anew() {
+        let mut key = written("file:///before");
+        key.record_write("file:///written".to_owned());
+        let reported = Some("file:///before");
+
+        assert_eq!(key.change("file:///before", reported), None);
+        key.hear("file:///before", reported);
+        key.hear("file:///written", reported);
+
+        assert_eq!(
+            key.change("file:///before", Some("file:///written")),
+            Some(KeyChange::Taken)
+        );
+    }
+
+    #[test]
+    fn a_retry_called_off_puts_the_uri_before_the_failed_write_back_on_record() {
+        let mut locked = written("file:///before");
+        locked.record_write("file:///refused".to_owned());
+        locked.reassert = Some(Reassert::Retry(at(60)));
+        let mut taken = locked.clone();
+
+        locked.lock_out();
+        locked.unlock();
+        taken.pause();
+
+        assert_eq!(
+            locked.change("file:///before", Some("file:///before")),
+            None
+        );
+        assert_eq!(locked.landed_uri(), Some("file:///before"));
+        assert_eq!(
+            taken.change("file:///before", Some("file:///other")),
+            Some(KeyChange::Returned)
+        );
+    }
+
+    #[test]
+    fn only_a_wait_for_the_next_tick_ends_with_end_tick_wait() {
+        let mut ticking = written("file:///slot");
+        ticking.reassert = Some(Reassert::AtNextTick);
+        let mut retrying = written("file:///slot");
+        retrying.reassert = Some(Reassert::Retry(at(60)));
+
+        ticking.end_tick_wait();
+        retrying.end_tick_wait();
+
+        assert_eq!(ticking.reassert, Some(Reassert::Now));
+        assert_eq!(retrying.reassert, Some(Reassert::Retry(at(60))));
     }
 
     #[test]

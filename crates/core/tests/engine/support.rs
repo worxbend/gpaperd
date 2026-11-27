@@ -77,11 +77,14 @@ pub fn url(text: &str) -> Url {
     Url::parse(text).expect("test URL parses")
 }
 
+/// The directory of the remote cache: each blob lies under it.
+pub const REMOTE_CACHE_DIR: &str = "/cache";
+
 /// Version `n` of `url`'s image in the remote cache. Each version has a blob
 /// of its own.
 pub fn blob(text: &str, n: u32) -> RemoteBlob {
     let url = url(text);
-    let blob = PathBuf::from(format!("/cache{}/v{n}.jpg", url.path()));
+    let blob = PathBuf::from(format!("{REMOTE_CACHE_DIR}{}/v{n}.jpg", url.path()));
     RemoteBlob { url, blob }
 }
 
@@ -271,6 +274,7 @@ pub fn init(config: Config, light: &[&str], dark: &[&str]) -> ModelInit {
         restored: None,
         seed: 7,
         slot_uris: slot_uris(),
+        remote_cache_dir: PathBuf::from(REMOTE_CACHE_DIR),
     }
 }
 
@@ -376,6 +380,8 @@ pub struct World {
     /// Why writing the original keys back fails, for `RestoreKeys`. `None`
     /// when it works.
     pub restore_error: Option<String>,
+    /// GNOME refuses every key write: the keys stay as they are.
+    pub refuses_key_writes: bool,
     last_slot_inode: u64,
 }
 
@@ -391,6 +397,7 @@ impl World {
             slots: PerStyle::default(),
             keys: user_keys(),
             restore_error: None,
+            refuses_key_writes: false,
             last_slot_inode: 0,
         }
     }
@@ -465,6 +472,13 @@ impl World {
             Effect::Republish(style) => Some(Event::Republished {
                 style: *style,
                 result: Ok(self.write_slot(*style)),
+            }),
+            Effect::SetKeys {
+                uris,
+                picture_options,
+            } if self.refuses_key_writes => Some(Event::KeyWriteFailed {
+                uris: uris.clone(),
+                picture_options: *picture_options,
             }),
             Effect::SetKeys { .. } => {
                 write_keys(&mut self.keys, effect);

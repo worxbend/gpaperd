@@ -212,7 +212,6 @@ fn a_refused_write_after_a_reload_does_not_bring_back_options_that_left() {
             dark: Some(slots.dark),
         },
         picture_options: Some(PictureOptions::Spanned),
-        unconfirmed: false,
     };
 
     world.run(at(110), refused);
@@ -652,4 +651,27 @@ fn an_apply_mode_change_still_borrows_when_sources_stay() {
             .iter()
             .any(|(style, _)| *style == Style::Dark)
     );
+}
+
+#[test]
+fn a_failed_write_after_a_reload_does_not_bring_back_a_zoom_that_left() {
+    let zoom = changed(|config| config.general.picture_options = Some(PictureOptions::Zoom));
+    let mut world = World::new(init(zoom, &["/l/a.jpg"], &["/d/a.jpg"]));
+    world.keys.picture_options = "scaled".to_owned();
+    world.start(at(0), Style::Light);
+    world.run(at(100), reloaded(alphabetical()));
+    let slots = slot_uris();
+    let failed = Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: Some(slots.light),
+            dark: Some(slots.dark),
+        },
+        picture_options: Some(PictureOptions::Zoom),
+    };
+
+    world.run(at(110), failed);
+    let retried = world.run(at(170), DEADLINE);
+
+    let options = keys_written(&retried).last().map(|(_, options)| *options);
+    assert_eq!(options, Some(None));
 }

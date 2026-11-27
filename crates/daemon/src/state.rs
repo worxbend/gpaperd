@@ -6,7 +6,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpaperd_core::model::{Persisted, STATE_VERSION};
 use serde_json::Value;
@@ -28,8 +28,9 @@ pub enum StateError {
 /// Reads the state file. `Ok(None)` when it does not exist. Blocking I/O.
 ///
 /// An existing file is set to mode `0600` and its directory to `0700` before
-/// the bytes are treated as state. When that fails, it logs a warning and
-/// parses the bytes anyway. A missing file does not create the directory.
+/// the bytes are treated as state, each unless it is private already. When
+/// that fails, it logs a warning and parses the bytes anyway. A missing file
+/// does not create the directory.
 ///
 /// # Errors
 ///
@@ -37,8 +38,8 @@ pub enum StateError {
 /// where it is. [`StateError::Corrupt`] for
 /// invalid JSON or a wrong shape, including a missing version.
 /// [`StateError::UnsupportedVersion`] when the version is not `STATE_VERSION`.
-/// The caller logs those two and starts without state; the next [`save`]
-/// replaces the file. It does not replace a file that failed with I/O.
+/// The caller logs those two, moves the file away with [`set_aside`], and
+/// starts without state. It does not replace a file that failed with I/O.
 pub fn load(path: &Path) -> Result<Option<Persisted>, StateError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -77,6 +78,19 @@ fn corrupt(error: serde_json::Error) -> StateError {
     StateError::Corrupt(error.to_string())
 }
 
+/// Renames the state file at `path` to `<path>.corrupt`, replacing an older
+/// one there, so that the next [`save`] does not destroy its bytes. Returns
+/// the new path. Blocking I/O.
+///
+/// # Errors
+///
+/// When the rename fails. The file then stays where it is.
+pub fn set_aside(path: &Path) -> io::Result<PathBuf> {
+    let aside = path.with_added_extension("corrupt");
+    fs::rename(path, &aside)?;
+    Ok(aside)
+}
+
 /// Writes the state file: temp file in the same directory, `fsync`, rename,
 /// then `fsync` of the parent directory. A crash leaves the old or the new
 /// file, never a partial one. The parent directory is created when missing.
@@ -111,12 +125,24 @@ pub fn save(path: &Path, state: &Persisted) -> Result<(), StateError> {
     Ok(())
 }
 
-/// Sets the existing file at `path` to mode `0600` and its directory to `0700`.
+/// Sets the existing file at `path` to mode `0600` and its directory to `0700`,
+/// each unless group and others already have no access to it.
 fn make_private(path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        ensure_private_dir(dir)?;
+        restrict_to_owner(dir, 0o700)?;
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    restrict_to_owner(path, 0o600)
+}
+
+/// Sets `path` to `mode` when group or others have some access to it. A
+/// private mode is left alone, so a read-only mount loads with no failed
+/// `chmod`.
+fn restrict_to_owner(path: &Path, mode: u32) -> io::Result<()> {
+    let current = fs::metadata(path)?.permissions().mode();
+    if current & 0o077 == 0 {
+        return Ok(());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
 /// Creates `dir` when it is missing, then makes it readable by the user only.
@@ -387,6 +413,27 @@ mod tests {
         let mode = |path: &Path| MetadataExt::mode(&fs::metadata(path).unwrap()) & 0o777;
         assert_eq!(mode(&state_dir), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn load_leaves_a_mode_that_is_already_private() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("gpaperd");
+        fs::create_dir(&state_dir).unwrap();
+        let path = state_dir.join("state.json");
+        save(&path, &sample_state()).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let loaded = load(&path).unwrap();
+
+        let mode = |path: &Path| MetadataExt::mode(&fs::metadata(path).unwrap()) & 0o777;
+        let modes = (mode(&state_dir), mode(&path));
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(loaded, Some(sample_state()));
+        assert_eq!(modes, (0o500, 0o400));
     }
 
     #[test]

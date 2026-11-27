@@ -135,9 +135,19 @@ fn picture_options_are_written_with_the_first_key_only() {
     assert_eq!(written, [light_key_and_options, dark_key]);
 }
 
+/// A daemon like [`running_world`] whose config asks for `zoom`: a failed
+/// write of it is owed again.
+fn running_with_zoom() -> World {
+    let mut config = alphabetical();
+    config.general.picture_options = Some(PictureOptions::Zoom);
+    let mut world = World::new(two_folders_with(config));
+    world.start(at(0), Style::Light);
+    world
+}
+
 #[test]
 fn a_refused_key_write_is_tried_again_after_a_minute() {
-    let mut world = running_world();
+    let mut world = running_with_zoom();
     let slots = slot_uris();
     let failed = Event::KeyWriteFailed {
         uris: PerStyle {
@@ -145,7 +155,6 @@ fn a_refused_key_write_is_tried_again_after_a_minute() {
             dark: Some(slots.dark),
         },
         picture_options: Some(PictureOptions::Zoom),
-        unconfirmed: false,
     };
 
     let at_fail = world.run(at(100), failed);
@@ -169,7 +178,6 @@ fn an_event_during_the_minute_does_not_pull_the_retry_forward() {
             dark: Some(slots.dark),
         },
         picture_options: Some(PictureOptions::Zoom),
-        unconfirmed: false,
     };
 
     world.run(at(100), failed);
@@ -184,14 +192,13 @@ fn an_event_during_the_minute_does_not_pull_the_retry_forward() {
 
 #[test]
 fn a_refused_picture_options_write_waits_a_minute() {
-    let mut world = running_world();
+    let mut world = running_with_zoom();
     let failed = Event::KeyWriteFailed {
         uris: PerStyle {
             light: None,
             dark: None,
         },
         picture_options: Some(PictureOptions::Zoom),
-        unconfirmed: false,
     };
 
     let at_fail = world.run(at(100), failed);
@@ -205,7 +212,8 @@ fn a_refused_picture_options_write_waits_a_minute() {
     assert_eq!(zoom, Some(Some(PictureOptions::Zoom)));
 }
 
-/// Settings did not answer the write of both slot URIs at second 100.
+/// Settings did not answer the write of both slot URIs at second 100: the
+/// core hears of it as of a failed write. The write may still land.
 fn unconfirmed_slot_write() -> Event {
     let slots = slot_uris();
     Event::KeyWriteFailed {
@@ -214,7 +222,6 @@ fn unconfirmed_slot_write() -> Event {
             dark: Some(slots.dark),
         },
         picture_options: None,
-        unconfirmed: true,
     }
 }
 
@@ -250,7 +257,7 @@ fn a_user_change_after_a_late_landing_is_an_external_change() {
 
 #[test]
 fn a_refused_write_of_one_style_still_retries_the_other() {
-    let mut world = running_world();
+    let mut world = running_with_zoom();
     let slots = slot_uris();
     let failed = Event::KeyWriteFailed {
         uris: PerStyle {
@@ -258,7 +265,6 @@ fn a_refused_write_of_one_style_still_retries_the_other() {
             dark: Some(slots.dark),
         },
         picture_options: Some(PictureOptions::Zoom),
-        unconfirmed: false,
     };
 
     let at_fail = world.run(at(100), failed);
@@ -284,7 +290,6 @@ fn a_user_change_while_a_refused_options_write_waits_is_an_external_change() {
             dark: None,
         },
         picture_options: Some(PictureOptions::Zoom),
-        unconfirmed: false,
     };
     world.run(at(100), options_failed);
 
@@ -293,4 +298,33 @@ fn a_user_change_while_a_refused_options_write_waits_is_an_external_change() {
 
     assert!(world.model.persisted().styles[Style::Light].paused);
     assert_eq!(world.keys.picture_uri, "file:///home/u/Pictures/picked.jpg");
+}
+
+#[test]
+fn a_user_change_while_a_refused_first_write_waits_is_an_external_change() {
+    let mut world = World::new(two_folders());
+    world.refuses_key_writes = true;
+    world.start(at(0), Style::Light);
+    world.refuses_key_writes = false;
+
+    world.set_key(at(10), Style::Light, "file:///home/u/Pictures/picked.jpg");
+    let at_retry = world.run(at(60), DEADLINE);
+
+    assert!(world.model.persisted().styles[Style::Light].paused);
+    assert_eq!(keys_pointed(&at_retry), [[Style::Dark]]);
+    assert_eq!(world.keys.picture_uri, "file:///home/u/Pictures/picked.jpg");
+}
+
+#[test]
+fn a_refused_zoom_that_replaces_none_is_written_again() {
+    let mut world = World::new(two_folders());
+    world.keys.picture_options = "none".to_owned();
+    world.refuses_key_writes = true;
+    world.start(at(0), Style::Light);
+    world.refuses_key_writes = false;
+
+    let retried = world.run(at(60), DEADLINE);
+
+    let options = keys_written(&retried).last().map(|(_, options)| *options);
+    assert_eq!(options, Some(Some(PictureOptions::Zoom)));
 }

@@ -89,21 +89,20 @@ pub enum Event {
         result: Result<Config, ConfigError>,
     },
     /// Answer to [`Effect::RestoreKeys`] for the [`Command::Restore`] with
-    /// this `id`: whether the original keys were written, with the error
-    /// text when not. Answered with [`Reply::Done`] or [`Reply::Failed`].
+    /// this `id`: whether every original key was written, with the error
+    /// text when not. The keys that could be written are written even then.
+    /// Answered with [`Reply::Done`] or [`Reply::Failed`].
     KeysRestored {
         id: ReplyId,
         result: Result<(), String>,
     },
     /// Keys of an [`Effect::SetKeys`] that were not stored, or whose write
     /// was not confirmed. A `Some` names such a key. A `None` key was stored
-    /// or was not part of the write.
+    /// or was not part of the write. An unconfirmed write may still land
+    /// later, and GNOME then reports it as any other change.
     KeyWriteFailed {
         uris: PerStyle<Option<String>>,
         picture_options: Option<PictureOptions>,
-        /// Settings did not answer in time. The write may still land later,
-        /// and GNOME then reports it as any other change.
-        unconfirmed: bool,
     },
     /// The screen was locked or unlocked: `org.gnome.ScreenSaver`'s
     /// `ActiveChanged`, or its `GetActive` at start. May come before

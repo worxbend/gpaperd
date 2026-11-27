@@ -111,6 +111,9 @@ pub struct ModelInit {
     /// The `file://` URI of each style's slot file: what the style's key
     /// holds in slots mode.
     pub slot_uris: PerStyle<String>,
+    /// The directory of the remote cache. In uri mode a key that names a
+    /// file under it shows a cached remote image.
+    pub remote_cache_dir: PathBuf,
 }
 
 /// All state of the daemon's core. Only [`crate::step::step`] changes it.
@@ -134,6 +137,7 @@ pub struct Model {
     pub(crate) visible: Style,
     pub(crate) original_keys: Option<BackgroundKeys>,
     slot_uris: PerStyle<String>,
+    remote_cache_dir: PathBuf,
     rng: SmallRng,
     pub(crate) phase: Phase,
     /// The `picture-options` value that goes out with the next key write.
@@ -374,7 +378,11 @@ impl StyleState {
             user_paused: self.user_paused,
             history: self.history.clone(),
             // Before `Started` this run has not looked at the key yet.
-            key_uri: self.key.written.clone().or(self.saved_key_uri.clone()),
+            key_uri: self
+                .key
+                .landed_uri()
+                .map(str::to_owned)
+                .or(self.saved_key_uri.clone()),
         }
     }
 }
@@ -403,6 +411,7 @@ impl Model {
             restored,
             seed,
             slot_uris,
+            remote_cache_dir,
         } = init;
         let awaits_config = config.is_none();
         let config = config.unwrap_or_default();
@@ -424,6 +433,7 @@ impl Model {
             visible: Style::Light,
             original_keys,
             slot_uris,
+            remote_cache_dir,
             rng: SmallRng::seed_from_u64(seed),
             phase: Phase::Created,
             picture_options_owed: None,
@@ -548,12 +558,22 @@ impl Model {
         })
     }
 
-    /// Whether some key in `keys` names its style's slot file. Such keys
-    /// were written by an earlier run, so they are not the user's.
-    pub(crate) fn names_a_slot(&self, keys: &BackgroundKeys) -> bool {
-        Style::ALL
-            .into_iter()
-            .any(|style| keys.uri(style) == Some(self.slot_uris[style].as_str()))
+    /// Whether some key in `keys` names its style's slot file or a file in
+    /// the remote cache. Such keys were written by an earlier run, so they
+    /// are not the user's.
+    pub(crate) fn names_a_daemon_file(&self, keys: &BackgroundKeys) -> bool {
+        Style::ALL.into_iter().any(|style| {
+            keys.uri(style)
+                .is_some_and(|uri| uri == self.slot_uris[style] || self.is_in_remote_cache(uri))
+        })
+    }
+
+    /// Whether `uri` is a `file://` URI of a path under the remote cache.
+    fn is_in_remote_cache(&self, uri: &str) -> bool {
+        Url::parse(uri)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .is_some_and(|path| path.starts_with(&self.remote_cache_dir))
     }
 
     /// The value that `style`'s key may be locked on while the style still
@@ -644,10 +664,7 @@ impl Model {
     /// that waited is written back.
     pub(crate) fn reassert_at_tick(&mut self) {
         for style in Style::ALL {
-            let key = &mut self.styles[style].key;
-            if key.reassert == Some(Reassert::AtNextTick) {
-                key.reassert = Some(Reassert::Now);
-            }
+            self.styles[style].key.end_tick_wait();
         }
     }
 
@@ -681,7 +698,7 @@ impl Model {
         let short_waits = Style::ALL.into_iter().flat_map(|style| {
             let reassert = match self.styles[style].key.reassert {
                 Some(Reassert::At(due) | Reassert::Retry(due)) => Some(due),
-                Some(Reassert::Now | Reassert::AtNextTick) | None => None,
+                Some(Reassert::Now | Reassert::RetryNow | Reassert::AtNextTick) | None => None,
             };
             [self.refresh_deadline(style), reassert]
         });
@@ -874,6 +891,34 @@ impl Model {
     /// tells a round from before M2 what it showed.
     pub(crate) fn join_rounds_after_scan(&mut self, changed: Style, delta: &CatalogDelta) {
         self.join_rounds_by(changed, delta, ShuffleBag::scanned);
+        self.learn_shown_from_pool(changed);
+    }
+
+    /// Tells `style`'s round from before M2 what it showed once its own scan
+    /// is in, when that scan did not reach the round: `style` picks from no
+    /// catalog, or from the other style's. What the round does not hold of
+    /// the catalog it picks from now, it showed.
+    fn learn_shown_from_pool(&mut self, style: Style) {
+        let is_shuffled = self.config.styles[style].order == Order::Random;
+        if !is_shuffled || self.styles[style].bag.knows_shown() {
+            return;
+        }
+        // The other style's first scan may still give the round a catalog to
+        // pick from: that scan tells it what it showed.
+        let may_borrow_later = self.config.general.empty_style == EmptyStylePolicy::UseOtherStyle
+            && !self.is_scanned[style.other()];
+        if self.pool(style).is_none() && may_borrow_later {
+            return;
+        }
+        let on_screen = self.styles[style].current.as_ref();
+        let in_pool: Vec<ItemId> = self
+            .pool(style)
+            .into_iter()
+            .flat_map(|pool| self.catalogs[pool].candidates())
+            .map(|item| item.id.clone())
+            .filter(|id| Some(id) != on_screen)
+            .collect();
+        self.styles[style].bag.scanned(in_pool, &mut self.rng);
     }
 
     fn join_rounds_by(

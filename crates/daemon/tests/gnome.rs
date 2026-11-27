@@ -582,6 +582,67 @@ isolated_test!(
 );
 
 isolated_test!(
+    a_restore_that_cannot_put_back_locked_picture_options_names_them,
+    GNOME,
+    async |sandbox| {
+        let admins_settings = "[org/gnome/desktop/background]\n\
+            picture-uri='file:///user/light.png'\n\
+            picture-uri-dark='file:///user/dark.png'\n\
+            picture-options='scaled'\n";
+        sandbox.write_settings(admins_settings);
+        sandbox.lock_settings();
+        let (gnome, _events) = spawn_gnome();
+        let users_keys = BackgroundKeys {
+            picture_uri: "file:///user/light.png".to_owned(),
+            picture_uri_dark: Some("file:///user/dark.png".to_owned()),
+            picture_options: "zoom".to_owned(),
+        };
+
+        let restored = gnome.restore_keys(users_keys).await;
+
+        assert_eq!(
+            restored,
+            Err(GnomeError::Write {
+                reason: "locked keys: picture-options".to_owned(),
+                unstored: vec!["picture-options".to_owned()],
+            })
+        );
+        assert_eq!(sandbox.read_settings(), admins_settings);
+    }
+);
+
+isolated_test!(
+    a_restore_onto_locked_keys_names_every_key_it_could_not_put_back,
+    GNOME,
+    async |sandbox| {
+        let admins_settings = "[org/gnome/desktop/background]\n\
+            picture-uri='file:///admin/light.png'\n\
+            picture-uri-dark='file:///admin/dark.png'\n\
+            picture-options='scaled'\n";
+        sandbox.write_settings(admins_settings);
+        sandbox.lock_settings();
+        let (gnome, _events) = spawn_gnome();
+        let users_keys = BackgroundKeys {
+            picture_uri: "file:///user/light.png".to_owned(),
+            picture_uri_dark: Some("file:///user/dark.png".to_owned()),
+            picture_options: "zoom".to_owned(),
+        };
+
+        let restored = gnome.restore_keys(users_keys).await;
+
+        let unstored = ["picture-uri", "picture-uri-dark", "picture-options"];
+        assert_eq!(
+            restored,
+            Err(GnomeError::Write {
+                reason: format!("locked keys: {}", unstored.join(", ")),
+                unstored: unstored.map(str::to_owned).to_vec(),
+            })
+        );
+        assert_eq!(sandbox.read_settings(), admins_settings);
+    }
+);
+
+isolated_test!(
     value_the_schema_refuses_fails_the_write_and_changes_no_key,
     FEWER_OPTIONS,
     async |_sandbox| {

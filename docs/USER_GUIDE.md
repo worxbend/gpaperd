@@ -123,7 +123,13 @@ journalctl --user -u gpaperd -f
 The first time it runs, gpaperd saves your current wallpaper settings, then
 points GNOME's background keys at two files it manages in
 `~/.local/share/gpaperd/slots/`. `gpaperctl restore` puts your old settings
-back at any time.
+back at any time. A key an administrator locked stays as it is: restore
+writes the others and fails, naming the locked keys.
+
+If the state file is lost, gpaperd does not save keys that name a slot or a
+downloaded image as your settings, and `restore` fails with `no original
+keys are saved`. With `apply_mode = "uri"`, a key that names one of your own
+images is saved instead, and `restore` puts that image back.
 
 ## 4. Configure
 

@@ -102,7 +102,7 @@ impl Turn<'_> {
         self.model.restores.remove(index);
         let reply = match result {
             Ok(()) => Reply::Done,
-            Err(error) => Reply::Failed(format!("the original keys were not restored: {error}")),
+            Err(error) => Reply::Failed(format!("not every original key was restored: {error}")),
         };
         self.reply(id, reply);
     }
@@ -176,7 +176,9 @@ impl Turn<'_> {
     }
 
     /// Starts a requested rotation of `style`: with the next image of its
-    /// order, or the newest one of its history that can still be shown.
+    /// order, or the newest one of its history that can still be shown. A
+    /// key that waits for the next tick is written back with it: the clock
+    /// that would bring that tick may be stopped.
     fn start_request(&mut self, style: Style, direction: Direction) -> RequestStage {
         if let Some(why) = self.why_style_cannot_change(style) {
             return RequestStage::Finished(Err(why));
@@ -191,6 +193,7 @@ impl Turn<'_> {
         };
         match (candidate, direction) {
             (Some(candidate), _) => {
+                self.model.styles[style].key.end_tick_wait();
                 self.probe(style, candidate, Vec::new());
                 RequestStage::Running { before }
             }

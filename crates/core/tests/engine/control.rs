@@ -908,15 +908,29 @@ fn uri_mode_announces_the_image_with_its_key_write() {
 fn next_in_uri_mode_does_not_wait_for_a_key_written_later() {
     let mut config = alphabetical();
     config.general.apply_mode = ApplyMode::Uri;
-    config.general.on_external_change = ExternalChangePolicy::ReassertNextTick;
+    config.general.on_external_change = ExternalChangePolicy::ReassertNow;
     let mut world = World::new(two_folders_with(config));
     world.start(at(0), Style::Light);
     world.set_key(at(5), Style::Light, "file:///home/u/Pictures/picked.jpg");
 
-    let trace = world.ask(at(10), 1, NEXT);
+    let trace = world.ask(at(5), 1, NEXT);
 
     let Reply::Failed(why) = the_reply(&trace) else {
         panic!("expected a failure");
     };
     assert!(why.contains("written later"), "{why}");
+}
+
+#[test]
+fn next_writes_back_a_key_that_waits_for_the_next_tick() {
+    let mut config = alphabetical();
+    config.general.on_external_change = ExternalChangePolicy::ReassertNextTick;
+    let mut world = World::new(two_folders_with(config));
+    world.start(at(0), Style::Light);
+    world.set_key(at(100), Style::Light, "file:///home/u/Pictures/picked.jpg");
+
+    let trace = world.ask(at(200), 1, NEXT);
+
+    assert_eq!(the_reply(&trace), &Reply::Done);
+    assert_eq!(world.keys.picture_uri, slot_uris().light);
 }

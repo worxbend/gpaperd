@@ -105,7 +105,8 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// - [`Event::Started`]: ask for the scan and the watch of each style's
 ///   sources with [`Effect::Watch`], record the visible style, and keep the
 ///   snapshot's keys as the original keys unless restored state already has
-///   some, or a key names its slot file. Then the first apply, per style, hidden or not: a slot that is
+///   some, or a key names its slot file or a file in the remote cache
+///   (`ModelInit::remote_cache_dir`). Then the first apply, per style, hidden or not: a slot that is
 ///   missing or has another inode than the restored one is still to be
 ///   filled, with its current item when that is still usable, else with a
 ///   first pick. An intact slot is left alone, even when its item left the
@@ -125,8 +126,12 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///   locked on the slot URI is fine, because a rotation only replaces the
 ///   slot file. A style that the last run left paused stays paused, unless
 ///   its key holds the daemon's value again: the slot URI, or in uri mode
-///   the image URI that the last run wrote (saved). When the slot on screen
-///   is dirty, its refresh is planned as after a style switch.
+///   the image URI that the last run wrote (saved). A missing key ends a
+///   saved external-change pause. When what the keys tell changes the saved
+///   state, [`Effect::Persist`] saves it at once, so that a run killed
+///   before its next save does not leave the old pause for the next one.
+///   When the slot on screen is dirty, its refresh is planned as after a
+///   style switch.
 /// - [`Event::Scanned`] and [`Event::Fs`]: bring the style's catalog up to
 ///   date. A scan replaces it; a file change adds, removes or updates one
 ///   file. A check is kept for as long as its file's stamp stays the same.
@@ -211,15 +216,17 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     unless it holds the daemon's URI again by then. One change more than
 ///     [`MAX_KEY_FLIPS_PER_MINUTE`] within a minute pauses the style, as
 ///     `pause` does.
-/// - [`Event::KeyWriteFailed`]: the write did not land. Each style whose
-///   recorded URI is still the one that failed goes back to the URI on record
-///   before it, and is tried again after [`KEY_WRITE_RETRY`]. Another value
-///   of the key meanwhile is an external change. An unconfirmed write keeps
-///   the URI on record: when GNOME reports it landed, the retry is called
-///   off, and a later change is an external change. A style the failure does
-///   not name is left alone. A failure of `picture-options` alone arms the same retry.
-///   Options owed for a write that still matches are restored, unless a
-///   reload dropped them meanwhile.
+/// - [`Event::KeyWriteFailed`]: the write did not land, or was not
+///   confirmed. Each style whose recorded URI is still the one that failed
+///   keeps it on record, and is tried again after [`KEY_WRITE_RETRY`]. The
+///   key holds what GNOME last reported meanwhile: another value of it is an
+///   external change, also once the wait is over and the write waits for a
+///   busy style. When GNOME reports the failed URI after all, the retry is
+///   called off, and a later change is an external change. A style the
+///   failure does not name is left alone. A failure of `picture-options`
+///   alone arms the same retry. Options owed for a write that still matches
+///   are restored while the daemon would still write them: a reload may have
+///   dropped them meanwhile.
 /// - [`Event::ConfigChanged`] with `Err`: nothing. The running config stays.
 /// - [`Event::ConfigChanged`] with `Ok`: the new config is the running one
 ///   from here on, and what differs is applied:
@@ -278,7 +285,9 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     another usable image, without a config, or whose key is missing,
 ///     locked or not the daemon's (an external-change pause, or the user's
 ///     own value after `Restore` or a restart under a user pause) fails at
-///     once: no image is shown that the key does not name.
+///     once: no image is shown that the key does not name. A key that waits
+///     for the next tick under `reassert-next-tick` is written back with
+///     the rotation that a `Next` or `Previous` starts.
 ///   - Every publish of another image pushes the one it replaced onto the
 ///     style's history (20 entries, saved). `Previous` pops it and shows the
 ///     newest entry that is still usable, skipping gone or failing ones,
@@ -435,8 +444,7 @@ impl Turn<'_> {
             Event::KeyWriteFailed {
                 uris,
                 picture_options,
-                unconfirmed,
-            } => self.on_key_write_failed(uris, picture_options, unconfirmed),
+            } => self.on_key_write_failed(uris, picture_options),
             Event::Scanned { style, files } => {
                 let delta = self.model.replace_catalog(style, files);
                 self.model.join_rounds_after_scan(style, &delta);
@@ -465,10 +473,14 @@ impl Turn<'_> {
         self.model.visible = gnome.visible;
         self.model.picture_options_owed = picture_options;
         self.watch_sources();
+        let saved = self.model.persisted();
         self.adopt_keys(&gnome);
-        // A lost state file leaves the keys on the slots: saving those as the
-        // originals would make `restore` write the slots back.
-        if self.model.original_keys.is_none() && !self.model.names_a_slot(&gnome.keys) {
+        if self.model.persisted() != saved {
+            self.persist();
+        }
+        // A lost state file leaves the keys on the slots or on cached images:
+        // saving those as the originals would make `restore` write them back.
+        if self.model.original_keys.is_none() && !self.model.names_a_daemon_file(&gnome.keys) {
             self.model.original_keys = Some(gnome.keys);
         }
         self.absorb_clock_steps();
@@ -519,7 +531,7 @@ impl Turn<'_> {
             match &mut state.key.reassert {
                 Some(Reassert::At(due)) => *due = no_later_than(*due, now, reassert_delay),
                 Some(Reassert::Retry(due)) => *due = no_later_than(*due, now, KEY_WRITE_RETRY),
-                Some(Reassert::Now | Reassert::AtNextTick) | None => {}
+                Some(Reassert::Now | Reassert::RetryNow | Reassert::AtNextTick) | None => {}
             }
             state.refresh_due = state
                 .refresh_due

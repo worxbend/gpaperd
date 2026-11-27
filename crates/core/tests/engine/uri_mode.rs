@@ -121,6 +121,27 @@ fn a_path_is_percent_encoded_in_its_uri() {
 }
 
 #[test]
+fn a_cached_image_uri_found_without_a_state_file_is_not_saved_as_the_original() {
+    let mut world = World::new(two_folders_with(uri_mode()));
+    world.keys.picture_uri = "file:///cache/img.test/a%20b.jpg/v1.jpg".to_owned();
+
+    world.start(at(0), Style::Light);
+
+    assert_eq!(world.model.persisted().original_keys, None);
+}
+
+#[test]
+fn a_uri_beside_the_cache_directory_is_saved_as_the_original() {
+    let mut world = World::new(two_folders_with(uri_mode()));
+    world.keys.picture_uri = "file:///cache-old/day.jpg".to_owned();
+
+    world.start(at(0), Style::Light);
+
+    let saved = world.model.persisted().original_keys.expect("originals");
+    assert_eq!(saved.picture_uri, "file:///cache-old/day.jpg");
+}
+
+#[test]
 fn a_key_that_no_longer_holds_the_last_uri_is_an_external_change() {
     let mut world = running_in_uri_mode();
 
@@ -477,7 +498,6 @@ fn a_planned_key_write_does_not_announce_the_image() {
                 dark: None,
             },
             picture_options: None,
-            unconfirmed: false,
         },
     );
 
@@ -522,7 +542,6 @@ fn light_b_refused() -> Event {
             dark: None,
         },
         picture_options: None,
-        unconfirmed: false,
     }
 }
 
@@ -582,4 +601,30 @@ fn a_refused_write_of_a_user_paused_style_is_still_tried_again() {
         keys_written(&at_retry),
         one_write(Some("file:///l/b.jpg"), None)
     );
+}
+
+#[test]
+fn a_user_change_while_a_due_retry_waits_for_a_rotation_is_an_external_change() {
+    let mut world = light_b_write_refused(running_in_uri_mode(), DEADLINE);
+    let next = control(1, Command::Next(StyleTarget::Visible));
+    let busy = step(&mut world.model, at(950), next);
+    assert_eq!(probed(&busy).len(), 1);
+    step(&mut world.model, at(962), DEADLINE);
+
+    world.keys.picture_uri = PICKED.to_owned();
+    step(&mut world.model, at(970), keys_changed(world.keys.clone()));
+
+    assert!(world.model.persisted().styles[Style::Light].paused);
+}
+
+#[test]
+fn a_retry_that_is_refused_again_still_saves_the_uri_the_key_holds() {
+    let mut world = light_b_write_refused(running_in_uri_mode(), DEADLINE);
+    let retried = step(&mut world.model, at(962), DEADLINE);
+    assert!(retried.iter().any(is_set_keys));
+
+    step(&mut world.model, at(963), light_b_refused());
+
+    let saved = world.model.persisted().styles.light;
+    assert_eq!(saved.key_uri.as_deref(), Some("file:///l/a.jpg"));
 }

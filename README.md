@@ -55,14 +55,16 @@ every slide's texture, and the order is fixed when the file is generated.
 The [user guide](docs/USER_GUIDE.md) walks through installing, starting,
 configuring and removing gpaperd.
 
-Quick install from the newest GitHub release (x86_64 or aarch64, glibc 2.39+;
-no root needed):
+Install from the newest GitHub release (x86_64 or aarch64, glibc 2.39+;
+no root needed). Save the script and read it, then run it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh
+curl -fsSLO https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh
+less install.sh
+sh install.sh
 ```
 
-It puts `gpaperd` and `gpaperctl` in `~/.local/bin`, installs the man pages
+It checks the release archive against the release's `SHA256SUMS`, puts `gpaperd` and `gpaperctl` in `~/.local/bin`, installs the man pages
 and the user unit, writes a starter config if you have none, and starts the
 unit in a GNOME session. `sh install.sh --help` lists the options, including
 `--uninstall`. `cargo binstall --git https://github.com/worxbend/gpaperd
@@ -219,6 +221,7 @@ D-Bus: name and interface `io.github.worxbend.Gpaperd1`, object
 | `~/.config/gpaperd/config.toml` | Config |
 | `~/.local/share/gpaperd/slots/{light,dark}` | Slot files the keys point at. Under data, not cache, so a cache cleaner cannot blank the desktop |
 | `~/.local/state/gpaperd/state.json` | Current images, shuffle bags, deadlines, pauses, history, your original keys |
+| `~/.local/state/gpaperd/state.json.corrupt` | The last state file that could not be read. A newer one replaces it |
 | `~/.cache/gpaperd/remote/` | Downloaded images |
 
 Each path follows the matching `XDG_*_HOME` variable when it is set.
@@ -250,6 +253,8 @@ Each path follows the matching `XDG_*_HOME` variable when it is set.
   gpaperd to get instant updates again.
 - **Undo everything.** `gpaperctl restore` writes back the keys you had
   before gpaperd first ran and pauses rotation. Then disable the unit.
+  A key an administrator locked stays as it is: restore writes the others
+  and fails, naming the locked keys.
 
 Logs go to the journal at level info, with the fields `STYLE=`, `ITEM=`,
 `METHOD=`, `REASON=` and `PATH=`:

@@ -25,7 +25,8 @@ use proptest::test_runner::TestCaseError;
 
 use super::scenario::{Boot, Folders, Op, Reload, Scenario};
 use crate::support::{
-    at, id, is_set_keys, keys_changed, slot_uris, started, started_with_locks, user_keys, version,
+    REMOTE_CACHE_DIR, at, id, is_set_keys, keys_changed, slot_uris, started, started_with_locks,
+    user_keys, version,
 };
 
 /// Answers the daemon may still owe after the last generated op. Each style
@@ -1651,6 +1652,7 @@ pub fn new_model(
         restored,
         seed,
         slot_uris: slot_uris(),
+        remote_cache_dir: PathBuf::from(REMOTE_CACHE_DIR),
     })
 }
 
@@ -1665,6 +1667,7 @@ fn restored(styles: PerStyle<StylePersisted>, files: PerStyle<Option<Vec<LocalFi
         }),
         seed: 1,
         slot_uris: slot_uris(),
+        remote_cache_dir: PathBuf::from(REMOTE_CACHE_DIR),
     })
 }
 
@@ -1702,6 +1705,41 @@ fn a_missing_key_keeps_the_saved_uri_for_persist() {
         model.persisted().styles.dark.key_uri.as_deref(),
         Some(saved_uri.as_str())
     );
+}
+
+/// A run that is killed before it saves anything else must not leave the
+/// ended pause in the state file: the next run would take the user's key for
+/// the daemon's and write over it.
+#[test]
+fn a_missing_key_saves_the_end_of_an_external_change_pause_at_start() {
+    let paused = StylePersisted {
+        paused: true,
+        user_paused: true,
+        ..StylePersisted::default()
+    };
+    let mut model = restored(
+        PerStyle {
+            light: StylePersisted::default(),
+            dark: paused,
+        },
+        PerStyle::default(),
+    );
+    let mut keys = user_keys();
+    keys.picture_uri_dark = None;
+
+    let effects = step(
+        &mut model,
+        at(0),
+        started(Style::Light, keys, PerStyle::default()),
+    );
+
+    assert!(
+        effects.contains(&Effect::Persist),
+        "the start saved nothing"
+    );
+    let dark = &model.persisted().styles.dark;
+    assert!(!dark.paused, "the external-change pause outlived the key");
+    assert!(dark.user_paused, "the user pause was dropped");
 }
 
 #[test]

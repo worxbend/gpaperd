@@ -63,6 +63,10 @@ Unset leaves the key alone, except that
 .B none
 (which shows no image) is turned into
 .BR zoom .
+A failed write of that
+.B zoom
+is retried only while the key still holds
+.BR none .
 .B none
 is refused here.
 .TP
@@ -76,7 +80,11 @@ a config reload, or the key points at
 .B gpaperd
 again.
 .B reassert\-next\-tick
-writes the key back at the next change.
+writes the key back at the next change; a
+.B gpaperctl next
+or
+.B previous
+of that style writes it back with the image it shows.
 .B reassert\-now
 writes it back after 1 second; more than 3 changes within a minute mean
 another tool is fighting over the key, and the style pauses.

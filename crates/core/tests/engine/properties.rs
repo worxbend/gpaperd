@@ -275,11 +275,10 @@ fn any_event() -> impl Strategy<Value = Event> {
                 Err("the key is locked".to_owned())
             },
         }),
-        1 => (any_failed_uris(), any_picture_options(), any::<bool>()).prop_map(
-            |(uris, picture_options, unconfirmed)| Event::KeyWriteFailed {
+        1 => (any_failed_uris(), any_picture_options()).prop_map(
+            |(uris, picture_options)| Event::KeyWriteFailed {
                 uris,
                 picture_options,
-                unconfirmed,
             }
         ),
         1 => Just(Event::Shutdown),

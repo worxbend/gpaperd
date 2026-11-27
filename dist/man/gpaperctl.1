@@ -56,8 +56,16 @@ first wrote them, and pause both styles.
 .B resume
 hands the keys back to
 .BR gpaperd .
-Fails when no original keys are saved, for example when the state file
-was lost while the keys pointed at the slots.
+A key that an administrator locked stays as it is: every other key is
+written back, and the command fails naming the locked keys.
+Fails when no original keys are saved.
+After the state file is lost, keys that name a slot or a downloaded image
+are not saved as originals.
+With
+.BR "apply_mode = \(dquri\(dq" ,
+a key that names a local image is saved as an original then, and
+.B restore
+writes that image back.
 .TP
 .B status
 Print the style on screen, the next change in local time, and for each
@@ -109,8 +117,9 @@ With
 .B next
 and
 .B previous
-also exit 1 when the image changed but the key write waits for a retry or
-the next change.
+also exit 1 when the image changed but the key write waits for a retry
+after a failed write, or for the 1 second wait of
+.BR "on_external_change = \(dqreassert\-now\(dq" .
 The reason goes to stderr.
 .TP
 .B 2

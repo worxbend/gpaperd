@@ -125,13 +125,14 @@ impl ShuffleBag {
         }
     }
 
-    /// Adds the scan's new or changed catalog items, as
-    /// [`ShuffleBag::insert`] does.
+    /// Adds `ids` after a scan, as [`ShuffleBag::insert`] does: the scan's
+    /// new or changed catalog items, or every item of the catalog that the
+    /// round picks from.
     ///
     /// A round from [`ShuffleBag::restore_queue_only`] learns here what it
-    /// showed: each id the round does not hold, including the one on screen
-    /// when the scan passes it. None of them joins, and the round knows what
-    /// it showed from now on, even when the scan passed nothing. With no
+    /// showed: each id of `ids` that the round does not hold, including the
+    /// one on screen when `ids` holds it. None of them joins, and the round
+    /// knows what it showed from now on, even when `ids` is empty. With no
     /// round in progress it does nothing: the next round starts known.
     pub fn scanned(&mut self, ids: impl IntoIterator<Item = ItemId>, rng: &mut impl Rng) {
         if !self.is_shown_unknown || self.queue.is_empty() {

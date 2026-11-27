@@ -222,6 +222,31 @@ fn restore_whose_write_fails_returns_the_error() {
 }
 
 #[test]
+fn restore_writes_the_keys_that_are_not_locked_and_names_the_locked_one() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let (world, daemon) = running_daemon(&bus).await;
+        let client = bus.client().await;
+        world.gnome.lock_key(Style::Dark);
+
+        let error = client.restore().await.expect_err("Restore() fails");
+
+        let text = error.to_string();
+        assert!(text.contains("locked keys: picture-uri-dark"), "{text}");
+        assert!(!text.contains("picture-uri,"), "{text}");
+        assert_eq!(
+            world.gnome.key(Style::Light),
+            Some(users_keys().picture_uri)
+        );
+        assert_eq!(
+            world.gnome.key(Style::Dark),
+            Some(world.slot_uri(Style::Dark))
+        );
+        daemon.terminate().await;
+    });
+}
+
+#[test]
 fn a_restore_in_flight_when_the_daemon_stops_is_not_answered_failed() {
     scenario(async {
         let bus = PrivateBus::start();

@@ -68,9 +68,10 @@ pub trait GnomePort {
     /// raw enum nick. For `gpaperctl restore`, whose values come from the
     /// user and need not be ones that the daemon would write.
     ///
-    /// Locked keys and refused writes fail as in [`GnomePort::set_keys`],
-    /// except that a `picture-options` locked at `none` blocks only a
-    /// restore that would change it.
+    /// Every key that is not locked is written back, even when another one
+    /// is locked. The call then fails if a key that needs a change is
+    /// locked, at any value: the error names each such key, and each key
+    /// the backend refused.
     fn restore_keys(&self, keys: BackgroundKeys) -> impl Future<Output = Result<(), GnomeError>>;
 }
 
@@ -421,6 +422,8 @@ impl Session {
         self.write_changes(self.wanted(write), blocking)
     }
 
+    /// Commits every key of `keys` that is not set yet and not locked, then
+    /// fails naming the locked ones, whatever value they are locked at.
     fn restore(&self, keys: &BackgroundKeys) -> Result<(), GnomeError> {
         let mut wanted = vec![(PICTURE_URI, keys.picture_uri.as_str())];
         if let Some(dark_uri) = &keys.picture_uri_dark
@@ -429,7 +432,23 @@ impl Session {
             wanted.push((PICTURE_URI_DARK, dark_uri.as_str()));
         }
         wanted.push((PICTURE_OPTIONS, keys.picture_options.as_str()));
-        self.write_changes(wanted, &[])
+        let (locked, writable): (Vec<_>, Vec<_>) = wanted
+            .into_iter()
+            .filter(|change| self.is_outstanding(change))
+            .partition(|(key, _)| self.is_locked(key));
+        let committed = if writable.is_empty() {
+            Ok(())
+        } else {
+            self.commit(&writable)
+        };
+        if locked.is_empty() {
+            return committed;
+        }
+        let locked_error = write_error(format!("locked keys: {}", key_names(&locked)), &locked);
+        Err(match committed {
+            Ok(()) => locked_error,
+            Err(refused) => join_write_errors(refused, locked_error),
+        })
     }
 
     /// Commits the changes that are not set yet. A locked key, or a key in
@@ -544,6 +563,30 @@ fn options_block_the_write(options_locked: bool, current_options: &str) -> bool 
 /// value. Writing it anyway would fail every write that carries it.
 fn options_stay_as_locked(options_locked: bool, current_options: &str) -> bool {
     options_locked && current_options != "none"
+}
+
+/// One error for two failed parts of a restore: both reasons, every
+/// unstored key. Anything but two [`GnomeError::Write`] keeps `first`.
+fn join_write_errors(first: GnomeError, second: GnomeError) -> GnomeError {
+    match (first, second) {
+        (
+            GnomeError::Write {
+                reason: first_reason,
+                unstored: mut first_unstored,
+            },
+            GnomeError::Write {
+                reason: second_reason,
+                unstored: second_unstored,
+            },
+        ) => {
+            first_unstored.extend(second_unstored);
+            GnomeError::Write {
+                reason: format!("{first_reason}; {second_reason}"),
+                unstored: first_unstored,
+            }
+        }
+        (first, _) => first,
+    }
 }
 
 fn key_names(changes: &[KeyChange<'_>]) -> String {
@@ -766,6 +809,29 @@ mod tests {
         assert!(options_stay_as_locked(true, "scaled"));
         assert!(!options_stay_as_locked(true, "none"));
         assert!(!options_stay_as_locked(false, "scaled"));
+    }
+
+    #[test]
+    fn a_restore_refused_in_part_and_locked_in_part_names_every_unstored_key() {
+        let refused = write_error(
+            "refused by the backend: picture-uri".to_owned(),
+            &[(PICTURE_URI, "file:///user/light.png")],
+        );
+        let locked = write_error(
+            "locked keys: picture-options".to_owned(),
+            &[(PICTURE_OPTIONS, "zoom")],
+        );
+
+        let joined = join_write_errors(refused, locked);
+
+        assert_eq!(
+            joined,
+            GnomeError::Write {
+                reason: "refused by the backend: picture-uri; locked keys: picture-options"
+                    .to_owned(),
+                unstored: vec![PICTURE_URI.to_owned(), PICTURE_OPTIONS.to_owned()],
+            }
+        );
     }
 
     #[tokio::test]

@@ -76,7 +76,19 @@ const HUGE_PNG: &[u8] = include_bytes!("../fixtures/huge.png");
 /// Runs a scenario on a runtime that can host the interpreter, whose future
 /// is not `Send`. The image check needs the I/O driver and the timers.
 pub fn scenario(test: impl Future<Output = ()>) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    run_scenario(tokio::runtime::Builder::new_current_thread(), test);
+}
+
+/// [`scenario`] on a runtime whose blocking pool has one thread, so that a
+/// scenario that holds that thread stalls all blocking work behind it.
+pub fn scenario_with_one_blocking_thread(test: impl Future<Output = ()>) {
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.max_blocking_threads(1);
+    run_scenario(builder, test);
+}
+
+fn run_scenario(mut builder: tokio::runtime::Builder, test: impl Future<Output = ()>) {
+    let runtime = builder
         .enable_io()
         .enable_time()
         .build()
@@ -750,10 +762,14 @@ impl FakeGnome {
 
     /// Locks both URI keys, as an administrator does.
     pub fn lock_keys(&self) {
-        self.session.snapshot.borrow_mut().locked = PerStyle {
-            light: true,
-            dark: true,
-        };
+        for style in Style::ALL {
+            self.lock_key(style);
+        }
+    }
+
+    /// Locks `style`'s URI key, as an administrator does.
+    pub fn lock_key(&self, style: Style) {
+        self.session.snapshot.borrow_mut().locked[style] = true;
     }
 
     /// Reports a change of connectivity, as `GNetworkMonitor` does.
@@ -858,41 +874,25 @@ impl GnomePort for FakeGnome {
             let _ = release.await;
         }
         let before = self.keys();
-        // A locked key that holds another value refuses the transaction.
-        let is_refused = {
-            let snapshot = self.session.snapshot.borrow();
-            let refuses = |style: Style, wanted: Option<&String>| {
-                let held = snapshot.keys.uri(style);
-                snapshot.locked[style] && wanted.is_some_and(|uri| held != Some(uri.as_str()))
-            };
-            refuses(Style::Light, Some(&keys.picture_uri))
-                || refuses(Style::Dark, keys.picture_uri_dark.as_ref())
-        };
-        if is_refused {
-            return Err(GnomeError::Write {
-                reason: "locked keys".to_owned(),
-                unstored: vec![
-                    "picture-uri".to_owned(),
-                    "picture-uri-dark".to_owned(),
-                    "picture-options".to_owned(),
-                ],
-            });
+        // As in `Session::restore`: every key that is not locked on another
+        // value is written, and the call fails naming the locked ones.
+        let mut locked = Vec::new();
+        locked.extend(self.write_uri(Style::Light, keys.picture_uri).err());
+        if let Some(dark) = keys.picture_uri_dark {
+            locked.extend(self.write_uri(Style::Dark, dark).err());
         }
-        {
-            let held = &mut self.session.snapshot.borrow_mut().keys;
-            held.picture_uri = keys.picture_uri;
-            if let (Some(dark), Some(held_dark)) =
-                (keys.picture_uri_dark, &mut held.picture_uri_dark)
-            {
-                *held_dark = dark;
-            }
-            held.picture_options = keys.picture_options;
-        }
+        self.session.snapshot.borrow_mut().keys.picture_options = keys.picture_options;
         let after = self.keys();
         if after != before {
             self.report(GnomeEvent::KeysChanged(after));
         }
-        Ok(())
+        if locked.is_empty() {
+            return Ok(());
+        }
+        Err(GnomeError::Write {
+            reason: format!("locked keys: {}", locked.join(", ")),
+            unstored: locked.into_iter().map(str::to_owned).collect(),
+        })
     }
 }
 

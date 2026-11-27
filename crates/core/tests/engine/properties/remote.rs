@@ -19,7 +19,9 @@ use proptest::sample::subsequence;
 use proptest::test_runner::TestCaseError;
 use url::Url;
 
-use crate::support::{at, blob, files, keys_changed, slot_uris, started, user_keys, write_keys};
+use crate::support::{
+    REMOTE_CACHE_DIR, at, blob, files, keys_changed, slot_uris, started, user_keys, write_keys,
+};
 
 /// Every URL a generated config can list.
 const URLS: [&str; 6] = [
@@ -206,6 +208,7 @@ impl Daemon {
             restored: None,
             seed: scenario.seed,
             slot_uris: slot_uris(),
+            remote_cache_dir: PathBuf::from(REMOTE_CACHE_DIR),
         });
         let mut daemon = Daemon {
             base: scenario.config.clone(),
