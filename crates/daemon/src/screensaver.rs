@@ -3,7 +3,10 @@
 //!
 //! [`watch`] subscribes to `ActiveChanged` and to owner changes of the
 //! name first and then asks `GetActive`, so no change between the two is
-//! lost. A new owner is asked `GetActive` again; a name without an owner
+//! lost. An answer outranks the `ActiveChanged` signals its shield sent
+//! before it and yields to those sent after: a connection numbers what it
+//! sends in rising serials, so the serials order the two. A new owner is
+//! asked `GetActive` again; a name without an owner
 //! counts as unlocked, since no shield hides the screen. Each answer goes
 //! to the interpreter as a [`ScreenLock`]. The core reads it only when the config
 //! asks for it, so the watch runs whatever the config says.
@@ -15,14 +18,16 @@
 //! after each D-Bus reply timeout. Those retries log only at debug.
 
 use std::mem;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::{Stream, StreamExt};
 use gpaperd_core::event::ScreenLock;
 use tokio::sync::mpsc;
+use zbus::names::UniqueName;
 use zbus::proxy::CacheProperties;
-use zbus::{Connection, proxy};
+use zbus::{Connection, Message, proxy};
 
 /// GNOME's screen shield, as far as gpaperd needs it.
 #[proxy(
@@ -31,9 +36,6 @@ use zbus::{Connection, proxy};
     default_path = "/org/gnome/ScreenSaver"
 )]
 pub trait ScreenSaver {
-    /// Whether the shield is up now.
-    fn get_active(&self) -> zbus::Result<bool>;
-
     /// The shield went up (`true`) or down (`false`).
     #[zbus(signal)]
     fn active_changed(&self, active: bool) -> zbus::Result<()>;
@@ -64,7 +66,7 @@ pub fn detached() -> mpsc::UnboundedReceiver<ScreenLock> {
 /// What the watch hears on the bus.
 enum Heard {
     /// `ActiveChanged`: the shield went up (`true`) or down.
-    Active(bool),
+    Active(bool, Sent),
     /// `org.gnome.ScreenSaver` got a new owner (`true`) or lost it.
     Owner(bool),
 }
@@ -77,8 +79,35 @@ enum Woke {
 /// The new owner's `GetActive` was answered, was not, or the listener is gone.
 enum OwnerReport {
     Stop,
-    Known,
+    Known(Sent),
     Unknown,
+}
+
+/// Where a message stands among those its sender sent.
+struct Sent {
+    sender: Option<UniqueName<'static>>,
+    serial: NonZeroU32,
+}
+
+impl Sent {
+    fn of(message: &Message) -> Self {
+        let header = message.header();
+        Self {
+            sender: header.sender().map(|name| name.to_owned()),
+            serial: header.primary().serial_num(),
+        }
+    }
+
+    /// Whether the peer that sent `later` sent this message before it.
+    fn precedes(&self, later: &Sent) -> bool {
+        self.sender == later.sender && self.serial < later.serial
+    }
+}
+
+/// A `GetActive` reply.
+struct Answer {
+    active: bool,
+    sent: Sent,
 }
 
 /// Why `GetActive` gave no answer.
@@ -117,7 +146,7 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
     };
     let changes = changes.filter_map(|signal| async move {
         match signal.args() {
-            Ok(args) => Some(Heard::Active(args.active)),
+            Ok(args) => Some(Heard::Active(args.active, Sent::of(signal.message()))),
             Err(error) => {
                 tracing::warn!(reason = %error, "malformed ActiveChanged signal ignored");
                 None
@@ -131,11 +160,14 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
     // failure sends nothing. The streams above were subscribed first. Only
     // a timeout is asked again: an error reply here means no shield yet,
     // and the owner change that brings one asks it.
+    // The last answer: the signals its shield sent before it are older.
+    let mut answered = None;
     let mut retry = match ask_active(&proxy).await {
-        Ok(active) => {
-            if sender.send(lock_state(active)).is_err() {
+        Ok(answer) => {
+            if sender.send(lock_state(answer.active)).is_err() {
                 return;
             }
+            answered = Some(answer.sent);
             false
         }
         Err(unanswered) => {
@@ -153,13 +185,12 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
         };
         match woke {
             Woke::Retry => match ask_active(&proxy).await {
-                Ok(active) => {
+                Ok(answer) => {
                     retry = false;
-                    if sender.send(lock_state(active)).is_err() {
+                    if sender.send(lock_state(answer.active)).is_err() {
                         return;
                     }
-                    // Queued before or during this ask: the answer is newer.
-                    discard_queued(changes.as_mut());
+                    answered = Some(answer.sent);
                 }
                 // Unlocked already stands for this owner. A signal queued
                 // meanwhile is this owner's and still applies.
@@ -170,7 +201,16 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
                     );
                 }
             },
-            Woke::Heard(Heard::Active(active)) => {
+            Woke::Heard(Heard::Active(active, sent)) => {
+                if answered
+                    .as_ref()
+                    .is_some_and(|answer| sent.precedes(answer))
+                {
+                    continue;
+                }
+                // Every later signal is newer still. Forgetting the answer
+                // also keeps a serial that wraps around from looking old.
+                answered = None;
                 retry = false;
                 if sender.send(lock_state(active)).is_err() {
                     return;
@@ -190,10 +230,9 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
                 discard_queued(changes.as_mut());
                 match report_owner_lock(&proxy, &sender).await {
                     OwnerReport::Stop => return,
-                    OwnerReport::Known => {
+                    OwnerReport::Known(sent) => {
                         retry = false;
-                        // Queued while this ask ran: the answer is newer.
-                        discard_queued(changes.as_mut());
+                        answered = Some(sent);
                     }
                     // This owner's signals queued during the ask still
                     // apply after the Unlocked.
@@ -213,30 +252,32 @@ async fn report_owner_lock(
     proxy: &ScreenSaverProxy<'_>,
     sender: &mpsc::UnboundedSender<ScreenLock>,
 ) -> OwnerReport {
-    let (state, known) = match ask_active(proxy).await {
-        Ok(active) => (lock_state(active), true),
+    let (state, report) = match ask_active(proxy).await {
+        Ok(answer) => (lock_state(answer.active), OwnerReport::Known(answer.sent)),
         Err(unanswered) => {
             log_unavailable(&unanswered);
-            (ScreenLock::Unlocked, false)
+            (ScreenLock::Unlocked, OwnerReport::Unknown)
         }
     };
     if sender.send(state).is_err() {
         return OwnerReport::Stop;
     }
-    if known {
-        OwnerReport::Known
-    } else {
-        OwnerReport::Unknown
-    }
+    report
 }
 
 /// `GetActive`, bounded by the D-Bus reply timeout. `gio` has no
 /// cancellable on this call; dropping the future is what ends the wait.
-async fn ask_active(proxy: &ScreenSaverProxy<'_>) -> Result<bool, Unanswered> {
-    match tokio::time::timeout(crate::dbus::REPLY_TIMEOUT, proxy.get_active()).await {
-        Ok(answer) => answer.map_err(Unanswered::Failed),
-        Err(_elapsed) => Err(Unanswered::TimedOut),
-    }
+async fn ask_active(proxy: &ScreenSaverProxy<'_>) -> Result<Answer, Unanswered> {
+    let call = proxy.inner().call_method("GetActive", &());
+    let reply = match tokio::time::timeout(crate::dbus::REPLY_TIMEOUT, call).await {
+        Ok(reply) => reply.map_err(Unanswered::Failed)?,
+        Err(_elapsed) => return Err(Unanswered::TimedOut),
+    };
+    let active = reply.body().deserialize().map_err(Unanswered::Failed)?;
+    Ok(Answer {
+        active,
+        sent: Sent::of(&reply),
+    })
 }
 
 fn log_unavailable(unanswered: &Unanswered) {

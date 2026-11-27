@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use gpaperd_core::event::{Pause, ScreenLock};
 use gpaperd_core::style::Style;
 use gpaperd_daemon::dbus::REPLY_TIMEOUT;
@@ -187,6 +188,40 @@ async fn emit_gate(service: &Connection, active: bool) {
     GateShield::active_changed(shield.signal_emitter(), active)
         .await
         .expect("emit ActiveChanged");
+}
+
+/// A shield on a raw connection: it answers the first `GetActive` with
+/// `active` and sends `ActiveChanged(!active)` right after that reply, so
+/// both reach the watch back to back. Stops after that one answer.
+async fn serve_flip_after_reply(bus: &PrivateBus, active: bool) -> Connection {
+    let service = zbus::connection::Builder::address(bus.address())
+        .build()
+        .await
+        .expect("connect the raw shield");
+    // Subscribed before the name is taken, so the first call is not missed.
+    let mut calls = zbus::MessageStream::from(&service);
+    service
+        .request_name(SERVICE)
+        .await
+        .expect("own org.gnome.ScreenSaver");
+    let shield = service.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(message)) = calls.next().await {
+            let header = message.header();
+            let get_active = header.message_type() == zbus::message::Type::MethodCall
+                && header.member().is_some_and(|member| member == "GetActive");
+            if !get_active {
+                continue;
+            }
+            shield.reply(&header, &active).await.expect("reply");
+            shield
+                .emit_signal(None::<()>, PATH, SERVICE, "ActiveChanged", &!active)
+                .await
+                .expect("emit ActiveChanged");
+            return;
+        }
+    });
+    service
 }
 
 async fn serve_fail_once(bus: &PrivateBus) -> Connection {
@@ -513,6 +548,48 @@ fn a_change_during_get_active_does_not_replace_that_answer() {
         assert!(
             trailing.is_err(),
             "a change queued during GetActive replaced it: {trailing:?}"
+        );
+    });
+}
+
+#[test]
+fn a_change_during_the_first_get_active_does_not_replace_that_answer() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let service = serve_gate(&bus, true, Arc::clone(&entered), Arc::clone(&release)).await;
+        let mut locks = screensaver::watch(bus.connect().await);
+        tokio::time::timeout(PATIENCE, entered.notified())
+            .await
+            .expect("the first GetActive started");
+        emit_gate(&service, false).await;
+        release.notify_one();
+
+        assert_eq!(next_lock(&mut locks).await, ScreenLock::Locked);
+        let trailing = tokio::time::timeout(QUIET, locks.recv()).await;
+        assert!(
+            trailing.is_err(),
+            "a change sent before the first answer replaced it: {trailing:?}"
+        );
+    });
+}
+
+#[test]
+fn a_change_right_after_a_new_owners_answer_is_heard() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let mut locks = screensaver::watch(bus.connect().await);
+        let early = tokio::time::timeout(QUIET, locks.recv()).await;
+        assert!(early.is_err(), "no state without the service: {early:?}");
+
+        let _service = serve_flip_after_reply(&bus, false).await;
+
+        assert_eq!(next_lock(&mut locks).await, ScreenLock::Unlocked);
+        let change = tokio::time::timeout(QUIET, locks.recv()).await;
+        assert_eq!(
+            change.expect("the change sent after the answer"),
+            Some(ScreenLock::Locked)
         );
     });
 }
