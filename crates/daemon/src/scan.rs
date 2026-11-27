@@ -37,10 +37,11 @@ pub struct Scan {
     pub files: Vec<LocalFile>,
     /// Directories a watch of the sources has to cover, in discovery order
     /// and each once: each source directory and, with `recursive`, the
-    /// directories below it down to the depth limit. The canonical parent of
-    /// a followed file symlink is here too, so a later write to the target
-    /// is scanned again. Walk paths are as the walk built them. A directory
-    /// that could not be listed is here too, next to its warning.
+    /// directories below it down to the depth limit. The canonical parents
+    /// of a followed file symlink's later links and target are here too, so
+    /// a later retarget or write to the target is scanned again. Walk paths
+    /// are as the walk built them. A directory that could not be listed is
+    /// here too, next to its warning.
     pub dirs: Vec<PathBuf>,
     /// Sources and entries that were skipped, for the log.
     pub warnings: Vec<ScanWarning>,
@@ -65,14 +66,16 @@ pub struct ScanWarning {
 ///   `dir` that is no directory and a `file` that is no regular file.
 /// - A file named directly is taken whatever its name. The filters below
 ///   apply to directory entries only. When that file is a symlink, the
-///   parent of its canonical path is listed in [`Scan::dirs`].
+///   directories of its symlink chain are listed in [`Scan::dirs`].
 /// - Directory entries: regular files, after following symlinks when
 ///   `follow_symlinks` is set, with an extension from the plan's list
 ///   (compared without case). Hidden entries are skipped unless `hidden` is
 ///   set. In-progress names (`.part`, `.crdownload`, `.tmp`, a trailing `~`)
 ///   are skipped. Subdirectories are entered only with `recursive`, at most
 ///   16 levels deep. A followed symlink to a file is catalogued at its
-///   canonical path, and that parent is listed in [`Scan::dirs`].
+///   canonical path, and the directories of its chain are listed in
+///   [`Scan::dirs`]: the canonical parent of each later link and of the
+///   target.
 /// - An entry that cannot be read (permission denied, dangling symlink,
 ///   symlink loop) yields one warning and the scan goes on. So does a file
 ///   whose canonical path is not UTF-8, which the catalog cannot hold.
@@ -116,7 +119,7 @@ impl Scan {
             return;
         };
         if path.is_symlink() {
-            self.list_target_dir(&file);
+            self.list_link_dirs(path, &file);
         }
         self.files.push(file);
     }
@@ -126,14 +129,37 @@ impl Scan {
             return;
         };
         if options.follow_symlinks && entry.path_is_symlink() {
-            self.list_target_dir(&file);
+            self.list_link_dirs(entry.path(), &file);
         }
         self.files.push(file);
     }
 
-    /// Lists the parent of a file reached through a symlink: the directory
-    /// that holds the link does not see a later write to the target.
-    fn list_target_dir(&mut self, file: &LocalFile) {
+    /// Lists the directories a file reached through `link` depends on: the
+    /// canonical parent of each later link in the chain and of the target.
+    /// The directory that holds `link` sees neither a retarget of a later
+    /// link nor a write to the target.
+    ///
+    /// `file` was just resolved, so the chain ends; a link seen twice (the
+    /// chain changed since) stops the walk all the same. A hop that can no
+    /// longer be read stops it too, and the target's parent is still listed.
+    fn list_link_dirs(&mut self, link: &Path, file: &LocalFile) {
+        let mut seen = HashSet::new();
+        let mut hop = link.to_owned();
+        while let Ok(target) = fs::read_link(&hop) {
+            hop = match hop.parent() {
+                Some(parent) => parent.join(target),
+                None => target,
+            };
+            if !seen.insert(hop.clone()) {
+                break;
+            }
+            if let Some(dir) = hop
+                .parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+            {
+                self.dirs.push(dir);
+            }
+        }
         if let Some(parent) = file.path.parent() {
             self.dirs.push(parent.to_owned());
         }
@@ -506,6 +532,25 @@ mod tests {
 
         assert_eq!(relative_paths(&root, &found), ["store/real.png"]);
         assert_eq!(found.dirs, [root.join("walls"), root.join("store")]);
+        assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+    }
+
+    #[test]
+    fn followed_symlink_chain_lists_each_link_directory_and_the_target_directory() {
+        let (_dir, root) = temp_root();
+        touch(&root.join("store/real.png"));
+        fs::create_dir(root.join("walls")).expect("create dir");
+        fs::create_dir(root.join("mid")).expect("create dir");
+        symlink("../store/real.png", root.join("mid/hop.png")).expect("symlink");
+        symlink(root.join("mid/hop.png"), root.join("walls/link.png")).expect("symlink");
+
+        let found = scan(&[dir_source(&root.join("walls"), DirOptions::default())]);
+
+        assert_eq!(relative_paths(&root, &found), ["store/real.png"]);
+        assert_eq!(
+            found.dirs,
+            [root.join("walls"), root.join("mid"), root.join("store")]
+        );
         assert!(found.warnings.is_empty(), "{:?}", found.warnings);
     }
 
