@@ -180,7 +180,8 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///   slot that waited to get its new content gets it.
 /// - [`Event::Gnome`] with `StyleChanged`: with `rotate_hidden = false`, stop
 ///   the hidden style's clock (store `remaining`) and restart the visible
-///   one at `now + remaining`. A change to the style that is already visible
+///   one at `now + remaining`, and emit [`Effect::Persist`] when a clock
+///   stopped or started. A change to the style that is already visible
 ///   does nothing.
 ///
 ///   A slot that was written while its style was hidden is dirty: the shell
@@ -246,6 +247,8 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///   - `max_pixels`: when it went up, every "too large" verdict is dropped.
 ///     When it went down, the image on screen is probed again against the
 ///     new cap.
+///   - `rotate_hidden`: the hidden style's clock starts or stops as on a
+///     style switch, and [`Effect::Persist`] saves it.
 ///   - URLs: a URL that no style listed is fetched as at start. One that no
 ///     style lists any more leaves the catalogs at once and gets an
 ///     [`Effect::DropRemote`].
@@ -670,10 +673,21 @@ impl Turn<'_> {
             return;
         }
         self.model.visible = visible;
+        self.follow_visibility_saved();
+        self.plan_refresh();
+    }
+
+    /// Runs or stops each style's clock as [`Model::is_running`] says, and
+    /// saves the state when a clock stopped or started. An interval may last
+    /// a week: a crash must not lose a stopped clock.
+    pub(super) fn follow_visibility_saved(&mut self) {
+        let clocks_before = PerStyle::from_fn(|style| self.model.styles[style].clock);
         for style in Style::ALL {
             self.model.follow_visibility(style, self.now);
         }
-        self.plan_refresh();
+        if PerStyle::from_fn(|style| self.model.styles[style].clock) != clocks_before {
+            self.persist();
+        }
     }
 
     fn on_probed(&mut self, style: Style, item: &ItemId, verdict: Result<(), BadReason>) {

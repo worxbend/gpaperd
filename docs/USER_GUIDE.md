@@ -149,7 +149,7 @@ it also works in a dotfiles CI job.
 
 ```toml
 [general]
-interval = "15m"        # how often the wallpaper changes: 1m to 1h
+interval = "15m"        # how often the wallpaper changes: 1m to 7d
 order = "random"        # or "alphabetical"
 
 [light]
@@ -203,7 +203,7 @@ style under `[light]` or `[dark]`.
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `interval` | `"15m"` | Time between changes, `1m` to `1h`. Counts only time the style is on screen when `rotate_hidden` is false |
+| `interval` | `"15m"` | Time between changes, `1m` to `7d` (`"1d"` for daily, `"7d"` for weekly). Counts only time the style is on screen when `rotate_hidden` is false. The deadline is saved: after a restart or reboot gpaperd changes the wallpaper soon if it is overdue, else waits the time left; after suspend it changes it on resume if it fell due |
 | `order` | `"random"` | `random` shows every image once per round; `alphabetical` follows file names |
 | `picture_options` | not set | `zoom`, `scaled`, `centered`, `stretched`, `wallpaper` or `spanned`. Unset leaves GNOME's value, but `none` becomes `zoom` |
 | `rotate_hidden` | `false` | Also rotate the style that is not on screen |

@@ -188,6 +188,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deadline_a_week_ahead_is_armed_and_waits() {
+        let timer = WallTimer::new().unwrap();
+        let a_week = Duration::from_secs(7 * 24 * 60 * 60);
+
+        timer.arm(Some(SystemTime::now() + a_week)).unwrap();
+
+        assert!(timeout(QUIET, timer.wait()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn new_timer_is_disarmed() {
         let timer = WallTimer::new().unwrap();
 

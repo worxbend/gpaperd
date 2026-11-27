@@ -12,7 +12,7 @@
 # link-local IP address is not fetched and not retried; use a host name.
 
 [general]
-interval = "15m"                 # 1m ..= 1h
+interval = "15m"                 # 1m ..= 7d; the deadline survives restarts
 order = "random"                 # "random" | "alphabetical"
 picture_options = "zoom"         # optional; omit to leave GNOME's value alone
 on_external_change = "pause"     # "pause" | "reassert-next-tick" | "reassert-now"

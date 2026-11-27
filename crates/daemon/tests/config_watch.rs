@@ -204,7 +204,7 @@ async fn invalid_file_gives_line_and_column_and_a_later_save_loads() {
     home.write("config/config.toml", &with_interval(2));
     let mut watch = ConfigWatch::start(home.config_file());
 
-    home.save("config/config.toml", "[light]\ninterval = \"2h\"\n");
+    home.save("config/config.toml", "[light]\ninterval = \"8d\"\n");
     let invalid = next_reload(&mut watch).await;
     home.save("config/config.toml", &with_interval(3));
     let repaired = interval_minutes(next_reload(&mut watch).await);

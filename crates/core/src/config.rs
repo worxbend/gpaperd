@@ -19,8 +19,10 @@ use crate::style::PerStyle;
 
 /// Shortest allowed rotation interval, inclusive.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(60);
-/// Longest allowed rotation interval, inclusive.
-pub const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Longest allowed rotation interval, inclusive: a week. The deadline is a
+/// saved wall-clock time, so an interval this long survives restarts and
+/// suspend.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Interval when neither `[general]` nor the style table sets one.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// `max_pixels` when `[general]` does not set it: 100 megapixels.
@@ -57,7 +59,7 @@ impl Config {
     /// is an error.
     ///
     /// `[general]` keys:
-    /// - `interval`: humantime duration (`90s`, `15m`, `1h`), within
+    /// - `interval`: humantime duration (`90s`, `15m`, `1h`, `7d`), within
     ///   [`MIN_INTERVAL`]`..=`[`MAX_INTERVAL`] inclusive.
     /// - `order`: `"random"` or `"alphabetical"`.
     /// - `picture_options`: `"wallpaper"`, `"centered"`, `"scaled"`,
@@ -784,7 +786,7 @@ mod tests {
     fn plan_example_parses() {
         let text = r#"
 [general]
-interval = "15m"                 # 1m ..= 1h
+interval = "15m"                 # 1m ..= 7d
 order = "random"                 # "random" | "alphabetical"
 picture_options = "zoom"         # optional; omit to leave GNOME's value alone
 on_external_change = "pause"     # "pause" | "reassert-next-tick" | "reassert-now"
@@ -999,7 +1001,16 @@ order = "random"
 
     #[test]
     fn interval_bounds_are_inclusive() {
-        for (written, seconds) in [("1m", 60), ("60s", 60), ("1h", 3600), ("59m 60s", 3600)] {
+        let week = 7 * 24 * 3600;
+        for (written, seconds) in [
+            ("1m", 60),
+            ("60s", 60),
+            ("1h", 3600),
+            ("24h", 24 * 3600),
+            ("7d", week),
+            ("1w", week),
+            ("6d 23h 59m 60s", week),
+        ] {
             let config = parse(&format!("[general]\ninterval = \"{written}\"\n"))
                 .unwrap_or_else(|err| panic!("{written} is accepted: {err}"));
             assert_eq!(config.styles.light.interval, Duration::from_secs(seconds));
@@ -1007,14 +1018,14 @@ order = "random"
     }
 
     #[test]
-    fn interval_outside_one_minute_to_one_hour_is_rejected() {
-        for written in ["30s", "59s", "61m", "1h 1s", "0s"] {
+    fn interval_outside_one_minute_to_seven_days_is_rejected() {
+        for written in ["30s", "59s", "0s", "7d 1s", "8d", "2w", "1month"] {
             let err = parse(&format!("[general]\ninterval = \"{written}\"\n"))
                 .expect_err("interval is out of range");
             assert_eq!((err.line, err.column), (2, 12), "{written}");
             assert_eq!(
                 err.message,
-                "interval must be a duration from 1m to 1h, such as \"15m\""
+                "interval must be a duration from 1m to 7days, such as \"15m\""
             );
         }
     }

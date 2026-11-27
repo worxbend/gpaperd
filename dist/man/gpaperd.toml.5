@@ -34,10 +34,16 @@ A commented example ships as
 .BR interval " = \(dq15m\(dq"
 Time between two changes of the style on screen, as a duration such as
 .BR 90s ,
-.B 15m
+.BR 15m ,
+.B 1h
 or
-.BR 1h ,
-from 1 minute to 1 hour inclusive.
+.BR 7d ,
+from 1 minute to 7 days inclusive.
+The deadline is saved in the state file as a wall-clock time: after a
+restart or a reboot the style on screen changes at once when it is
+overdue, and otherwise waits for the time it has left.
+A reload to a shorter interval counts it from the last change, so no style
+waits longer than its new interval.
 .TP
 .BR order " = \(dqrandom\(dq"
 .B random

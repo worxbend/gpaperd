@@ -49,6 +49,8 @@ on
 .BR CLOCK_REALTIME ,
 so a change that fell due during suspend happens right after resume,
 and a clock step re-arms the timer.
+Each style's last change and its time left are saved in the state file, so
+an interval of up to 7 days keeps its deadline across restarts and reboots.
 .PP
 Each style has a catalog that inotify keeps current (or a poll, for network
 and FUSE file systems and with a

@@ -140,7 +140,7 @@ has every key with a comment. The full reference is `gpaperd.toml(5)`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `interval` | `"15m"` | Time between changes, from `1m` to `1h` inclusive (`90s`, `15m`, `1h`) |
+| `interval` | `"15m"` | Time between changes, from `1m` to `7d` inclusive (`90s`, `15m`, `1h`, `1d`, `7d`). The deadline is saved, so a restart, reboot or suspend does not reset it |
 | `order` | `"random"` | `"random"` (shuffle bag) or `"alphabetical"` (natural sort on the file name) |
 | `picture_options` | unset | `wallpaper`, `centered`, `scaled`, `stretched`, `zoom` or `spanned`. Unset leaves GNOME's value, but `none` becomes `zoom` |
 | `on_external_change` | `"pause"` | `"pause"`, `"reassert-next-tick"` or `"reassert-now"` (written back after 1 s; more than 3 changes a minute pauses) |

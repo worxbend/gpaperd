@@ -86,3 +86,36 @@ fn a_clock_step_that_changes_no_deadline_arms_the_alarm_again() {
         assert_eq!(world.shown(Style::Light), "a.png");
     });
 }
+
+#[test]
+fn a_weekly_interval_outlives_a_restart_and_fires_after_a_suspend() {
+    scenario(async {
+        let week = 7 * 24 * 60 * MINUTE;
+        let weekly = "order = \"alphabetical\"\ninterval = \"7d\"";
+        let world = World::new();
+        world.add_images(Style::Light, &["a.png", "b.png"]);
+        world.add_images(Style::Dark, &["x.png"]);
+        let mut first_run = world.start_daemon(world.config(weekly), SEED);
+        world.showing(&mut first_run, "a.png", "x.png").await;
+        first_run.terminate().await;
+
+        // Three days pass while the daemon is down.
+        world.clock.advance(3 * 24 * 60 * MINUTE);
+        let mut second_run = world.start_daemon(world.config(weekly), SEED);
+        let first_deadline = start_time() + week;
+        second_run
+            .status_where("the saved weekly deadline", |status| {
+                status.next_change == Some(first_deadline)
+            })
+            .await;
+        assert_eq!(world.clock.armed(), Some(first_deadline));
+        assert_eq!(world.shown(Style::Light), "a.png");
+
+        // The machine sleeps through the deadline and wakes a day after it.
+        world.clock.advance(5 * 24 * 60 * MINUTE);
+        let status = world.showing(&mut second_run, "b.png", "x.png").await;
+
+        let woke_up = start_time() + 8 * 24 * 60 * MINUTE;
+        assert_eq!(status.next_change, Some(woke_up + week));
+    });
+}

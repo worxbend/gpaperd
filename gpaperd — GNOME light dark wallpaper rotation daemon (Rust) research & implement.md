@@ -125,7 +125,7 @@ One TOML file at `$XDG_CONFIG_HOME/gpaperd/config.toml` (override with `--config
 ```toml
 # ~/.config/gpaperd/config.toml
 [general]
-interval = "15m"                 # 1m ..= 1h
+interval = "15m"                 # 1m ..= 7d
 order = "random"                 # "random" | "alphabetical"
 picture_options = "zoom"         # optional; omit to leave GNOME's value alone
 on_external_change = "pause"     # "pause" | "reassert-next-tick" | "reassert-now"
@@ -156,7 +156,7 @@ sources = [
 
 **Path expansion.** `~` and `$VAR` / `${VAR}` are expanded; an undefined variable is an error. Relative paths resolve against the directory of the *resolved* config file, so stow or chezmoi symlinks behave.
 
-**Validation.** Intervals parse with humantime (`90s`, `15m`, `1h`) and must be within 1 min..=1 h inclusive. URLs must be `http`/`https` with a host. A style with no sources is valid and falls under `empty_style`. Errors carry the TOML line and column.
+**Validation.** Intervals parse with humantime (`90s`, `15m`, `1h`) and must be within 1 min..=7 days inclusive. URLs must be `http`/`https` with a host. A style with no sources is valid and falls under `empty_style`. Errors carry the TOML line and column.
 
 **Load and reload rules.**
 
@@ -331,7 +331,7 @@ The rule behind every row: never show a blank or broken desktop, never fight the
 | Config | Invalid at start | Parse or validation error | Exit 78; unit does not restart |
 | Config | Invalid on reload | Parse or validation error | Keep running config; log line and column |
 | Config | Symlinked dotfile changes in its repo | Watch the target's dir; re-resolve | Reload |
-| Config | Interval outside 1 min..=1 h | Validation | Error, as above |
+| Config | Interval outside 1 min..=7 days | Validation | Error, as above |
 | Config | Both styles end up with zero usable images | Catalog sizes | Keep both slots as they are; warn; idle |
 | Local | Source dir missing, created later | `ENOENT`; ancestor watch | Add its items when it appears |
 | Local | Source dir deleted or unmounted | `IN_DELETE_SELF`, `IN_UNMOUNT` | Drop items; slot keeps its data; watch ancestor |
@@ -523,7 +523,7 @@ Six milestones, about 13–18 working days in total. M0 comes first because its 
 **Decisions made on your behalf** (each is a config switch or a small change):
 
 - "Writes both `picture-uri` and `picture-uri-dark`" is met by pointing each key at its own style's slot. Keys are written once; content rotates. `apply_mode = "uri"` gives literal per-tick key writes.
-- The interval is global with a per-style override, valid from 1 min to 1 h inclusive.
+- The interval is global with a per-style override, valid from 1 min to 7 days inclusive.
 - The hidden style does not rotate by default, and its interval counts on-screen time only.
 - "Downloaded and cached on start" means: cached copies are used at once and every URL is revalidated at each daemon start.
 - An external wallpaper change pauses rotation; a 404 keeps the stale cached image.

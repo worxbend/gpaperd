@@ -156,7 +156,7 @@ install_starter_config() {
 # Edits apply while gpaperd runs; `gpaperd check-config` validates this file.
 
 [general]
-interval = "15m"        # 1m ..= 1h
+interval = "15m"        # 1m ..= 7d
 order = "random"        # or "alphabetical"
 
 [light]

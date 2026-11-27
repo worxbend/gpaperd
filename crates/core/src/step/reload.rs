@@ -24,9 +24,9 @@ impl Turn<'_> {
         for style in Style::ALL {
             self.reload_style(style, &old.styles[style]);
             self.resume(style);
-            // `rotate_hidden` decides which clocks run.
-            self.model.follow_visibility(style, self.now);
         }
+        // `rotate_hidden` decides which clocks run.
+        self.follow_visibility_saved();
         self.reload_remotes();
         // A new `empty_style` or `apply_mode` leaves a style to be filled.
         self.fill_empty_slots();
