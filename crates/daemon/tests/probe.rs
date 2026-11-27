@@ -368,7 +368,10 @@ async fn sandbox_that_works_later_is_used_by_a_later_check() {
     } else {
         let Some(bwrap) = bwrap_on_path().filter(|_| decodes_here()) else {
             // Without a bwrap that works here, a later start cannot be staged.
-            eprintln!("skipped: no bwrap on PATH, or glycin cannot decode here");
+            eprintln!(
+                "skipped: no bwrap on PATH, or glycin cannot decode here \
+                 (probe::tests covers the retry without bwrap)"
+            );
             return;
         };
         let bin_dir = TempDir::new().expect("temp dir");

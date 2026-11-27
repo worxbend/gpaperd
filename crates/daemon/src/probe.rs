@@ -9,6 +9,7 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::panic;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -123,13 +124,29 @@ pub fn probe(path: &Path) -> Result<(), BadReason> {
 ///
 /// Use a `Prober` in one tokio runtime only: the one of its first check. Its
 /// loader processes and its GLib thread stay with that runtime.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Prober {
     /// What glycin said about each file, by the stamp the file had then.
     decoded: Mutex<HashMap<FileStamp, Decoded>>,
-    /// Holds only a sandbox that decoded. While it is empty, each check
-    /// starts and tries a new one.
+    /// Holds only a sandbox that passed `trial`. While it is empty, each
+    /// check starts and tries a new one.
     sandbox: OnceCell<Sandbox>,
+    /// Tells whether a new sandbox works: [`Sandbox::decodes`]. A field only
+    /// so that a unit test can stand in for glycin and bwrap.
+    trial: Trial,
+}
+
+/// How a [`Prober`] tries a new sandbox before it keeps it.
+type Trial = for<'a> fn(&'a Sandbox) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+impl Default for Prober {
+    fn default() -> Prober {
+        Prober {
+            decoded: Mutex::default(),
+            sandbox: OnceCell::new(),
+            trial: Sandbox::decodes,
+        }
+    }
 }
 
 /// glycin as one [`Prober`] uses it: loader processes and a GLib thread of
@@ -184,18 +201,21 @@ impl Sandbox {
     }
 
     /// Whether an image that is known to be good loads. Warns when not.
-    async fn decodes(&self) -> bool {
-        let known_good = Loader::new_vec(KNOWN_GOOD_PNG.to_vec());
-        match self.loader(known_good).load().await {
-            Ok(_image) => true,
-            Err(error) => {
-                tracing::warn!(
-                    reason = %first_line(&error),
-                    "glycin cannot decode in its sandbox: no image passes until a later check can"
-                );
-                false
+    /// Boxed, so that it fits [`Trial`].
+    fn decodes(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let known_good = Loader::new_vec(KNOWN_GOOD_PNG.to_vec());
+            match self.loader(known_good).load().await {
+                Ok(_image) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        reason = %first_line(&error),
+                        "glycin cannot decode in its sandbox: no image passes until a later check can"
+                    );
+                    false
+                }
             }
-        }
+        })
     }
 }
 
@@ -296,7 +316,7 @@ impl Prober {
     async fn sandbox(&self) -> Option<&Sandbox> {
         let start = || async {
             let sandbox = Sandbox::start();
-            sandbox.decodes().await.then_some(sandbox).ok_or(())
+            (self.trial)(&sandbox).await.then_some(sandbox).ok_or(())
         };
         self.sandbox.get_or_try_init(start).await.ok()
     }
@@ -468,7 +488,7 @@ fn is_qoi(header: &[u8]) -> bool {
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use gpaperd_core::catalog::FileId;
     use tempfile::TempDir;
@@ -828,6 +848,51 @@ mod tests {
             Ok(other) => panic!("zero glycin limit did not time out: {other:?}"),
             Err(_elapsed) => panic!("zero glycin limit waited out the decode timeout"),
         }
+    }
+
+    /// How many times [`passes_from_the_second_trial`] ran. Only
+    /// `failed_sandbox_is_tried_again_and_a_working_one_is_kept` uses it.
+    static TRIALS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Fails the first trial and passes every later one, as a `bwrap` that
+    /// was fixed meanwhile.
+    fn passes_from_the_second_trial(
+        _sandbox: &Sandbox,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let earlier_trials = TRIALS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { earlier_trials > 0 })
+    }
+
+    /// The retry of `tests/probe.rs`, without bwrap: the trial stands in for
+    /// glycin, and glycin's answer for the file is already remembered, so
+    /// nothing is decoded.
+    #[tokio::test]
+    async fn failed_sandbox_is_tried_again_and_a_working_one_is_kept() {
+        let dir = TempDir::new().expect("temp dir");
+        let png = aged(file_with(&dir, "wall.png", PNG_HEADER));
+        let prober = Prober {
+            trial: passes_from_the_second_trial,
+            ..Prober::new()
+        };
+        let one_pixel = Dimensions {
+            width: 1,
+            height: 1,
+        };
+        prober.remember(current_stamp(&png).expect("stat fixture"), Ok(one_pixel));
+
+        let refused = prober.check(&png, 1).await;
+        let passed = prober.check(&png, 1).await;
+        let passed_again = prober.check(&png, 1).await;
+
+        assert_eq!(
+            (refused, passed, passed_again),
+            (Err(BadReason::Truncated), Ok(()), Ok(()))
+        );
+        assert_eq!(
+            TRIALS.load(Ordering::Relaxed),
+            2,
+            "a kept sandbox is tried again"
+        );
     }
 
     static RELEASE_STUCK_READ: AtomicBool = AtomicBool::new(false);
