@@ -18,6 +18,10 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant 5, merged into zbus 6; used by glycin" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names 4, merged into zbus 6; used by glycin" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5, merged into zbus 6; used by glycin" },
+    # Unmaintained, not vulnerable, every version. gpaperd uses it directly
+    # for config durations and RFC 3339 times; a replacement would change
+    # the duration syntax users already write in config.toml.
+    { id = "RUSTSEC-2026-0542", reason = "humantime: config duration and RFC 3339 parsing; no vulnerability" },
 ]
 
 [licenses]
