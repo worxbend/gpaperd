@@ -17,12 +17,15 @@ env:
   # The toolchain the workspace is developed with.
   RUST_TOOLCHAIN: "1.99.1"
 
+# Job caps reuse the Test step's 15 minutes (`timeout 900`): 15 per step
+# that compiles or runs Rust code, plus 15 for the rest of the job.
 jobs:
   fmt:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15 # no compile: 15 for the job
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-27
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -30,6 +33,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15 # no compile: 15 for the job
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Licences, advisories, bans and sources, as configured in deny.toml.
@@ -39,6 +43,8 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    # clippy + test build + test run (3 x 15) + the rest (15)
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # GLib/GIO for GSettings, libseccomp and fontconfig for glycin;
@@ -52,7 +58,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libglib2.0-dev libglib2.0-bin libseccomp-dev \
             libfontconfig-dev dbus groff-base shellcheck
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-27
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy

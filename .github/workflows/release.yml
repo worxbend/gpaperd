@@ -14,6 +14,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.99.1"
 
+# Job caps reuse ci.yml's Test step limit of 15 minutes (`timeout 900`):
+# 15 per step that compiles Rust code, plus 15 for the rest of the job.
 jobs:
   build:
     strategy:
@@ -24,6 +26,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30 # release build (15) + the rest (15)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install system packages
@@ -31,7 +34,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libglib2.0-dev libseccomp-dev libfontconfig-dev
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-27
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Check the tag matches the crate version
@@ -61,6 +64,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15 # no compile: 15 for the job
     permissions:
       contents: write
     steps:
