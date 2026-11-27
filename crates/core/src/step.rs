@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::catalog::{BadReason, CatalogDelta, FileId, ItemId, Version};
 use crate::config::{ApplyMode, ExternalChangePolicy};
+use crate::control::Direction;
 #[cfg(doc)]
 use crate::control::Reply;
 #[cfg(doc)]
@@ -297,6 +298,14 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     and does not push what it replaces: two `Previous` go back two
 ///     images. `Next` always draws by the order; it does not walk forward
 ///     through the history.
+///   - `Set` shows the named item of each style meant as `Next` shows its
+///     pick, with the same checks, waits and reply, and pushes what it
+///     replaces onto the history. The item must be in the style's own
+///     catalog: when a scanned style lacks it, the reply is `Rejected` and
+///     no style changes. One not scanned yet, a listed URL with no blob, or
+///     an item that failed its probe fails. A failed probe or publish tries
+///     no other image and, as a rotation that gives up, starts a fresh
+///     interval. A `Set` of the image on screen only restarts the interval.
 ///   - `Pause` sets the user pause ([`Pause::User`], saved), next to any
 ///     other pause: no tick, and no rotation in flight is published. A
 ///     requested rotation and a repair of the slot go on, with their key
@@ -906,10 +915,10 @@ impl Turn<'_> {
         if self.model.shows(style, &rotation.candidate.id) {
             return;
         }
-        if self.model.steps_back(style) {
-            self.step_back_further(style);
-        } else {
-            self.retry(style, rotation);
+        match self.model.requested_direction(style) {
+            Some(Direction::Back) => self.step_back_further(style),
+            Some(Direction::To(_)) => self.end_set(style),
+            Some(Direction::Forward) | None => self.retry(style, rotation),
         }
     }
 

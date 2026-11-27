@@ -268,6 +268,7 @@ fn command() -> impl Strategy<Value = Command> {
     prop_oneof![
         3 => target().prop_map(Command::Next),
         3 => target().prop_map(Command::Previous),
+        2 => (target(), image()).prop_map(|(target, image)| Command::Set(target, id(image))),
         2 => target().prop_map(Command::Pause),
         2 => target().prop_map(Command::Resume),
         1 => Just(Command::Restore),

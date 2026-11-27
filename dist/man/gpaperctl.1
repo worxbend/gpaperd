@@ -7,6 +7,11 @@ gpaperctl \- control a running gpaperd
 .RB [ \-\-style
 .IR STYLE ]
 .br
+.B gpaperctl set
+.RB [ \-\-style
+.IR STYLE ]
+.I IMAGE
+.br
 .B gpaperctl
 .RB ( reload | refresh | restore )
 .br
@@ -21,6 +26,16 @@ over the session bus, at the name and interface
 object
 .BR /io/github/worxbend/Gpaperd1 ,
 and waits for the answer.
+.B set
+calls the method
+.BR Set(style,\ id) ,
+whose
+.I id
+is an absolute, canonical path or an
+.B http
+or
+.B https
+URL.
 .SH COMMANDS
 .TP
 .B next
@@ -29,6 +44,28 @@ Rotate now.
 .B previous
 Show the previous image again.
 Each style remembers the last 20 images it showed.
+.TP
+.BI set " IMAGE"
+Show
+.I IMAGE
+now, as
+.B next
+shows the image it picks: the interval starts again, the image it
+replaces goes into the history, so
+.B previous
+returns to it, and a pause stays as it is.
+.I IMAGE
+is a local file, made absolute and canonical against the current
+directory, or a remote URL as the config lists it.
+It must be in the sources of each style meant; otherwise the command fails
+with
+.B org.freedesktop.DBus.Error.InvalidArgs
+and nothing changes.
+It also fails while the style's sources are still being scanned, when a
+remote image is not downloaded yet, and when the image fails its check.
+When the image fails its check or cannot be written, the image on screen
+stays and its interval starts again.
+Setting the image already on screen only starts the interval again.
 .TP
 .B pause
 Stop the timer of a style.
@@ -111,12 +148,15 @@ The daemon carried out the command.
 .TP
 .B 1
 The daemon is not running or did not answer, the session bus cannot be
-reached, the reload was refused, or the daemon reported an error.
+reached, the reload was refused, the image of
+.B set
+cannot be found, or the daemon reported an error.
 With
 .BR "apply_mode = \(dquri\(dq" ,
-.B next
-and
+.BR next ,
 .B previous
+and
+.B set
 also exit 1 when the image changed but the key write waits for a retry
 after a failed write, or for the 1 second wait of
 .BR "on_external_change = \(dqreassert\-now\(dq" .
@@ -129,6 +169,7 @@ A usage error, such as an unknown command or style.
 .EX
 gpaperctl next \-\-style both
 gpaperctl pause \-\-style dark
+gpaperctl set \-\-style both ~/Pictures/Wallpapers/lake.jpg
 gpaperctl status
 gpaperctl status \-\-json | jq .styles.light.current
 .EE

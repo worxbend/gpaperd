@@ -42,6 +42,10 @@ pub trait Gpaperd1 {
     fn next(&self, style: &str) -> zbus::Result<()>;
     /// Step back through the style's history.
     fn previous(&self, style: &str) -> zbus::Result<()>;
+    /// Show the image `id` now: an absolute, canonical path or an `http` or
+    /// `https` URL of the style's sources. Outside them, or neither, it is
+    /// an `org.freedesktop.DBus.Error.InvalidArgs` error.
+    fn set(&self, style: &str, id: &str) -> zbus::Result<()>;
     /// Stop the style's timer (a user pause).
     fn pause(&self, style: &str) -> zbus::Result<()>;
     /// End the user pause.

@@ -17,7 +17,7 @@ use proptest::test_runner::TestCaseError;
 
 use super::daemon::new_model;
 use super::scenario::{IMAGES, config, image, style};
-use crate::support::{at, keys_changed, slot_uris, started, user_keys, version};
+use crate::support::{at, id, keys_changed, slot_uris, started, user_keys, version};
 
 /// Steps that the final drain takes before it gives up. Every answer
 /// leads to a few more effects at most, so a reducer that needs more
@@ -53,6 +53,7 @@ pub fn command() -> impl Strategy<Value = Command> {
     prop_oneof![
         3 => target().prop_map(Command::Next),
         3 => target().prop_map(Command::Previous),
+        2 => (target(), image()).prop_map(|(target, image)| Command::Set(target, id(image))),
         2 => target().prop_map(Command::Pause),
         2 => target().prop_map(Command::Resume),
         1 => Just(Command::Reload),

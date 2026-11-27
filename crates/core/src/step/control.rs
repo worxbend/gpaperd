@@ -10,6 +10,7 @@ use crate::control::{
     Command, Direction, PartialMove, Reply, ReplyId, Request, RequestStage, StyleTarget,
 };
 use crate::event::{Effect, Event, Pause};
+use crate::model::Unshowable;
 use crate::style::Style;
 
 const STARTING: &str = "gpaperd is still starting";
@@ -36,6 +37,7 @@ impl Turn<'_> {
         match command {
             Command::Next(target) => self.queue_request(id, Direction::Forward, target),
             Command::Previous(target) => self.queue_request(id, Direction::Back, target),
+            Command::Set(target, item) => self.queue_request(id, Direction::To(item), target),
             Command::Pause(target) => self.pause_by_user(id, target),
             Command::Resume(target) => self.resume_by_user(id, target),
             Command::Reload => {
@@ -122,9 +124,12 @@ impl Turn<'_> {
     /// is free, and answers every request that is finished.
     pub(super) fn serve_requests(&mut self) {
         let mut requests = mem::take(&mut self.model.requests);
-        for part in requests.iter_mut().flat_map(|request| &mut request.styles) {
-            if let RequestStage::Running { before } = &part.stage {
-                part.stage = self.follow_rotation(part.style, before.clone());
+        for request in &mut requests {
+            for part in &mut request.styles {
+                if let RequestStage::Running { before } = &part.stage {
+                    part.stage =
+                        self.follow_rotation(part.style, before.clone(), &request.direction);
+                }
             }
         }
         for index in 0..requests.len() {
@@ -150,36 +155,48 @@ impl Turn<'_> {
             let is_taken = earlier.iter().any(|other| other.runs_for(part.style));
             let is_free = !is_taken && !self.model.styles[part.style].is_busy();
             if part.stage == RequestStage::Queued && is_free {
-                part.stage = self.start_request(part.style, request.direction);
+                part.stage = self.start_request(part.style, &request.direction);
             }
         }
     }
 
     /// Where a request's rotation of `style` stands. `before` is what the
-    /// style showed when it started.
-    fn follow_rotation(&self, style: Style, before: Option<ItemId>) -> RequestStage {
+    /// style showed when it started. A `Set` is over once its image is on
+    /// screen; a `Next` or `Previous` once any other image is.
+    fn follow_rotation(
+        &self,
+        style: Style,
+        before: Option<ItemId>,
+        direction: &Direction,
+    ) -> RequestStage {
         let state = &self.model.styles[style];
         let is_uri_mode = self.model.config().general.apply_mode == ApplyMode::Uri;
         let owes_uri = is_uri_mode && self.model.owed_uri(style).is_some();
         // A write held for a later instant or tick may come long after the
         // caller stopped waiting.
         let writes_later = is_uri_mode && state.key.reassert.is_some();
+        let has_arrived = match direction {
+            Direction::To(item) => state.current.as_ref() == Some(item),
+            Direction::Forward | Direction::Back => state.current != before,
+        };
         if state.is_busy() || owes_uri {
             RequestStage::Running { before }
-        } else if writes_later && state.current != before {
+        } else if writes_later && has_arrived {
             RequestStage::Finished(Err(format!("the {style} background key is written later")))
-        } else if state.current != before {
+        } else if has_arrived {
             RequestStage::Finished(Ok(()))
+        } else if let Direction::To(_) = direction {
+            RequestStage::Finished(Err(format!("the {style} image could not be shown")))
         } else {
             RequestStage::Finished(Err(format!("no other {style} image could be shown")))
         }
     }
 
     /// Starts a requested rotation of `style`: with the next image of its
-    /// order, or the newest one of its history that can still be shown. A
-    /// key that waits for the next tick is written back with it: the clock
-    /// that would bring that tick may be stopped.
-    fn start_request(&mut self, style: Style, direction: Direction) -> RequestStage {
+    /// order, the newest one of its history that can still be shown, or the
+    /// image a `Set` names. A key that waits for the next tick is written
+    /// back with it: the clock that would bring that tick may be stopped.
+    fn start_request(&mut self, style: Style, direction: &Direction) -> RequestStage {
         if let Some(why) = self.why_style_cannot_change(style) {
             return RequestStage::Finished(Err(why));
         }
@@ -187,22 +204,53 @@ impl Turn<'_> {
         let candidate = match direction {
             // A pick from a round with nothing else to show would start a
             // new round, and forget what this one showed.
-            Direction::Forward if !self.model.has_other_candidate(style) => None,
-            Direction::Forward => self.model.pick(style, &[]),
-            Direction::Back => self.model.step_back(style),
+            Direction::Forward if !self.model.has_other_candidate(style) => {
+                Err(format!("no other {style} image to show"))
+            }
+            Direction::Forward => self
+                .model
+                .pick(style, &[])
+                .ok_or_else(|| format!("no other {style} image to show")),
+            Direction::Back => self
+                .model
+                .step_back(style)
+                .ok_or_else(|| format!("no earlier {style} image to show")),
+            Direction::To(item) if self.model.shows(style, item) => {
+                return self.keep_set_image(style);
+            }
+            Direction::To(item) => self
+                .model
+                .chosen_candidate(style, item)
+                .map_err(|why| unshowable_text(style, &why)),
         };
-        match (candidate, direction) {
-            (Some(candidate), _) => {
+        match candidate {
+            Ok(candidate) => {
                 self.model.styles[style].key.end_tick_wait();
                 self.probe(style, candidate, Vec::new());
                 RequestStage::Running { before }
             }
-            (None, Direction::Forward) => {
-                RequestStage::Finished(Err(format!("no other {style} image to show")))
-            }
-            (None, Direction::Back) => {
-                RequestStage::Finished(Err(format!("no earlier {style} image to show")))
-            }
+            Err(why) => RequestStage::Finished(Err(why)),
+        }
+    }
+
+    /// A `Set` of the image on screen: nothing to publish, but the image
+    /// gets a whole interval from now, as a shown one does.
+    fn keep_set_image(&mut self, style: Style) -> RequestStage {
+        self.model.restart_clock(style, self.now);
+        self.persist();
+        RequestStage::Finished(Ok(()))
+    }
+
+    /// A `Set` candidate failed. No other image is tried: the request ends
+    /// once nothing is in flight for the style. As when a rotation gives up,
+    /// a fresh interval starts, so that a tick that fell due meanwhile does
+    /// not show another image in its place. A slot that was lost meanwhile
+    /// is filled again.
+    pub(super) fn end_set(&mut self, style: Style) {
+        self.model.restart_clock(style, self.now);
+        self.persist();
+        if !self.model.has_wallpaper(style) {
+            self.refill(style);
         }
     }
 
@@ -250,11 +298,31 @@ impl Turn<'_> {
     }
 
     fn queue_request(&mut self, id: ReplyId, direction: Direction, target: StyleTarget) {
-        let mut request = Request::new(id, direction, target.styles(self.model.visible));
+        let styles = target.styles(self.model.visible);
+        if let Direction::To(item) = &direction
+            && let Some(unlisted) = self.style_without(&styles, item)
+        {
+            return self.reply(id, Reply::Rejected(not_in_sources(unlisted)));
+        }
+        let mut request = Request::new(id, direction, styles);
         if let Some(partial) = self.model.partial_move.take() {
             self.carry_partial_move(&mut request, &partial);
         }
         self.model.requests.push(request);
+    }
+
+    /// The first of `styles` whose sources do not hold `item`, as far as a
+    /// scan tells. A `Set` naming such an item changes nothing in any style.
+    /// Without a config every style lacks it: the request then fails as a
+    /// `Next` would.
+    fn style_without(&self, styles: &[Style], item: &ItemId) -> Option<Style> {
+        if self.model.awaits_config() {
+            return None;
+        }
+        let lacks = |style: &&Style| {
+            self.model.chosen_candidate(**style, item).err() == Some(Unshowable::NotListed)
+        };
+        styles.iter().find(lacks).copied()
     }
 
     /// A both-style retry of the same direction does not pick again for a
@@ -292,8 +360,8 @@ impl Turn<'_> {
             .filter(|part| part.stage == RequestStage::Finished(Ok(())))
             .map(|part| (part.style, self.model.styles[part.style].current.clone()))
             .collect();
-        self.model.partial_move = (failed && !moved.is_empty()).then_some(PartialMove {
-            direction: request.direction,
+        self.model.partial_move = (failed && !moved.is_empty()).then(|| PartialMove {
+            direction: request.direction.clone(),
             moved,
         });
     }
@@ -343,5 +411,20 @@ impl Turn<'_> {
 
     fn reply(&mut self, id: ReplyId, reply: Reply) {
         self.effects.push(Effect::Reply { id, reply });
+    }
+}
+
+fn not_in_sources(style: Style) -> String {
+    format!("the image is not in the sources of {style}")
+}
+
+/// Why `style` cannot show the image a `Set` names. The text leaves the
+/// image out: a URL may hold credentials.
+fn unshowable_text(style: Style, why: &Unshowable) -> String {
+    match why {
+        Unshowable::Unscanned => format!("the {style} sources are still being scanned"),
+        Unshowable::NotListed => not_in_sources(style),
+        Unshowable::NotDownloaded => format!("the {style} image is not downloaded yet"),
+        Unshowable::Bad(reason) => format!("the {style} image cannot be shown: {reason}"),
     }
 }

@@ -106,6 +106,92 @@ fn previous_goes_back_to_the_image_before() {
 }
 
 #[test]
+fn set_shows_the_named_image_restarts_its_interval_and_previous_returns() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let (world, daemon) = running_daemon(&bus).await;
+        let client = bus.client().await;
+        let mut changes = client
+            .receive_changed()
+            .await
+            .expect("subscribe to Changed");
+        world.clock.advance(MINUTE);
+        let c = world.item(Style::Light, "c.png");
+
+        client
+            .set("light", c.as_str())
+            .await
+            .expect("Set(light, c)");
+
+        assert_eq!(world.shown(Style::Light), "c.png");
+        let signal = tokio::time::timeout(PATIENCE, changes.next())
+            .await
+            .expect("a Changed signal in time")
+            .expect("the signal stream to be open");
+        let args = signal.args().expect("Changed's arguments");
+        assert_eq!((args.style, args.id), ("light", c.as_str()));
+        let new_deadline = Some(start_time() + MINUTE + LIGHT_INTERVAL);
+        eventually("the interval restarts", || {
+            world.clock.armed() == new_deadline
+        })
+        .await;
+        let a = world.item(Style::Light, "a.png");
+        assert_eq!(
+            world
+                .saved_state()
+                .styles
+                .light
+                .history
+                .iter()
+                .collect::<Vec<_>>(),
+            [&a]
+        );
+
+        client.previous("light").await.expect("Previous(light)");
+
+        assert_eq!(world.shown(Style::Light), "a.png");
+        daemon.terminate().await;
+    });
+}
+
+#[test]
+fn set_of_an_image_outside_the_styles_sources_is_invalid_args_and_logs_no_credentials() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let (world, daemon) = running_daemon(&bus).await;
+        let client = bus.client().await;
+        let x = world.item(Style::Dark, "x.png");
+
+        let not_light = client
+            .set("light", x.as_str())
+            .await
+            .expect_err("x is dark's");
+        let unlisted = client
+            .set("light", "https://user:secret@example.com/a.jpg")
+            .await
+            .expect_err("the URL is not listed");
+
+        for error in [&not_light, &unlisted] {
+            let is_invalid_args = match error {
+                zbus::Error::FDO(fdo_error) => {
+                    matches!(**fdo_error, zbus::fdo::Error::InvalidArgs(_))
+                }
+                _ => false,
+            };
+            assert!(is_invalid_args, "{error:?}");
+            assert!(
+                error.to_string().contains("not in the sources of light"),
+                "{error}"
+            );
+        }
+        assert_eq!(world.shown(Style::Light), "a.png");
+        assert!(world.logged("example.com/a.jpg"));
+        assert!(!world.logged("secret"));
+        daemon.terminate().await;
+    });
+}
+
+#[test]
 fn a_paused_style_skips_its_deadline_and_rotates_on_resume() {
     scenario(async {
         let bus = PrivateBus::start();

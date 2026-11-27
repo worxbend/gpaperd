@@ -148,6 +148,8 @@ pub struct Daemon<'a> {
     waiting: BTreeMap<u64, Vec<Style>>,
     /// The ids among `waiting` of the `Previous` requests.
     stepping_back: BTreeSet<u64>,
+    /// The ids among `waiting` of the `Set` requests.
+    setting: BTreeSet<u64>,
     /// The requests that the step in progress replies to.
     replied_in_step: BTreeSet<u64>,
     /// Whether the step in progress saves the state.
@@ -217,6 +219,7 @@ impl<'a> Daemon<'a> {
             is_stopped: false,
             waiting: BTreeMap::new(),
             stepping_back: BTreeSet::new(),
+            setting: BTreeSet::new(),
             replied_in_step: BTreeSet::new(),
             saved_in_step: false,
             state_file: None,
@@ -280,6 +283,7 @@ impl<'a> Daemon<'a> {
         // out.
         self.waiting.clear();
         self.stepping_back.clear();
+        self.setting.clear();
         self.find_keys(boot);
         self.refresh_from = self.now() + HIDDEN_REFRESH_DELAY;
         let keys = self.gnome_keys();
@@ -391,13 +395,23 @@ impl<'a> Daemon<'a> {
     /// Whether a `Previous` that waits for its reply steps `style` back to
     /// an image that the round may have shown.
     fn is_stepping_back(&self, style: Style) -> bool {
-        let is_back = |id: &&u64| self.stepping_back.contains(id);
-        let mut rotated = self.waiting.iter().filter(|(id, _)| is_back(id));
+        self.waits_among(&self.stepping_back, style)
+    }
+
+    /// Whether a `Set` that waits for its reply puts the image it names on
+    /// `style`, which the round may have shown.
+    fn is_setting(&self, style: Style) -> bool {
+        self.waits_among(&self.setting, style)
+    }
+
+    /// Whether one of the waiting requests `ids` rotates `style`.
+    fn waits_among(&self, ids: &BTreeSet<u64>, style: Style) -> bool {
+        let mut rotated = self.waiting.iter().filter(|(id, _)| ids.contains(id));
         rotated.any(|(_, styles)| styles.contains(&style))
     }
 
-    /// Whether a `Next` or `Previous` that waits for its reply rotates
-    /// `style`.
+    /// Whether a `Next`, `Previous` or `Set` that waits for its reply
+    /// rotates `style`.
     fn is_requested(&self, style: Style) -> bool {
         self.waiting.values().any(|styles| styles.contains(&style))
     }
@@ -477,7 +491,7 @@ impl<'a> Daemon<'a> {
             Op::Reload(reload) => self.reload(reload)?,
             Op::ReloadFails => self.fail_reload()?,
             Op::Restart { boot, lost_slots } => self.restart(boot, *lost_slots)?,
-            Op::Ask(command) => self.ask(*command)?,
+            Op::Ask(command) => self.ask(command.clone())?,
             Op::Lock(lock) => {
                 self.screen_locked = *lock == ScreenLock::Locked;
                 self.send(Event::ScreenLock(*lock))?;
@@ -491,13 +505,21 @@ impl<'a> Daemon<'a> {
     fn ask(&mut self, command: Command) -> Result<(), TestCaseError> {
         let id = self.next_request;
         self.next_request += 1;
-        let rotated = match command {
-            Command::Next(target) | Command::Previous(target) => target.styles(self.visible),
+        let rotated = match &command {
+            Command::Next(target) | Command::Previous(target) | Command::Set(target, _) => {
+                target.styles(self.visible)
+            }
             _ => Vec::new(),
         };
         self.waiting.insert(id, rotated);
-        if matches!(command, Command::Previous(_)) {
-            self.stepping_back.insert(id);
+        match command {
+            Command::Previous(_) => {
+                self.stepping_back.insert(id);
+            }
+            Command::Set(..) => {
+                self.setting.insert(id);
+            }
+            _ => {}
         }
         if let Command::Resume(target) = command {
             // A resume ends an external-change pause and writes that key
@@ -509,7 +531,7 @@ impl<'a> Daemon<'a> {
         }
         self.send(Event::Control {
             id: ReplyId(id),
-            command,
+            command: command.clone(),
         })?;
         match command {
             Command::Pause(target) => {
@@ -790,7 +812,7 @@ impl<'a> Daemon<'a> {
             Some(Effect::Publish { style, item, .. }) => {
                 let before = self.model.persisted().styles[style].clone();
                 // The reply may go out in the same step.
-                let steps_back = self.is_stepping_back(style);
+                let is_off_order = self.is_stepping_back(style) || self.is_setting(style);
                 let result = self.write_slot(style, publish_fails);
                 let is_written_while_hidden = result.is_ok() && style != self.visible;
                 self.send(Event::Published {
@@ -810,7 +832,7 @@ impl<'a> Daemon<'a> {
                     is_written_while_hidden || !got_dirty,
                     "the {style} slot got dirty on screen"
                 );
-                self.check_round(style, &before, steps_back)
+                self.check_round(style, &before, is_off_order)
             }
             Some(Effect::Republish(style)) => {
                 let result = match self.slots[style] {
@@ -962,21 +984,22 @@ impl<'a> Daemon<'a> {
 
     /// Checks that a shuffled style showed no image twice in one round.
     /// `before` is the style's saved state from before the publish answer,
-    /// and `steps_back` whether a `Previous` brought an image back.
+    /// and `is_off_order` whether a `Previous` brought an image back or a
+    /// `Set` chose it.
     fn check_round(
         &self,
         style: Style,
         before: &StylePersisted,
-        steps_back: bool,
+        is_off_order: bool,
     ) -> Result<(), TestCaseError> {
         let after = &self.model.persisted().styles[style];
         let is_shuffled = self.config.styles[style].order == Order::Random;
         let Some(shown) = after.current.as_ref().filter(|_| is_shuffled) else {
             return Ok(());
         };
-        if before.current.as_ref() == Some(shown) || steps_back {
-            // The slot was written again with the image it had, or got an
-            // image back from its history.
+        if before.current.as_ref() == Some(shown) || is_off_order {
+            // The slot was written again with the image it had, got an
+            // image back from its history, or the one a `Set` named.
             return Ok(());
         }
         // Every state file here is this model's own, which knows what its
@@ -1279,6 +1302,7 @@ impl<'a> Daemon<'a> {
                 let waited = self.waiting.remove(&id.0);
                 prop_assert!(waited.is_some(), "a second reply, or one nobody asked for");
                 self.stepping_back.remove(&id.0);
+                self.setting.remove(&id.0);
             }
             Effect::RestoreKeys { id, keys } => {
                 let is_restore = matches!(

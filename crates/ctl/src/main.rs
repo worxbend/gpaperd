@@ -5,6 +5,7 @@
 mod summary;
 
 use std::fmt;
+use std::fs;
 use std::process::ExitCode;
 use std::str::FromStr;
 
@@ -29,6 +30,13 @@ enum Cmd {
     Next(StyleArg),
     /// Show the previous image again.
     Previous(StyleArg),
+    /// Show one image of the style's sources now.
+    Set {
+        #[command(flatten)]
+        style: StyleArg,
+        /// A local file or a URL, as the config lists it.
+        image: String,
+    },
     /// Stop rotating.
     Pause(StyleArg),
     /// Start rotating again.
@@ -63,6 +71,9 @@ enum Failure {
     NoAnswer,
     /// The session bus itself cannot be reached.
     NoBus(zbus::Error),
+    /// `set` names a local file that cannot be resolved, or whose path is
+    /// not UTF-8 and so has no catalog id.
+    NoImage { image: String, reason: String },
     /// `Reload` answered `(false, error)`.
     ReloadFailed(String),
     /// Any other D-Bus error, the daemon's own included.
@@ -106,6 +117,12 @@ impl fmt::Display for Failure {
             Failure::NotRunning => f.write_str("gpaperd is not running"),
             Failure::NoAnswer => f.write_str("gpaperd did not answer"),
             Failure::NoBus(error) => write!(f, "cannot reach the session bus: {error}"),
+            Failure::NoImage { image, reason } => write!(
+                f,
+                "cannot find {}: {}",
+                summary::replace_controls(image),
+                summary::replace_controls(reason)
+            ),
             Failure::ReloadFailed(error) => {
                 write!(f, "reload failed: {}", summary::replace_controls(error))
             }
@@ -160,6 +177,7 @@ async fn run(command: Cmd) -> Result<String, Failure> {
     match command {
         Cmd::Next(arg) => daemon.next(arg.style.as_str()).await,
         Cmd::Previous(arg) => daemon.previous(arg.style.as_str()).await,
+        Cmd::Set { style, image } => daemon.set(style.style.as_str(), &image_id(&image)?).await,
         Cmd::Pause(arg) => daemon.pause(arg.style.as_str()).await,
         Cmd::Resume(arg) => daemon.resume(arg.style.as_str()).await,
         Cmd::Refresh => daemon.refresh_remote().await,
@@ -169,6 +187,25 @@ async fn run(command: Cmd) -> Result<String, Failure> {
     }
     .map_err(Failure::from_call)?;
     Ok(String::new())
+}
+
+/// The `id` that `Set` takes for `image`. A URL goes as typed: the daemon
+/// puts it in the form the catalog keeps. A path is made absolute and
+/// canonical here, against this process's working directory, as the
+/// daemon's scanner makes catalog ids.
+fn image_id(image: &str) -> Result<String, Failure> {
+    // The config tells a URL from a path the same way.
+    if image.contains("://") {
+        return Ok(image.to_owned());
+    }
+    let no_image = |reason: String| Failure::NoImage {
+        image: image.to_owned(),
+        reason,
+    };
+    let path = fs::canonicalize(image).map_err(|error| no_image(error.to_string()))?;
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| no_image("the path is not UTF-8".to_owned()))
 }
 
 async fn reload(daemon: &Gpaperd1Proxy<'_>) -> Result<String, Failure> {
@@ -246,6 +283,47 @@ mod tests {
     fn an_unknown_style_is_a_usage_error() {
         let error = parse(&["next", "--style", "all"]).expect_err("rejected");
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn set_takes_an_image_and_defaults_to_the_visible_style() {
+        let parsed = parse(&["set", "day.jpg"]).ok();
+        let expected = Cmd::Set {
+            style: style(StyleTarget::Visible),
+            image: "day.jpg".to_owned(),
+        };
+        assert_eq!(parsed, Some(expected));
+
+        let parsed = parse(&["set", "--style", "both", "https://example.com/a.jpg"]).ok();
+        let expected = Cmd::Set {
+            style: style(StyleTarget::Both),
+            image: "https://example.com/a.jpg".to_owned(),
+        };
+        assert_eq!(parsed, Some(expected));
+    }
+
+    #[test]
+    fn set_needs_an_image() {
+        let error = parse(&["set"]).expect_err("rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn an_unresolved_image_names_the_image_and_why() {
+        let failure = image_id("/no/such/dir/x\u{1b}.jpg").expect_err("missing");
+        let shown = failure.to_string();
+        assert!(
+            shown.starts_with("cannot find /no/such/dir/x?.jpg: "),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_url_image_is_sent_as_typed() {
+        assert_eq!(
+            image_id("HTTPS://Example.com/a.jpg").ok().as_deref(),
+            Some("HTTPS://Example.com/a.jpg")
+        );
     }
 
     #[test]

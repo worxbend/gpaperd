@@ -52,6 +52,14 @@ impl Bus {
     fn ctl(&self, args: &[&str]) -> Output {
         ctl_with(&self.address, self.home.path(), args)
     }
+
+    /// Runs `gpaperctl args…` on this bus from the working directory `cwd`.
+    fn ctl_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        ctl_command(&self.address, self.home.path(), args)
+            .current_dir(cwd)
+            .output()
+            .expect("gpaperctl runs")
+    }
 }
 
 impl Drop for Bus {
@@ -62,16 +70,22 @@ impl Drop for Bus {
 }
 
 fn ctl_with(address: &str, home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_gpaperctl"))
+    ctl_command(address, home, args)
+        .output()
+        .expect("gpaperctl runs")
+}
+
+fn ctl_command(address: &str, home: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gpaperctl"));
+    command
         .args(args)
         .env_clear()
         .env("DBUS_SESSION_BUS_ADDRESS", address)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
-        .env("TZ", "UTC")
-        .output()
-        .expect("gpaperctl runs")
+        .env("TZ", "UTC");
+    command
 }
 
 /// How the fake daemon answers.
@@ -103,6 +117,10 @@ impl FakeDaemon {
 
     fn previous(&self, style: &str) {
         self.record(format!("Previous({style})"));
+    }
+
+    fn set(&self, style: &str, id: &str) {
+        self.record(format!("Set({style}, {id})"));
     }
 
     fn pause(&self, style: &str) {
@@ -255,6 +273,57 @@ fn each_command_calls_its_method() {
             "Restore",
         ]
     );
+}
+
+#[test]
+fn set_sends_a_relative_path_absolute_and_canonical() {
+    let bus = Bus::start();
+    let server = Server::start(&bus, Script::default());
+    let pictures = TempDir::new().expect("temp dir");
+    std::fs::write(pictures.path().join("day.jpg"), b"image").expect("write image");
+    std::os::unix::fs::symlink("day.jpg", pictures.path().join("link.jpg")).expect("symlink");
+    let canonical = pictures
+        .path()
+        .canonicalize()
+        .expect("canonical dir")
+        .join("day.jpg");
+
+    let output = bus.ctl_in(pictures.path(), &["set", "link.jpg"]);
+
+    assert_ok(&output);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        server.calls(),
+        [format!("Set(visible, {})", canonical.display())]
+    );
+}
+
+#[test]
+fn set_sends_a_url_as_typed() {
+    let bus = Bus::start();
+    let server = Server::start(&bus, Script::default());
+
+    let output = bus.ctl(&["set", "--style", "dark", "https://example.com/night.jpg"]);
+
+    assert_ok(&output);
+    assert_eq!(server.calls(), ["Set(dark, https://example.com/night.jpg)"]);
+}
+
+#[test]
+fn set_of_a_missing_file_says_so_and_never_reaches_the_bus() {
+    let bus = Bus::start();
+    let server = Server::start(&bus, Script::default());
+    let empty = TempDir::new().expect("temp dir");
+
+    let output = bus.ctl_in(empty.path(), &["set", "gone.jpg"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("gpaperctl: cannot find gone.jpg: "),
+        "{}",
+        stderr(&output)
+    );
+    assert!(server.calls().is_empty());
 }
 
 #[test]

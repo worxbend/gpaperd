@@ -245,6 +245,20 @@ pub(crate) enum Timer {
     Stale,
 }
 
+/// Why a style cannot show the item that a `Set` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unshowable {
+    /// The style's catalog is not known yet: the scan of its sources is
+    /// still to come.
+    Unscanned,
+    /// Neither the style's catalog nor its sources' URLs hold it.
+    NotListed,
+    /// One of the style's URLs whose image is not in the remote cache yet.
+    NotDownloaded,
+    /// Its last probe rejected it.
+    Bad(BadReason),
+}
+
 /// One rotation of a style: a candidate on its way into the slot.
 #[derive(Debug, Clone)]
 pub(crate) struct Rotation {
@@ -787,9 +801,40 @@ impl Model {
     /// Whether a `Previous` runs a rotation of `style`: the image it shows
     /// comes from the history and does not go back into it.
     pub(crate) fn steps_back(&self, style: Style) -> bool {
+        self.requested_direction(style) == Some(&Direction::Back)
+    }
+
+    /// The direction of the request that runs a rotation of `style`, if
+    /// any. At most one request runs for a style.
+    pub(crate) fn requested_direction(&self, style: Style) -> Option<&Direction> {
         self.requests
             .iter()
-            .any(|request| request.direction == Direction::Back && request.runs_for(style))
+            .find(|request| request.runs_for(style))
+            .map(|request| &request.direction)
+    }
+
+    /// `id` as `style` can show it for a `Set`: an item of the style's own
+    /// catalog, that is of its sources, and not known to be bad. Unlike
+    /// [`Model::candidate`] it never borrows the other style's images.
+    pub(crate) fn chosen_candidate(
+        &self,
+        style: Style,
+        id: &ItemId,
+    ) -> Result<Candidate, Unshowable> {
+        if !self.is_scanned[style] || self.awaits_rescan[style] {
+            return Err(Unshowable::Unscanned);
+        }
+        match self.catalogs[style].get(id) {
+            Some(Item {
+                check: Check::Bad(reason),
+                ..
+            }) => Err(Unshowable::Bad(reason.clone())),
+            Some(item) => Ok(Candidate::of(item)),
+            None if self.urls_of(style).any(|url| url.as_str() == id.as_str()) => {
+                Err(Unshowable::NotDownloaded)
+            }
+            None => Err(Unshowable::NotListed),
+        }
     }
 
     /// Takes the newest image of `style`'s history that it can show now,

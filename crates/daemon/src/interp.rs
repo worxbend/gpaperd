@@ -30,7 +30,7 @@ use std::{io, mem, panic};
 
 use gpaperd_core::catalog::{BadReason, FileId, FsChange, ItemId, RemoteBlob};
 use gpaperd_core::config::{Config, ConfigError, LinkPolicy, Source};
-use gpaperd_core::control::ReplyId;
+use gpaperd_core::control::{Command, ReplyId};
 use gpaperd_core::event::{
     BackgroundKeys, Effect, Event, FetchOutcome, Fired, GnomeEvent, ScreenLock, Status,
 };
@@ -611,7 +611,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     /// `pending` until the core answers.
     fn control_event(&mut self, request: ControlRequest) -> Event {
         let ControlRequest { command, reply } = request;
-        tracing::info!(?command, "control request");
+        log_command(&command);
         Event::Control {
             id: self.pending.register(reply),
             command,
@@ -1140,6 +1140,17 @@ fn slot_on_disk(slot: &Path) -> Option<FileId> {
 fn slot_uri(paths: &Paths, style: Style) -> String {
     // Only a relative path has no URI, and `Paths` holds absolute ones.
     slots::file_uri(&paths.slot(style)).expect("an absolute slots directory")
+}
+
+/// Logs a control request. A `Set` names its image as the log does
+/// everywhere: a URL may hold credentials.
+fn log_command(command: &Command) {
+    match command {
+        Command::Set(target, item) => {
+            tracing::info!(command = "Set", style = %target, item = %fetch::loggable(item), "control request");
+        }
+        other => tracing::info!(command = ?other, "control request"),
+    }
 }
 
 /// Logs what a probe, a slot write or the slots watch reports. The core

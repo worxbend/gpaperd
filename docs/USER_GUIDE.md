@@ -255,6 +255,7 @@ sources = ["~/Pictures/Wallpapers"]
 gpaperctl next                 # next image now, for the style on screen
 gpaperctl next --style both    # both styles
 gpaperctl previous             # back to the image before (20 kept per style)
+gpaperctl set ~/Pictures/Wallpapers/lake.jpg   # show this one now
 gpaperctl pause                # stop changing; resume continues
 gpaperctl resume
 gpaperctl status               # what is shown, when it changes next
@@ -265,6 +266,11 @@ gpaperctl restore              # put your original wallpaper back and pause
 ```
 
 `--style` takes `light`, `dark`, `visible` (the default) or `both`.
+
+`gpaperctl set` takes a file from the style's sources, or a URL exactly as
+the config lists it. A file elsewhere is refused and nothing changes: add
+its folder to `sources` first. The image gets a full interval, a pause
+stays on, and `gpaperctl previous` brings back the image before it.
 
 If you choose a wallpaper in GNOME Settings, gpaperd pauses that style
 (with the default `on_external_change = "pause"`). `gpaperctl resume` or a

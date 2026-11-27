@@ -534,6 +534,33 @@ fn next_is_not_done_before_the_uri_key_write() {
     assert_eq!(the_reply(&landed), &Reply::Done);
 }
 
+#[test]
+fn set_is_not_done_before_the_uri_key_write() {
+    let mut world = running_in_uri_mode();
+    step(
+        &mut world.model,
+        at(10),
+        control(1, Command::Set(StyleTarget::Light, id("/l/c.jpg"))),
+    );
+
+    let planned = step(
+        &mut world.model,
+        at(11),
+        probe_passed(Style::Light, "/l/c.jpg"),
+    );
+    assert!(planned.iter().any(is_set_keys));
+    assert!(replies(&planned).is_empty());
+
+    world.keys.picture_uri = "file:///l/c.jpg".to_owned();
+    let landed = step(&mut world.model, at(12), keys_changed(world.keys.clone()));
+
+    assert!(landed.contains(&Effect::Changed {
+        style: Style::Light,
+        item: id("/l/c.jpg"),
+    }));
+    assert_eq!(the_reply(&landed), &Reply::Done);
+}
+
 /// GNOME refused the write of `/l/b.jpg` to the light key.
 fn light_b_refused() -> Event {
     Event::KeyWriteFailed {

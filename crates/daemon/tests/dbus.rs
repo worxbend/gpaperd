@@ -86,7 +86,7 @@ async fn serve(
         // than see a dropped sender.
         let mut ignored = Vec::new();
         while let Some(request) = incoming.recv().await {
-            record.lock().unwrap().push(request.command);
+            record.lock().unwrap().push(request.command.clone());
             match answer(request.command) {
                 Some(reply) => {
                     let _ = request.reply.send(reply);
@@ -227,6 +227,70 @@ async fn an_unknown_style_is_invalid_args_and_never_reaches_the_core() {
         }
     }
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn set_passes_the_style_and_the_catalog_id_to_the_core() {
+    let bus = PrivateBus::start();
+    let (_server, seen) = serve(&bus, Duration::from_secs(30), healthy).await;
+    let client = bus.client().await;
+
+    within(client.set("light", "/pics/a b.jpg")).await.unwrap();
+    within(client.set("both", "HTTPS://Example.com/x.jpg"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            Command::Set(StyleTarget::Light, ItemId::new("/pics/a b.jpg")),
+            Command::Set(StyleTarget::Both, ItemId::new("https://example.com/x.jpg")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn set_of_no_absolute_path_or_web_url_is_invalid_args_and_never_reaches_the_core() {
+    let bus = PrivateBus::start();
+    let (_server, seen) = serve(&bus, Duration::from_secs(30), healthy).await;
+    let client = bus.client().await;
+
+    for (style, id) in [
+        ("light", "pics/a.jpg"),
+        ("light", "ftp://example.com/a.jpg"),
+        ("light", ""),
+        ("all", "/pics/a.jpg"),
+    ] {
+        let error = within(client.set(style, id)).await.unwrap_err();
+        assert_eq!(
+            error_name(&error),
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "{style:?} {id:?}"
+        );
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_rejected_reply_is_invalid_args_with_its_text() {
+    let bus = PrivateBus::start();
+    let (_server, _) = serve(&bus, Duration::from_secs(30), |_| {
+        Some(Reply::Rejected(
+            "the image is not in the sources of dark".to_owned(),
+        ))
+    })
+    .await;
+    let client = bus.client().await;
+
+    let error = within(client.set("dark", "/pics/a.jpg")).await.unwrap_err();
+
+    assert_eq!(error_name(&error), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        error
+            .to_string()
+            .contains("the image is not in the sources of dark"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

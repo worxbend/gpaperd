@@ -200,6 +200,7 @@ dark:
 ```text
 gpaperctl next     [--style light|dark|visible|both]   rotate now
 gpaperctl previous [--style …]                         show the previous image again (20 per style)
+gpaperctl set      [--style …] <image>                 show this file or listed URL now
 gpaperctl pause    [--style …]                         stop a style's timer
 gpaperctl resume   [--style …]                         end the pause; an overdue style rotates at once
 gpaperctl reload                                       re-read the config; prints line and column on error
@@ -208,11 +209,16 @@ gpaperctl restore                                      put the original wallpape
 gpaperctl status   [--json]                            what is shown, the next change, catalog sizes, pauses
 ```
 
-`--style` defaults to `visible`, the style on screen. The exit status is 0
-on success, 1 when the daemon is not running or reports an error, and 2 on
-a usage error.
+`--style` defaults to `visible`, the style on screen. `set` takes a local
+file, resolved against the current directory, or a URL as the config lists
+it. The image must be in the sources of each style meant, or nothing
+changes. It restarts the interval, keeps a pause, and `previous` goes back
+from it. The exit status is 0 on success, 1 when the daemon is not running
+or reports an error, and 2 on a usage error.
 D-Bus: name and interface `io.github.worxbend.Gpaperd1`, object
-`/io/github/worxbend/Gpaperd1`.
+`/io/github/worxbend/Gpaperd1`. `set` calls `Set(style, id)`; `id` is an
+absolute, canonical path or an `http(s)` URL, and one outside the style's
+sources is `org.freedesktop.DBus.Error.InvalidArgs`.
 
 ## Files
 

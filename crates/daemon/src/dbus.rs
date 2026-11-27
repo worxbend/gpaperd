@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpaperd_core::catalog::ItemId;
 use gpaperd_core::control::{
-    BUS_NAME, Command, OBJECT_PATH, Reply, ReplyId, StatusReport, StyleTarget,
+    self, BUS_NAME, Command, OBJECT_PATH, Reply, ReplyId, StatusReport, StyleTarget,
 };
 use gpaperd_core::event::Status;
 use gpaperd_core::style::Style;
@@ -164,7 +164,8 @@ fn lock(properties: &Mutex<Properties>) -> std::sync::MutexGuard<'_, Properties>
     properties.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `Reply::Done` is `Ok`; `Reply::Failed` is a `Failed` error.
+/// `Reply::Done` is `Ok`; `Reply::Failed` is a `Failed` error and
+/// `Reply::Rejected` an `InvalidArgs` one.
 fn done(reply: Reply) -> fdo::Result<()> {
     match reply {
         Reply::Done => Ok(()),
@@ -201,11 +202,12 @@ fn redacted_report(mut report: StatusReport) -> StatusReport {
     report
 }
 
-/// `Failed(text)` carries the core's text; any other reply is a bug in the
-/// core, named without its contents.
+/// `Failed(text)` and `Rejected(text)` carry the core's text; any other
+/// reply is a bug in the core, named without its contents.
 fn unexpected(reply: Reply) -> fdo::Error {
     let name = match reply {
         Reply::Failed(text) => return fdo::Error::Failed(text),
+        Reply::Rejected(text) => return fdo::Error::InvalidArgs(text),
         Reply::Done => "Done",
         Reply::Reloaded(_) => "Reloaded",
         Reply::Status(_) => "Status",
@@ -223,6 +225,12 @@ impl Control {
     /// Step back through the style's history.
     async fn previous(&self, style: &str) -> fdo::Result<()> {
         done(self.ask(Command::Previous(parse_style(style)?)).await?)
+    }
+
+    /// Show the image `id` of the style's sources now.
+    async fn set(&self, style: &str, id: &str) -> fdo::Result<()> {
+        let command = Command::Set(parse_style(style)?, parse_image(id)?);
+        done(self.ask(command).await?)
     }
 
     /// Stop the style's timer.
@@ -296,6 +304,13 @@ pub fn parse_style(style: &str) -> fdo::Result<StyleTarget> {
         .map_err(|error: gpaperd_core::control::UnknownStyleTarget| {
             fdo::Error::InvalidArgs(error.to_string())
         })
+}
+
+/// Parses the `id` argument of `Set`: an absolute path, or an `http` or
+/// `https` URL, which becomes the form the catalog keeps. Anything else is
+/// `org.freedesktop.DBus.Error.InvalidArgs`.
+fn parse_image(id: &str) -> fdo::Result<ItemId> {
+    control::image_id(id).map_err(|error| fdo::Error::InvalidArgs(error.to_string()))
 }
 
 /// Why [`own_name`] did not serve the interface.

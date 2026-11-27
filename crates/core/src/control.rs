@@ -10,9 +10,11 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::catalog::ItemId;
 use crate::event::Pause;
@@ -33,7 +35,7 @@ pub const HISTORY_LEN: usize = 20;
 pub const STATUS_VERSION: u32 = 1;
 
 /// Which styles a command acts on: the `style` argument of the D-Bus
-/// methods `Next`, `Previous`, `Pause` and `Resume`.
+/// methods `Next`, `Previous`, `Set`, `Pause` and `Resume`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StyleTarget {
     Light,
@@ -92,13 +94,41 @@ impl FromStr for StyleTarget {
     }
 }
 
+/// The `id` argument of the D-Bus method `Set` that names neither an
+/// absolute path nor an `http` or `https` URL. The D-Bus server answers it
+/// with `org.freedesktop.DBus.Error.InvalidArgs`. The text leaves the
+/// argument out: a URL may hold credentials.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("expected an absolute path or an http or https URL")]
+pub struct UnknownImage;
+
+/// The catalog id that `text`, the `id` argument of `Set`, names: an `http`
+/// or `https` URL in the form the catalog keeps it, or an absolute path as
+/// it is. A path is not made canonical here: only the client knows its own
+/// working directory and file system view.
+///
+/// # Errors
+///
+/// [`UnknownImage`] for anything else: a relative path, another scheme.
+pub fn image_id(text: &str) -> Result<ItemId, UnknownImage> {
+    match Url::parse(text) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(ItemId::from_url(&url)),
+        Ok(_) => Err(UnknownImage),
+        Err(_) if Path::new(text).is_absolute() => Ok(ItemId::new(text)),
+        Err(_) => Err(UnknownImage),
+    }
+}
+
 /// What a control client asks the core to do. One per D-Bus method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Rotate now.
     Next(StyleTarget),
     /// Show the image before the current one, from the style's [`History`].
     Previous(StyleTarget),
+    /// Show this item of each meant style's own catalog now, as `Next`
+    /// shows the image it draws.
+    Set(StyleTarget, ItemId),
     /// Stop the style's timer: a user pause, next to any other pause.
     Pause(StyleTarget),
     /// End the user pause. An overdue style rotates at once.
@@ -126,7 +156,8 @@ pub struct ReplyId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// The command was carried out. For `Next` and `Previous`: every
-    /// style meant shows another image now, its publish finished.
+    /// style meant shows another image now, its publish finished. For
+    /// `Set`: every style meant shows the named image.
     Done,
     /// Answer to [`Command::Reload`]: `Err` holds the config error's text,
     /// with line and column.
@@ -138,19 +169,26 @@ pub enum Reply {
     /// `Previous` for both styles fails when either style could not show
     /// another image, although the other one may have.
     Failed(String),
+    /// The command names something the core does not have, so nothing was
+    /// done: a `Set` of an image outside a meant style's sources. The text
+    /// says why. The D-Bus server answers it with
+    /// `org.freedesktop.DBus.Error.InvalidArgs`.
+    Rejected(String),
 }
 
 /// Which way a [`Request`] moves through a style's images.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Direction {
     /// `Next`: the style's order draws the image.
     Forward,
     /// `Previous`: the newest image of the style's [`History`] that can
     /// still be shown.
     Back,
+    /// `Set`: this item and no other.
+    To(ItemId),
 }
 
-/// A `Next` or `Previous` that waits for its rotations to end.
+/// A `Next`, `Previous` or `Set` that waits for its rotations to end.
 #[derive(Debug, Clone)]
 pub(crate) struct Request {
     pub(crate) id: ReplyId,
@@ -181,7 +219,7 @@ pub(crate) enum RequestStage {
     Carried,
 }
 
-/// What a both-style `Next` or `Previous` moved before its other style
+/// What a both-style `Next`, `Previous` or `Set` moved before its other style
 /// failed: each moved style with the item it showed then.
 #[derive(Debug, Clone)]
 pub(crate) struct PartialMove {
@@ -339,6 +377,41 @@ mod tests {
                 bad.parse::<StyleTarget>(),
                 Err(UnknownStyleTarget(bad.to_owned()))
             );
+        }
+    }
+
+    #[test]
+    fn an_image_id_is_an_absolute_path_as_is() {
+        assert_eq!(
+            image_id("/srv/walls/a b.jpg"),
+            Ok(ItemId::new("/srv/walls/a b.jpg"))
+        );
+    }
+
+    #[test]
+    fn an_image_url_takes_the_form_the_catalog_keeps() {
+        let config_url = Url::parse("HTTPS://Example.com").expect("parses");
+        assert_eq!(
+            image_id("HTTPS://Example.com"),
+            Ok(ItemId::from_url(&config_url))
+        );
+        assert_eq!(
+            image_id("https://example.com/a.jpg?k=1"),
+            Ok(ItemId::new("https://example.com/a.jpg?k=1"))
+        );
+    }
+
+    #[test]
+    fn an_image_that_is_neither_an_absolute_path_nor_a_web_url_is_unknown() {
+        for bad in [
+            "",
+            "a.jpg",
+            "./a.jpg",
+            "~/a.jpg",
+            "file:///a.jpg",
+            "ftp://h/a.jpg",
+        ] {
+            assert_eq!(image_id(bad), Err(UnknownImage), "{bad:?}");
         }
     }
 
