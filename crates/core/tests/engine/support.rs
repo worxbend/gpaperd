@@ -357,6 +357,7 @@ pub fn light_showing(current: &str, bag: &[&str], shown: &[&str]) -> Persisted {
             dark: StylePersisted::default(),
         },
         original_keys: None,
+        banned: Default::default(),
     }
 }
 
@@ -382,6 +383,9 @@ pub struct World {
     pub restore_error: Option<String>,
     /// GNOME refuses every key write: the keys stay as they are.
     pub refuses_key_writes: bool,
+    /// Why copying a favorite fails, for `SaveFavorites`. `None` when it
+    /// works.
+    pub favorite_error: Option<String>,
     last_slot_inode: u64,
 }
 
@@ -398,6 +402,7 @@ impl World {
             keys: user_keys(),
             restore_error: None,
             refuses_key_writes: false,
+            favorite_error: None,
             last_slot_inode: 0,
         }
     }
@@ -488,6 +493,10 @@ impl World {
             Effect::ReadConfig(id) => Some(Event::ConfigRead {
                 id: *id,
                 result: self.config_file.clone(),
+            }),
+            Effect::SaveFavorites { id, .. } => Some(Event::FavoritesSaved {
+                id: *id,
+                result: self.favorite_error.clone().map_or(Ok(()), Err),
             }),
             _ => None,
         };

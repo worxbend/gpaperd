@@ -35,7 +35,8 @@ pub const HISTORY_LEN: usize = 20;
 pub const STATUS_VERSION: u32 = 1;
 
 /// Which styles a command acts on: the `style` argument of the D-Bus
-/// methods `Next`, `Previous`, `Set`, `Pause` and `Resume`.
+/// methods `Next`, `Previous`, `Set`, `Ban`, `Favorite`, `Pause` and
+/// `Resume`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StyleTarget {
     Light,
@@ -94,18 +95,18 @@ impl FromStr for StyleTarget {
     }
 }
 
-/// The `id` argument of the D-Bus method `Set` that names neither an
-/// absolute path nor an `http` or `https` URL. The D-Bus server answers it
-/// with `org.freedesktop.DBus.Error.InvalidArgs`. The text leaves the
-/// argument out: a URL may hold credentials.
+/// The `id` argument of the D-Bus methods `Set` and `Unban` that names
+/// neither an absolute path nor an `http` or `https` URL. The D-Bus server
+/// answers it with `org.freedesktop.DBus.Error.InvalidArgs`. The text leaves
+/// the argument out: a URL may hold credentials.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("expected an absolute path or an http or https URL")]
 pub struct UnknownImage;
 
-/// The catalog id that `text`, the `id` argument of `Set`, names: an `http`
-/// or `https` URL in the form the catalog keeps it, or an absolute path as
-/// it is. A path is not made canonical here: only the client knows its own
-/// working directory and file system view.
+/// The catalog id that `text`, the `id` argument of `Set` and `Unban`,
+/// names: an `http` or `https` URL in the form the catalog keeps it, or an
+/// absolute path as it is. A path is not made canonical here: only the
+/// client knows its own working directory and file system view.
 ///
 /// # Errors
 ///
@@ -129,6 +130,13 @@ pub enum Command {
     /// Show this item of each meant style's own catalog now, as `Next`
     /// shows the image it draws.
     Set(StyleTarget, ItemId),
+    /// Ban the image each meant style shows, for good and for both styles,
+    /// then rotate each meant style as `Next` does.
+    Ban(StyleTarget),
+    /// Lift the ban of this item.
+    Unban(ItemId),
+    /// Copy the image each meant style shows into `favorites_dir`.
+    Favorite(StyleTarget),
     /// Stop the style's timer: a user pause, next to any other pause.
     Pause(StyleTarget),
     /// End the user pause. An overdue style rotates at once.
@@ -155,9 +163,10 @@ pub struct ReplyId(pub u64);
 /// The core's answer to a [`Command`]. Every command gets exactly one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    /// The command was carried out. For `Next` and `Previous`: every
-    /// style meant shows another image now, its publish finished. For
-    /// `Set`: every style meant shows the named image.
+    /// The command was carried out. For `Next`, `Previous` and `Ban`:
+    /// every style meant shows another image now, its publish finished. For
+    /// `Set`: every style meant shows the named image. For `Favorite`: every
+    /// copy is written.
     Done,
     /// Answer to [`Command::Reload`]: `Err` holds the config error's text,
     /// with line and column.
@@ -170,7 +179,8 @@ pub enum Reply {
     /// another image, although the other one may have.
     Failed(String),
     /// The command names something the core does not have, so nothing was
-    /// done: a `Set` of an image outside a meant style's sources. The text
+    /// done: a `Set` of an image outside a meant style's sources, an
+    /// `Unban` of an image that is not banned. The text
     /// says why. The D-Bus server answers it with
     /// `org.freedesktop.DBus.Error.InvalidArgs`.
     Rejected(String),
@@ -280,6 +290,10 @@ pub struct StatusReport {
     /// `None` when none is scheduled.
     pub next_change: Option<u64>,
     pub styles: PerStyle<StyleReport>,
+    /// The banned items of both styles, in id order. Missing from a
+    /// document of a daemon that predates bans.
+    #[serde(default)]
+    pub banned: Vec<ItemId>,
 }
 
 /// One style in a [`StatusReport`].
@@ -293,7 +307,8 @@ pub struct StyleReport {
     pub paused: Vec<Pause>,
     /// Items in the style's own catalog, usable or not.
     pub items: usize,
-    /// Items that may be picked: present and not known to be bad.
+    /// Items that may be picked: present, not known to be bad and not
+    /// banned.
     pub usable: usize,
     /// Items rejected by a probe, with the reason.
     pub bad: Vec<BadItem>,

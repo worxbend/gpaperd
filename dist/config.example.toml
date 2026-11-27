@@ -27,6 +27,7 @@ apply_mode = "slots"             # "slots": rotate two slot files, keys written 
                                  # "uri": write each image's own URI to the keys
 max_pixels = 100_000_000         # skip images with more pixels (width x height)
 pause_when_locked = false        # stop the timers while the screen is locked
+favorites_dir = "~/Pictures/Favorites"  # optional; where `gpaperctl favorite` copies
 
 [light]
 sources = [

@@ -216,14 +216,19 @@ fn picture_options() -> impl Strategy<Value = Option<PictureOptions>> {
 pub fn config() -> impl Strategy<Value = Config> {
     let general = (any::<bool>(), any::<bool>(), policy(), picture_options());
     let styles = (order(), order(), 60_u64..=3600, 60_u64..=3600);
-    (general, styles, any::<bool>()).prop_map(|(general, styles, pause_when_locked)| {
+    let switches = (any::<bool>(), any::<bool>());
+    (general, styles, switches).prop_map(|(general, styles, switches)| {
         let (rotate_hidden, keep_current, on_external_change, picture_options) = general;
+        let (pause_when_locked, has_favorites_dir) = switches;
         let (light_order, dark_order, light_secs, dark_secs) = styles;
         let mut config = Config::default();
         config.general.rotate_hidden = rotate_hidden;
         config.general.on_external_change = on_external_change;
         config.general.picture_options = picture_options;
         config.general.pause_when_locked = pause_when_locked;
+        if has_favorites_dir {
+            config.general.favorites_dir = Some(PathBuf::from("/home/u/favorites"));
+        }
         if keep_current {
             config.general.empty_style = EmptyStylePolicy::KeepCurrent;
         }

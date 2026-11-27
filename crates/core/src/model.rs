@@ -1,6 +1,6 @@
 //! The reducer's state, and the part of it that survives a restart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -12,14 +12,15 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::catalog::{
-    BadReason, Catalog, CatalogDelta, Check, FileId, FsChange, Item, ItemId, LocalFile, Version,
+    BadReason, Catalog, CatalogDelta, Check, FileId, FsChange, Item, ItemId, LocalFile, Origin,
+    Version,
 };
 use crate::config::{ApplyMode, Config, EmptyStylePolicy, Order, PictureOptions, Source};
 use crate::control::{
     BadItem, Direction, History, PartialMove, ReplyId, Request, STATUS_VERSION, StatusReport,
     StyleReport,
 };
-use crate::event::{BackgroundKeys, Pause, ScreenLock, Status};
+use crate::event::{BackgroundKeys, Favorite, Pause, ScreenLock, Status};
 use crate::key::{KeyState, Reassert};
 use crate::ordering::{ShuffleBag, is_remote_id, next_alphabetical};
 use crate::remote::Remotes;
@@ -43,6 +44,10 @@ pub struct Persisted {
     /// The user's keys from before the daemon's first write, kept for
     /// `gpaperctl restore`. Set once and never overwritten.
     pub original_keys: Option<BackgroundKeys>,
+    /// The items that `gpaperctl ban` took out of rotation, in both styles.
+    /// Empty in a state file from before bans.
+    #[serde(default)]
+    pub banned: BTreeSet<ItemId>,
 }
 
 /// One style's persisted state.
@@ -161,6 +166,11 @@ pub struct Model {
     pub(crate) reloads: Vec<ReplyId>,
     /// The `Restore` requests whose `KeysRestored` is still to come.
     pub(crate) restores: Vec<ReplyId>,
+    /// The `Favorite` requests whose `FavoritesSaved` is still to come.
+    pub(crate) favorites: Vec<ReplyId>,
+    /// The banned items. Each catalog holds the same bans, so that no
+    /// order ever draws one.
+    banned: BTreeSet<ItemId>,
     /// Whether the screen is locked, as last reported. Recorded whatever
     /// the config says; [`Model::is_held_by_lock`] reads the setting.
     pub(crate) screen_lock: ScreenLock,
@@ -257,6 +267,8 @@ pub(crate) enum Unshowable {
     NotDownloaded,
     /// Its last probe rejected it.
     Bad(BadReason),
+    /// `gpaperctl ban` took it out of rotation.
+    Banned,
 }
 
 /// One rotation of a style: a candidate on its way into the slot.
@@ -429,9 +441,9 @@ impl Model {
         } = init;
         let awaits_config = config.is_none();
         let config = config.unwrap_or_default();
-        let (mut saved_styles, original_keys) = match restored {
-            Some(saved) => (saved.styles, saved.original_keys),
-            None => (PerStyle::default(), None),
+        let (mut saved_styles, original_keys, banned) = match restored {
+            Some(saved) => (saved.styles, saved.original_keys, saved.banned),
+            None => (PerStyle::default(), None, BTreeSet::new()),
         };
         let styles = PerStyle::from_fn(|style| {
             let saved = mem::take(&mut saved_styles[style]);
@@ -459,10 +471,15 @@ impl Model {
             partial_move: None,
             reloads: Vec::new(),
             restores: Vec::new(),
+            favorites: Vec::new(),
+            banned: BTreeSet::new(),
             screen_lock: ScreenLock::default(),
             locks: PerStyle::default(),
             gnome_keys: None,
         };
+        for id in banned {
+            model.ban(id);
+        }
         for style in Style::ALL {
             if let Some(files) = local_files[style].take() {
                 let delta = model.replace_catalog(style, files);
@@ -483,7 +500,56 @@ impl Model {
             version: STATE_VERSION,
             styles: PerStyle::from_fn(|style| self.styles[style].persisted()),
             original_keys: self.original_keys.clone(),
+            banned: self.banned.clone(),
         }
+    }
+
+    /// Takes `id` out of rotation in both styles, for good.
+    pub(crate) fn ban(&mut self, id: ItemId) {
+        for style in Style::ALL {
+            self.catalogs[style].ban(id.clone());
+        }
+        self.banned.insert(id);
+    }
+
+    /// Lifts the ban of `id`. Returns whether it was banned.
+    pub(crate) fn unban(&mut self, id: &ItemId) -> bool {
+        for style in Style::ALL {
+            self.catalogs[style].unban(id);
+        }
+        self.banned.remove(id)
+    }
+
+    pub(crate) fn is_banned(&self, id: &ItemId) -> bool {
+        self.banned.contains(id)
+    }
+
+    /// Whether `style`'s catalog holds `id`, usable or not.
+    pub(crate) fn holds(&self, style: Style, id: &ItemId) -> bool {
+        self.catalogs[style].get(id).is_some()
+    }
+
+    /// What `gpaperctl favorite` copies for `style`: the file of the image
+    /// on screen, named after its file or its URL. `None` when the style
+    /// shows nothing, or a remote image that no catalog holds any more.
+    ///
+    /// A local image that no catalog holds is copied from its path, gone
+    /// or not: the copy then fails with the I/O error.
+    pub(crate) fn favorite(&self, style: Style) -> Option<Favorite> {
+        let current = self.styles[style].current.as_ref()?;
+        let held = Style::ALL
+            .into_iter()
+            .find_map(|owner| self.catalogs[owner].get(current));
+        let source = match held {
+            Some(item) => item.origin.path().to_owned(),
+            None if is_pre_scan_path(current.as_str()) => PathBuf::from(current.as_str()),
+            None => return None,
+        };
+        let name = match held.map(|item| &item.origin) {
+            Some(Origin::Remote(remote)) => url_file_name(&remote.url),
+            Some(Origin::Local(_)) | None => path_file_name(&source),
+        };
+        Some(Favorite { source, name })
     }
 
     pub fn config(&self) -> &Config {
@@ -771,6 +837,7 @@ impl Model {
                 .and_then(since_epoch)
                 .map(|since| since.as_secs()),
             styles: PerStyle::from_fn(|style| self.style_report(style)),
+            banned: self.banned.iter().cloned().collect(),
         }
     }
 
@@ -821,6 +888,9 @@ impl Model {
         style: Style,
         id: &ItemId,
     ) -> Result<Candidate, Unshowable> {
+        if self.banned.contains(id) {
+            return Err(Unshowable::Banned);
+        }
         if !self.is_scanned[style] || self.awaits_rescan[style] {
             return Err(Unshowable::Unscanned);
         }
@@ -1216,19 +1286,21 @@ impl Model {
         if !self.is_scanned[style] {
             return self.saved_candidate(style, id);
         }
-        let item = self.catalogs[self.pool(style)?].get(id)?;
-        item.is_candidate().then(|| Candidate::of(item))
+        let catalog = &self.catalogs[self.pool(style)?];
+        let item = catalog.get(id)?;
+        catalog.is_candidate(id).then(|| Candidate::of(item))
     }
 
     /// `id` as `style` can publish it before its first scan. Its catalog
     /// holds only remote items then, and a URL that it does not hold has no
     /// blob to read.
     fn saved_candidate(&self, style: Style, id: &ItemId) -> Option<Candidate> {
-        if let Some(item) = self.catalogs[style].get(id) {
-            return item.is_candidate().then(|| Candidate::of(item));
+        let catalog = &self.catalogs[style];
+        if let Some(item) = catalog.get(id) {
+            return catalog.is_candidate(id).then(|| Candidate::of(item));
         }
         let text = id.as_str();
-        if !is_pre_scan_path(text) {
+        if !is_pre_scan_path(text) || self.banned.contains(id) {
             return None;
         }
         Some(Candidate {
@@ -1284,6 +1356,27 @@ impl Model {
 fn is_pre_scan_path(id: &str) -> bool {
     Url::parse(id).is_err() && Path::new(id).is_absolute() && !id.contains('\u{FFFD}')
 }
+
+/// The name of a copy of the local file at `path`: its file name.
+fn path_file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || FALLBACK_FILE_NAME.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// The name of a copy of `url`'s image: its last path segment, still
+/// percent-encoded, so that it holds no `/`. The parser removes `.` and
+/// `..` segments.
+fn url_file_name(url: &Url) -> String {
+    url.path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .map_or_else(|| FALLBACK_FILE_NAME.to_owned(), str::to_owned)
+}
+
+/// The name of a copy whose source names no file: a URL such as
+/// `https://example.com/`.
+const FALLBACK_FILE_NAME: &str = "image";
 
 /// Whether `catalog` holds `id` in `version`.
 fn holds_version(catalog: &Catalog, id: &ItemId, version: &Version) -> bool {

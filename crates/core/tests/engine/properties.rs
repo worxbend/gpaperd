@@ -275,6 +275,14 @@ fn any_event() -> impl Strategy<Value = Event> {
                 Err("the key is locked".to_owned())
             },
         }),
+        1 => (0_u64..4, any::<bool>()).prop_map(|(n, wrote)| Event::FavoritesSaved {
+            id: ReplyId(n),
+            result: if wrote {
+                Ok(())
+            } else {
+                Err("Permission denied".to_owned())
+            },
+        }),
         1 => (any_failed_uris(), any_picture_options()).prop_map(
             |(uris, picture_options)| Event::KeyWriteFailed {
                 uris,

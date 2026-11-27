@@ -46,6 +46,15 @@ pub trait Gpaperd1 {
     /// `https` URL of the style's sources. Outside them, or neither, it is
     /// an `org.freedesktop.DBus.Error.InvalidArgs` error.
     fn set(&self, style: &str, id: &str) -> zbus::Result<()>;
+    /// Ban the image on screen in each style meant, for good, and rotate
+    /// each one as `next` does.
+    fn ban(&self, style: &str) -> zbus::Result<()>;
+    /// Lift the ban of `id`: an absolute path or an `http` or `https` URL,
+    /// as `Status()` lists it. One that is not banned is an
+    /// `org.freedesktop.DBus.Error.InvalidArgs` error.
+    fn unban(&self, id: &str) -> zbus::Result<()>;
+    /// Copy the image on screen in each style meant into `favorites_dir`.
+    fn favorite(&self, style: &str) -> zbus::Result<()>;
     /// Stop the style's timer (a user pause).
     fn pause(&self, style: &str) -> zbus::Result<()>;
     /// End the user pause.

@@ -1,5 +1,6 @@
 //! The short human summary that `gpaperctl status` prints.
 
+use gpaperd_core::catalog::ItemId;
 use gpaperd_core::control::{StatusReport, StyleReport};
 use gpaperd_core::event::Pause;
 use gpaperd_core::style::Style;
@@ -20,7 +21,16 @@ pub fn summary(report: &StatusReport, now: Timestamp, zone: &TimeZone) -> String
         let label = format!("{style}:");
         lines.extend(style_lines(&label, &report.styles[style]));
     }
+    lines.extend(banned_lines(&report.banned));
     lines.join("\n") + "\n"
+}
+
+/// One line per banned item, the first labeled. None when nothing is banned.
+fn banned_lines(banned: &[ItemId]) -> impl Iterator<Item = String> {
+    banned.iter().enumerate().map(|(index, item)| {
+        let label = if index == 0 { "banned:" } else { "" };
+        line(label, &replace_controls(item.as_str()))
+    })
 }
 
 fn line(label: &str, value: &str) -> String {
@@ -111,7 +121,6 @@ fn compact(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gpaperd_core::catalog::ItemId;
     use gpaperd_core::control::{BadItem, STATUS_VERSION};
     use gpaperd_core::style::PerStyle;
     use jiff::tz;
@@ -142,6 +151,7 @@ mod tests {
                 },
                 dark: StyleReport::default(),
             },
+            banned: Vec::new(),
         }
     }
 
@@ -175,6 +185,25 @@ dark:        none
              0 items, 0 usable, 0 bad
 ";
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn summary_lists_each_banned_image_on_its_own_line() {
+        let mut report = report();
+        report.banned = vec![
+            ItemId::new("/pics/dull.jpg"),
+            ItemId::new("/pics/b\u{1b}d.jpg"),
+        ];
+
+        let text = summary(&report, now(), &TimeZone::UTC);
+
+        let ending = "\
+dark:        none
+             0 items, 0 usable, 0 bad
+banned:      /pics/dull.jpg
+             /pics/b?d.jpg
+";
+        assert!(text.ends_with(ending), "{text}");
     }
 
     #[test]

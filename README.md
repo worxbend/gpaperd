@@ -48,6 +48,8 @@ every slide's texture, and the order is fixed when the file is generated.
 - When something else changes the wallpaper, gpaperd pauses by default.
 - The config file reloads on change, symlinked dotfiles included.
 - Optional pause while the screen is locked (`pause_when_locked`).
+- Ban an image you are tired of (`gpaperctl ban`), or copy one you like into
+  a folder (`gpaperctl favorite`). Neither deletes or moves a file.
 - A `Type=notify` systemd user unit that never restart-loops on a bad config.
 
 ## Install
@@ -151,6 +153,7 @@ has every key with a comment. The full reference is `gpaperd.toml(5)`.
 | `apply_mode` | `"slots"` | `"slots"` replaces two slot files. `"uri"` writes each image's URI to the keys |
 | `max_pixels` | `100_000_000` | Skip images larger than this, width times height |
 | `pause_when_locked` | `false` | Stop the timers while the screen is locked (`org.gnome.ScreenSaver`). A change that fell due happens at unlock |
+| `favorites_dir` | unset | Where `gpaperctl favorite` copies the image on screen. A path, expanded as source paths are; created when missing. Unset, `favorite` fails |
 
 ### `[light]` and `[dark]`
 
@@ -201,24 +204,44 @@ dark:
 gpaperctl next     [--style light|dark|visible|both]   rotate now
 gpaperctl previous [--style …]                         show the previous image again (20 per style)
 gpaperctl set      [--style …] <image>                 show this file or listed URL now
+gpaperctl ban      [--style …]                         never show the current image again; show the next
+gpaperctl unban    <id>                                let a banned image be shown again
+gpaperctl favorite [--style …]                         copy the current image into favorites_dir
 gpaperctl pause    [--style …]                         stop a style's timer
 gpaperctl resume   [--style …]                         end the pause; an overdue style rotates at once
 gpaperctl reload                                       re-read the config; prints line and column on error
 gpaperctl refresh                                      revalidate every remote image now
 gpaperctl restore                                      put the original wallpaper back and pause both styles
-gpaperctl status   [--json]                            what is shown, the next change, catalog sizes, pauses
+gpaperctl status   [--json]                            what is shown, the next change, catalog sizes, pauses, bans
 ```
 
 `--style` defaults to `visible`, the style on screen. `set` takes a local
 file, resolved against the current directory, or a URL as the config lists
 it. The image must be in the sources of each style meant, or nothing
 changes. It restarts the interval, keeps a pause, and `previous` goes back
-from it. The exit status is 0 on success, 1 when the daemon is not running
+from it.
+
+`ban` takes the image on screen out of rotation in both styles for good,
+and rotates the style as `next` does. Bans are saved in the state file;
+`status` lists them, and `unban <id>` takes one back, with the id as
+`status` prints it (a URL with credentials or a query as the config lists
+it). No `next`, `previous`, `set` or rotation shows a banned image. A style
+left without another image follows `empty_style`; with `keep-current` the
+banned image stays on screen and `ban` fails, but the ban holds.
+
+`favorite` copies the image on screen into `favorites_dir`: a local file
+under its own name, a remote image under the last path segment of its URL.
+An existing file is never replaced; the copy gets a suffix such as
+`day-1.jpg`. Without `favorites_dir` it fails.
+
+The exit status is 0 on success, 1 when the daemon is not running
 or reports an error, and 2 on a usage error.
 D-Bus: name and interface `io.github.worxbend.Gpaperd1`, object
 `/io/github/worxbend/Gpaperd1`. `set` calls `Set(style, id)`; `id` is an
 absolute, canonical path or an `http(s)` URL, and one outside the style's
-sources is `org.freedesktop.DBus.Error.InvalidArgs`.
+sources is `org.freedesktop.DBus.Error.InvalidArgs`. `ban`, `unban` and
+`favorite` call `Ban(style)`, `Unban(id)` and `Favorite(style)`; an `Unban`
+of an id that is not banned is `InvalidArgs` too.
 
 ## Files
 
@@ -226,7 +249,7 @@ sources is `org.freedesktop.DBus.Error.InvalidArgs`.
 | --- | --- |
 | `~/.config/gpaperd/config.toml` | Config |
 | `~/.local/share/gpaperd/slots/{light,dark}` | Slot files the keys point at. Under data, not cache, so a cache cleaner cannot blank the desktop |
-| `~/.local/state/gpaperd/state.json` | Current images, shuffle bags, deadlines, pauses, history, your original keys |
+| `~/.local/state/gpaperd/state.json` | Current images, shuffle bags, deadlines, pauses, history, banned images, your original keys |
 | `~/.local/state/gpaperd/state.json.corrupt` | The last state file that could not be read. A newer one replaces it |
 | `~/.cache/gpaperd/remote/` | Downloaded images |
 

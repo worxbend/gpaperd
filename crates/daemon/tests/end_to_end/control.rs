@@ -192,6 +192,98 @@ fn set_of_an_image_outside_the_styles_sources_is_invalid_args_and_logs_no_creden
 }
 
 #[test]
+fn ban_shows_the_next_image_and_the_banned_one_never_comes_back_until_unban() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let (world, daemon) = running_daemon(&bus).await;
+        let client = bus.client().await;
+        let a = world.item(Style::Light, "a.png");
+
+        client.ban("light").await.expect("Ban(light)");
+
+        assert_eq!(world.shown(Style::Light), "b.png");
+        assert!(world.saved_state().banned.contains(&a));
+        assert_eq!(
+            status_report(&client).await.banned,
+            std::slice::from_ref(&a)
+        );
+        client.next("light").await.expect("Next(light) to c");
+        client.next("light").await.expect("Next(light) past a");
+        assert_eq!(world.shown(Style::Light), "b.png");
+        let refused = client
+            .set("light", a.as_str())
+            .await
+            .expect_err("a is banned");
+        assert!(refused.to_string().contains("banned"), "{refused}");
+
+        client.unban(a.as_str()).await.expect("Unban(a)");
+
+        assert!(world.saved_state().banned.is_empty());
+        client
+            .set("light", a.as_str())
+            .await
+            .expect("Set(light, a)");
+        assert_eq!(world.shown(Style::Light), "a.png");
+        assert!(
+            world.image(Style::Light, "a.png").exists(),
+            "ban deleted a file"
+        );
+        daemon.terminate().await;
+    });
+}
+
+#[test]
+fn favorite_copies_the_image_on_screen_and_never_overwrites() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let world = World::new();
+        world.add_images(Style::Light, &["a.png", "b.png"]);
+        world.add_images(Style::Dark, &["x.png"]);
+        let favorites = world.root().join("favorites");
+        let general = format!("{ALPHABETICAL}\nfavorites_dir = {favorites:?}");
+        world.save_config_file(&world.config_text(&general));
+        let mut daemon = world.start_daemon_on_bus(bus.address(), SEED).await;
+        world.showing(&mut daemon, "a.png", "x.png").await;
+        let client = bus.client().await;
+        let a_bytes = std::fs::read(world.image(Style::Light, "a.png")).expect("read a.png");
+
+        client.favorite("light").await.expect("Favorite(light)");
+        client
+            .favorite("visible")
+            .await
+            .expect("Favorite(visible) again");
+
+        assert_eq!(std::fs::read(favorites.join("a.png")).unwrap(), a_bytes);
+        assert_eq!(std::fs::read(favorites.join("a-1.png")).unwrap(), a_bytes);
+        assert_eq!(
+            std::fs::read(world.image(Style::Light, "a.png")).unwrap(),
+            a_bytes
+        );
+        daemon.terminate().await;
+    });
+}
+
+#[test]
+fn favorite_without_a_favorites_dir_fails_with_a_clear_message() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let (_world, daemon) = running_daemon(&bus).await;
+        let client = bus.client().await;
+
+        let error = client
+            .favorite("light")
+            .await
+            .expect_err("no favorites_dir");
+
+        assert!(
+            error.to_string().contains("favorites_dir is not set"),
+            "{error}"
+        );
+        daemon.terminate().await;
+    });
+}
+
+#[test]
 fn a_paused_style_skips_its_deadline_and_rotates_on_resume() {
     scenario(async {
         let bus = PrivateBus::start();

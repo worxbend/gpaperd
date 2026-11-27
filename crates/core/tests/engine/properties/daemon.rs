@@ -1326,6 +1326,9 @@ impl<'a> Daemon<'a> {
             Effect::ReadConfig(_) => {
                 prop_assert!(false, "{effect:?} without a reload request");
             }
+            Effect::SaveFavorites { .. } => {
+                prop_assert!(false, "{effect:?} without a favorite request");
+            }
         }
         Ok(())
     }
@@ -1688,6 +1691,7 @@ fn restored(styles: PerStyle<StylePersisted>, files: PerStyle<Option<Vec<LocalFi
             version: STATE_VERSION,
             styles,
             original_keys: None,
+            banned: Default::default(),
         }),
         seed: 1,
         slot_uris: slot_uris(),

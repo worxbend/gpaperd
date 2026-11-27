@@ -37,6 +37,15 @@ enum Cmd {
         /// A local file or a URL, as the config lists it.
         image: String,
     },
+    /// Ban the image on screen for good and show the next one.
+    Ban(StyleArg),
+    /// Let a banned image be shown again.
+    Unban {
+        /// The image as `status` lists it: a path or a URL.
+        id: String,
+    },
+    /// Copy the image on screen into favorites_dir.
+    Favorite(StyleArg),
     /// Stop rotating.
     Pause(StyleArg),
     /// Start rotating again.
@@ -178,6 +187,9 @@ async fn run(command: Cmd) -> Result<String, Failure> {
         Cmd::Next(arg) => daemon.next(arg.style.as_str()).await,
         Cmd::Previous(arg) => daemon.previous(arg.style.as_str()).await,
         Cmd::Set { style, image } => daemon.set(style.style.as_str(), &image_id(&image)?).await,
+        Cmd::Ban(arg) => daemon.ban(arg.style.as_str()).await,
+        Cmd::Unban { id } => daemon.unban(&id).await,
+        Cmd::Favorite(arg) => daemon.favorite(arg.style.as_str()).await,
         Cmd::Pause(arg) => daemon.pause(arg.style.as_str()).await,
         Cmd::Resume(arg) => daemon.resume(arg.style.as_str()).await,
         Cmd::Refresh => daemon.refresh_remote().await,
@@ -264,6 +276,29 @@ mod tests {
             parse(&["resume"]).ok(),
             Some(Cmd::Resume(style(StyleTarget::Visible)))
         );
+        assert_eq!(
+            parse(&["ban"]).ok(),
+            Some(Cmd::Ban(style(StyleTarget::Visible)))
+        );
+        assert_eq!(
+            parse(&["favorite"]).ok(),
+            Some(Cmd::Favorite(style(StyleTarget::Visible)))
+        );
+    }
+
+    #[test]
+    fn unban_takes_the_id_as_typed() {
+        let parsed = parse(&["unban", "/pics/gone.jpg"]).ok();
+        let expected = Cmd::Unban {
+            id: "/pics/gone.jpg".to_owned(),
+        };
+        assert_eq!(parsed, Some(expected));
+    }
+
+    #[test]
+    fn unban_needs_an_id() {
+        let error = parse(&["unban"]).expect_err("rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

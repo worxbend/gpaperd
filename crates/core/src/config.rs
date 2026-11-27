@@ -74,6 +74,8 @@ impl Config {
     /// - `apply_mode`: `"slots"` or `"uri"`.
     /// - `max_pixels`: a whole number of pixels, greater than zero.
     /// - `pause_when_locked`: bool.
+    /// - `favorites_dir`: a path or a `file://` URI, expanded as source
+    ///   paths are. Unset by default.
     ///
     /// `[light]` and `[dark]` keys: `interval` and `order` (each overrides the
     /// general value for that style) and `sources`.
@@ -177,6 +179,9 @@ pub struct General {
     /// Stop the timers of both styles while the screen is locked. Off by
     /// default.
     pub pause_when_locked: bool,
+    /// Where `gpaperctl favorite` copies the image on screen: absolute and
+    /// expanded. `None` when unset: the command then fails.
+    pub favorites_dir: Option<PathBuf>,
 }
 
 impl Default for General {
@@ -191,6 +196,7 @@ impl Default for General {
             apply_mode: ApplyMode::default(),
             max_pixels: DEFAULT_MAX_PIXELS,
             pause_when_locked: false,
+            favorites_dir: None,
         }
     }
 }
@@ -377,7 +383,7 @@ impl RawConfig {
     fn resolve(self, ctx: &ParseContext<'_>) -> Result<Config, Invalid> {
         let inherited = self.general.style_defaults()?;
         Ok(Config {
-            general: self.general.resolve()?,
+            general: self.general.resolve(ctx)?,
             styles: PerStyle {
                 light: self.light.resolve(&inherited, ctx)?,
                 dark: self.dark.resolve(&inherited, ctx)?,
@@ -400,6 +406,7 @@ struct RawGeneral {
     apply_mode: ApplyMode,
     max_pixels: Option<Spanned<i64>>,
     pause_when_locked: bool,
+    favorites_dir: Option<Spanned<String>>,
 }
 
 impl RawGeneral {
@@ -413,7 +420,7 @@ impl RawGeneral {
         })
     }
 
-    fn resolve(self) -> Result<General, Invalid> {
+    fn resolve(self, ctx: &ParseContext<'_>) -> Result<General, Invalid> {
         Ok(General {
             picture_options: self.picture_options,
             on_external_change: self.on_external_change,
@@ -433,6 +440,13 @@ impl RawGeneral {
                 None => DEFAULT_MAX_PIXELS,
             },
             pause_when_locked: self.pause_when_locked,
+            favorites_dir: match &self.favorites_dir {
+                Some(raw) => Some(
+                    local_path(raw.get_ref(), ctx)
+                        .map_err(|message| Invalid::at(raw, format!("favorites_dir: {message}")))?,
+                ),
+                None => None,
+            },
         })
     }
 }
@@ -870,6 +884,7 @@ link = false
 apply_mode = "uri"
 max_pixels = 50_000_000
 pause_when_locked = true
+favorites_dir = "~/Pictures/Favorites"
 "#;
 
         let general = parse(text).expect("config parses").general;
@@ -884,6 +899,7 @@ pause_when_locked = true
             apply_mode: ApplyMode::Uri,
             max_pixels: 50_000_000,
             pause_when_locked: true,
+            favorites_dir: Some(PathBuf::from("/home/ada/Pictures/Favorites")),
         };
         assert_eq!(general, expected);
     }
@@ -924,6 +940,57 @@ pause_when_locked = true
     #[test]
     fn pause_when_locked_in_a_style_table_is_rejected() {
         let err = parse("[dark]\npause_when_locked = true\n").expect_err("the key is general only");
+
+        assert_eq!((err.line, err.column), (2, 1));
+    }
+
+    #[test]
+    fn favorites_dir_is_unset_unless_set() {
+        let general = parse("").expect("config parses").general;
+
+        assert_eq!(general.favorites_dir, None);
+    }
+
+    #[test]
+    fn favorites_dir_is_expanded_as_a_source_path_is() {
+        for (written, expanded) in [
+            ("$WALLS/favs", "/mnt/walls/favs"),
+            ("favs", "/dotfiles/gpaperd/favs"),
+            ("file:///srv/my%20favs", "/srv/my favs"),
+        ] {
+            let text = format!("[general]\nfavorites_dir = {written:?}\n");
+            let general = parse(&text).expect("config parses").general;
+            assert_eq!(
+                general.favorites_dir,
+                Some(PathBuf::from(expanded)),
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn favorites_dir_that_is_no_local_path_is_rejected() {
+        for (written, message) in [
+            (
+                "https://example.com/favs",
+                "favorites_dir: expected a local path, found a remote URL",
+            ),
+            (
+                "$NOPE/favs",
+                "favorites_dir: environment variable `NOPE` is not set",
+            ),
+            ("$EMPTY", "favorites_dir: a path must not be empty"),
+        ] {
+            let text = format!("[general]\nfavorites_dir = {written:?}\n");
+            let err = parse(&text).expect_err("favorites_dir is rejected");
+            assert_eq!((err.line, err.column), (2, 17), "{written}");
+            assert_eq!(err.message, message, "{written}");
+        }
+    }
+
+    #[test]
+    fn favorites_dir_in_a_style_table_is_rejected() {
+        let err = parse("[light]\nfavorites_dir = \"/favs\"\n").expect_err("general only");
 
         assert_eq!((err.line, err.column), (2, 1));
     }

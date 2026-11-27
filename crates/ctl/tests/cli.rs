@@ -16,6 +16,9 @@ use zbus::{fdo, interface};
 
 const STATUS_JSON: &str = r#"{"version":1,"visible":"light","next_change":null,"styles":{"light":{"current":"/pics/day.jpg","paused":["user"],"items":4,"usable":3,"bad":[{"id":"/pics/x.png","reason":"not an image"}]},"dark":{"current":null,"paused":[],"items":0,"usable":0,"bad":[]}}}"#;
 
+/// The same document from a daemon with two banned images.
+const STATUS_WITH_BANS_JSON: &str = r#"{"version":1,"visible":"light","next_change":null,"styles":{"light":{"current":"/pics/day.jpg","paused":[],"items":4,"usable":2,"bad":[]},"dark":{"current":null,"paused":[],"items":0,"usable":0,"bad":[]}},"banned":["/pics/dull.jpg","https://example.com/grey.jpg"]}"#;
+
 /// A private bus. Killed on drop.
 struct Bus {
     daemon: Child,
@@ -95,6 +98,10 @@ struct Script {
     restore_error: Option<String>,
     /// `Status()` never answers, as a stopped daemon does.
     status_hangs: bool,
+    /// `Status()` lists banned images.
+    status_has_bans: bool,
+    /// Why `Favorite()` fails. `None` when it works.
+    favorite_error: Option<String>,
 }
 
 /// Stands in for gpaperd's control object; records every call.
@@ -121,6 +128,22 @@ impl FakeDaemon {
 
     fn set(&self, style: &str, id: &str) {
         self.record(format!("Set({style}, {id})"));
+    }
+
+    fn ban(&self, style: &str) {
+        self.record(format!("Ban({style})"));
+    }
+
+    fn unban(&self, id: &str) {
+        self.record(format!("Unban({id})"));
+    }
+
+    fn favorite(&self, style: &str) -> fdo::Result<()> {
+        self.record(format!("Favorite({style})"));
+        match &self.script.favorite_error {
+            Some(error) => Err(fdo::Error::Failed(error.clone())),
+            None => Ok(()),
+        }
     }
 
     fn pause(&self, style: &str) {
@@ -157,6 +180,9 @@ impl FakeDaemon {
         self.record("Status".to_owned());
         if self.script.status_hangs {
             std::future::pending::<()>().await;
+        }
+        if self.script.status_has_bans {
+            return STATUS_WITH_BANS_JSON.to_owned();
         }
         STATUS_JSON.to_owned()
     }
@@ -273,6 +299,89 @@ fn each_command_calls_its_method() {
             "Restore",
         ]
     );
+}
+
+#[test]
+fn ban_unban_and_favorite_call_their_methods() {
+    let bus = Bus::start();
+    let server = Server::start(&bus, Script::default());
+    let empty = TempDir::new().expect("temp dir");
+    let commands: [&[&str]; 5] = [
+        &["ban"],
+        &["ban", "--style", "both"],
+        &["unban", "/pics/gone.jpg"],
+        &["unban", "https://example.com/grey.jpg"],
+        &["favorite", "--style", "dark"],
+    ];
+    for args in commands {
+        let output = bus.ctl_in(empty.path(), args);
+        assert_ok(&output);
+        assert_eq!(stdout(&output), "", "{args:?} prints nothing");
+    }
+    assert_eq!(
+        server.calls(),
+        [
+            "Ban(visible)",
+            "Ban(both)",
+            "Unban(/pics/gone.jpg)",
+            "Unban(https://example.com/grey.jpg)",
+            "Favorite(dark)",
+        ]
+    );
+}
+
+#[test]
+fn a_failed_favorite_prints_the_daemon_reason_and_exits_1() {
+    let bus = Bus::start();
+    let script = Script {
+        favorite_error: Some("favorites_dir is not set in the config".to_owned()),
+        ..Script::default()
+    };
+    let _server = Server::start(&bus, script);
+
+    let output = bus.ctl(&["favorite"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        "gpaperctl: favorites_dir is not set in the config\n"
+    );
+}
+
+#[test]
+fn unban_needs_an_id() {
+    let bus = Bus::start();
+    let server = Server::start(&bus, Script::default());
+
+    let output = bus.ctl(&["unban"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(server.calls().is_empty());
+}
+
+#[test]
+fn status_lists_the_banned_images() {
+    let bus = Bus::start();
+    let script = Script {
+        status_has_bans: true,
+        ..Script::default()
+    };
+    let _server = Server::start(&bus, script);
+
+    let output = bus.ctl(&["status"]);
+
+    assert_ok(&output);
+    let expected = "\
+visible:     light
+next change: none
+light:       /pics/day.jpg
+             4 items, 2 usable, 0 bad
+dark:        none
+             0 items, 0 usable, 0 bad
+banned:      /pics/dull.jpg
+             https://example.com/grey.jpg
+";
+    assert_eq!(stdout(&output), expected);
 }
 
 #[test]

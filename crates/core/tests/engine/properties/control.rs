@@ -54,6 +54,9 @@ pub fn command() -> impl Strategy<Value = Command> {
         3 => target().prop_map(Command::Next),
         3 => target().prop_map(Command::Previous),
         2 => (target(), image()).prop_map(|(target, image)| Command::Set(target, id(image))),
+        1 => target().prop_map(Command::Ban),
+        1 => image().prop_map(|image| Command::Unban(id(image))),
+        1 => target().prop_map(Command::Favorite),
         2 => target().prop_map(Command::Pause),
         2 => target().prop_map(Command::Resume),
         1 => Just(Command::Reload),
@@ -122,7 +125,8 @@ impl Interpreter {
                 | Effect::Publish { .. }
                 | Effect::Republish(_)
                 | Effect::ReadConfig(_)
-                | Effect::RestoreKeys { .. } => self.unanswered.push(effect),
+                | Effect::RestoreKeys { .. }
+                | Effect::SaveFavorites { .. } => self.unanswered.push(effect),
                 _ => {}
             }
         }
@@ -185,6 +189,14 @@ impl Interpreter {
                 id,
                 result: if fails {
                     Err("picture-uri is locked".to_owned())
+                } else {
+                    Ok(())
+                },
+            },
+            Effect::SaveFavorites { id, .. } => Event::FavoritesSaved {
+                id,
+                result: if fails {
+                    Err("No space left on device".to_owned())
                 } else {
                     Ok(())
                 },

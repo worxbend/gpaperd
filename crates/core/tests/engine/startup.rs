@@ -217,6 +217,7 @@ fn a_saved_image_without_a_start_time_counts_as_overdue() {
             dark: StylePersisted::default(),
         },
         original_keys: None,
+        banned: Default::default(),
     };
     let mut world = World::new(ModelInit {
         restored: Some(hand_edited),

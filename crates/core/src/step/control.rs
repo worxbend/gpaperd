@@ -4,12 +4,12 @@
 use std::mem;
 
 use super::{Turn, keys};
-use crate::catalog::ItemId;
+use crate::catalog::{CatalogDelta, ItemId};
 use crate::config::{ApplyMode, Config, ConfigError};
 use crate::control::{
     Command, Direction, PartialMove, Reply, ReplyId, Request, RequestStage, StyleTarget,
 };
-use crate::event::{Effect, Event, Pause};
+use crate::event::{Effect, Event, Favorite, Pause};
 use crate::model::Unshowable;
 use crate::style::Style;
 
@@ -38,6 +38,9 @@ impl Turn<'_> {
             Command::Next(target) => self.queue_request(id, Direction::Forward, target),
             Command::Previous(target) => self.queue_request(id, Direction::Back, target),
             Command::Set(target, item) => self.queue_request(id, Direction::To(item), target),
+            Command::Ban(target) => self.ban(id, target),
+            Command::Unban(item) => self.unban(id, item),
+            Command::Favorite(target) => self.save_favorites(id, target),
             Command::Pause(target) => self.pause_by_user(id, target),
             Command::Resume(target) => self.resume_by_user(id, target),
             Command::Reload => {
@@ -109,13 +112,28 @@ impl Turn<'_> {
         self.reply(id, reply);
     }
 
+    /// [`Event::FavoritesSaved`]: answers the `Favorite` that waits for it.
+    /// An answer that no `Favorite` waits for is ignored.
+    pub(super) fn on_favorites_saved(&mut self, id: ReplyId, result: Result<(), String>) {
+        let Some(index) = self.model.favorites.iter().position(|&asked| asked == id) else {
+            return;
+        };
+        self.model.favorites.remove(index);
+        let reply = match result {
+            Ok(()) => Reply::Done,
+            Err(error) => Reply::Failed(format!("the favorite was not saved: {error}")),
+        };
+        self.reply(id, reply);
+    }
+
     /// `Shutdown`: every request that still waits fails.
     pub(super) fn refuse_waiting_requests(&mut self) {
         let waiting = mem::take(&mut self.model.requests);
         let reloads = mem::take(&mut self.model.reloads);
         let restores = mem::take(&mut self.model.restores);
+        let favorites = mem::take(&mut self.model.favorites);
         let ids = waiting.iter().map(|request| request.id);
-        for id in ids.chain(reloads).chain(restores) {
+        for id in ids.chain(reloads).chain(restores).chain(favorites) {
             self.reply(id, Reply::Failed(STOPPING.to_owned()));
         }
     }
@@ -215,6 +233,10 @@ impl Turn<'_> {
                 .model
                 .step_back(style)
                 .ok_or_else(|| format!("no earlier {style} image to show")),
+            // A banned image on screen stays only until the next change.
+            Direction::To(item) if self.model.is_banned(item) => {
+                Err(unshowable_text(style, &Unshowable::Banned))
+            }
             Direction::To(item) if self.model.shows(style, item) => {
                 return self.keep_set_image(style);
             }
@@ -258,23 +280,25 @@ impl Turn<'_> {
         if self.model.awaits_config() {
             return Some("no config file is loaded".to_owned());
         }
-        let state = &self.model.styles[style];
-        match state.key.pause {
+        match self.model.styles[style].key.pause {
             Some(Pause::NoKey) => Some(format!("GNOME has no {style} background key")),
             Some(Pause::LockedKey) => Some(format!("the {style} background key is locked")),
-            // The key would not name what the rotation shows.
-            Some(Pause::ExternalChange) => Some(format!(
-                "the {style} background key was changed outside gpaperd; run gpaperctl resume"
-            )),
-            Some(Pause::User | Pause::ScreenLocked) | None if state.is_handed_back() => {
-                Some(format!(
-                    "the {style} background key holds your own wallpaper; run gpaperctl resume"
-                ))
-            }
-            // A key pause is never one of these two; a request goes on under
-            // either.
-            Some(Pause::User | Pause::ScreenLocked) | None => None,
+            _ => self.why_key_shows_other_wallpaper(style),
         }
+    }
+
+    /// Why the key of `style` does not name the image the rotation last
+    /// showed: an outside change, or a key handed back to the user.
+    fn why_key_shows_other_wallpaper(&self, style: Style) -> Option<String> {
+        let state = &self.model.styles[style];
+        if state.key.pause == Some(Pause::ExternalChange) {
+            return Some(format!(
+                "the {style} background key was changed outside gpaperd; run gpaperctl resume"
+            ));
+        }
+        state.is_handed_back().then(|| {
+            format!("the {style} background key holds your own wallpaper; run gpaperctl resume")
+        })
     }
 
     /// A `Previous` candidate failed: the next older image of the history is
@@ -325,9 +349,78 @@ impl Turn<'_> {
         styles.iter().find(lacks).copied()
     }
 
+    /// Bans what each meant style shows, then rotates them as `Next` does.
+    /// Nothing is banned when a style shows nothing, or when `Next` would
+    /// fail at once for a reason other than a lack of images: no config, or
+    /// a key that is missing, locked or not the daemon's.
+    fn ban(&mut self, id: ReplyId, target: StyleTarget) {
+        let styles = target.styles(self.model.visible);
+        let mut shown = Vec::new();
+        for &style in &styles {
+            if let Some(why) = self.why_style_cannot_change(style) {
+                return self.reply(id, Reply::Failed(why));
+            }
+            match &self.model.styles[style].current {
+                Some(item) => shown.push(item.clone()),
+                None => return self.reply(id, Reply::Failed(nothing_shown(style))),
+            }
+        }
+        for item in shown {
+            self.model.ban(item);
+        }
+        self.persist();
+        self.queue_request(id, Direction::Forward, target);
+    }
+
+    /// Lifts the ban of `item`, which then counts as a new file in every
+    /// catalog that holds it.
+    fn unban(&mut self, id: ReplyId, item: ItemId) {
+        if !self.model.unban(&item) {
+            return self.reply(id, Reply::Rejected("the image is not banned".to_owned()));
+        }
+        self.persist();
+        for style in Style::ALL {
+            if self.model.holds(style, &item) {
+                let delta = CatalogDelta {
+                    added: vec![item.clone()],
+                    modified: Vec::new(),
+                };
+                self.follow_catalog(style, &delta);
+            }
+        }
+        self.reply(id, Reply::Done);
+    }
+
+    /// Asks for a copy of what each meant style shows, once per file, and
+    /// replies once [`Event::FavoritesSaved`] says how it went.
+    fn save_favorites(&mut self, id: ReplyId, target: StyleTarget) {
+        let Some(dir) = self.model.config().general.favorites_dir.clone() else {
+            let why = "favorites_dir is not set in the config".to_owned();
+            return self.reply(id, Reply::Failed(why));
+        };
+        let mut images: Vec<Favorite> = Vec::new();
+        for style in target.styles(self.model.visible) {
+            if self.model.styles[style].current.is_none() {
+                return self.reply(id, Reply::Failed(nothing_shown(style)));
+            }
+            if let Some(why) = self.why_key_shows_other_wallpaper(style) {
+                return self.reply(id, Reply::Failed(why));
+            }
+            let Some(image) = self.model.favorite(style) else {
+                let why = format!("the {style} image is no longer available");
+                return self.reply(id, Reply::Failed(why));
+            };
+            if !images.iter().any(|saved| saved.source == image.source) {
+                images.push(image);
+            }
+        }
+        self.model.favorites.push(id);
+        self.effects.push(Effect::SaveFavorites { id, dir, images });
+    }
+
     /// A both-style retry of the same direction does not pick again for a
     /// style that the last one moved, while that style still shows what it
-    /// moved to.
+    /// moved to. A banned image is never kept that way.
     fn carry_partial_move(&self, request: &mut Request, partial: &PartialMove) {
         if request.styles.len() < 2 || partial.direction != request.direction {
             return;
@@ -338,7 +431,10 @@ impl Turn<'_> {
                 .moved
                 .iter()
                 .any(|(style, shown)| *style == part.style && shown == current);
-            if still_shown {
+            let is_banned = current
+                .as_ref()
+                .is_some_and(|item| self.model.is_banned(item));
+            if still_shown && !is_banned {
                 part.stage = RequestStage::Carried;
             }
         }
@@ -414,6 +510,10 @@ impl Turn<'_> {
     }
 }
 
+fn nothing_shown(style: Style) -> String {
+    format!("no {style} image is shown")
+}
+
 fn not_in_sources(style: Style) -> String {
     format!("the image is not in the sources of {style}")
 }
@@ -426,5 +526,6 @@ fn unshowable_text(style: Style, why: &Unshowable) -> String {
         Unshowable::NotListed => not_in_sources(style),
         Unshowable::NotDownloaded => format!("the {style} image is not downloaded yet"),
         Unshowable::Bad(reason) => format!("the {style} image cannot be shown: {reason}"),
+        Unshowable::Banned => format!("the {style} image is banned"),
     }
 }

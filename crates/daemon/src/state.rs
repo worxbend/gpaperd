@@ -210,6 +210,11 @@ mod tests {
                 picture_uri_dark: None,
                 picture_options: "zoom".into(),
             }),
+            banned: [
+                ItemId::new("/pics/q.jpg"),
+                ItemId::new("https://example.com/r.jpg"),
+            ]
+            .into(),
         }
     }
 
@@ -325,6 +330,26 @@ mod tests {
         assert_eq!(loaded.styles.dark, expected);
         assert!(!loaded.styles.dark.user_paused);
         assert!(loaded.styles.dark.history.is_empty());
+    }
+
+    #[test]
+    fn a_state_file_from_before_bans_loads_with_no_ban() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let style = r#"{ "current": "/pics/a.jpg", "history": ["/pics/z.jpg"] }"#;
+        let file = format!(
+            r#"{{ "version": 1, "styles": {{ "light": {style}, "dark": {style} }},
+                "original_keys": null }}"#
+        );
+        fs::write(&path, file).unwrap();
+
+        let loaded = load(&path).unwrap().expect("a state file");
+
+        assert!(loaded.banned.is_empty());
+        assert_eq!(
+            loaded.styles.light.current,
+            Some(ItemId::new("/pics/a.jpg"))
+        );
     }
 
     #[test]

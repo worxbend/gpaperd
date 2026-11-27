@@ -425,7 +425,10 @@ impl Daemon {
                 None
             }
             Effect::Watch { .. } | Effect::Persist | Effect::Ready | Effect::Changed { .. } => None,
-            Effect::Reply { .. } | Effect::ReadConfig(_) | Effect::RestoreKeys { .. } => {
+            Effect::Reply { .. }
+            | Effect::ReadConfig(_)
+            | Effect::RestoreKeys { .. }
+            | Effect::SaveFavorites { .. } => {
                 prop_assert!(false, "{effect:?} without a control command");
                 None
             }

@@ -6,7 +6,7 @@
 //! them into [`Item`]s, so identity and de-duplication rules live in one
 //! place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -244,12 +244,17 @@ pub struct CatalogDelta {
 ///
 /// Remote items are one per URL, set apart from the local files by
 /// [`Catalog::set_remote`]: a scan or a file change leaves them alone.
+///
+/// A banned id is never a candidate, whatever its check, until it is
+/// unbanned. Bans are ids, not items: they hold while the file is gone and
+/// when it comes back, and a scan or a file change leaves them alone.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Catalog {
     items: BTreeMap<ItemId, Item>,
     /// Files that are no items, because an item with a smaller id is the same
     /// file. One of them takes over when that item's path goes away.
     aliases: BTreeMap<ItemId, LocalFile>,
+    banned: BTreeSet<ItemId>,
 }
 
 impl Catalog {
@@ -383,14 +388,25 @@ impl Catalog {
         self.items.values()
     }
 
-    /// The items that may be picked, in id order.
+    /// The items that may be picked, in id order: not bad and not banned.
     pub fn candidates(&self) -> impl Iterator<Item = &Item> {
-        self.items().filter(|item| item.is_candidate())
+        self.items()
+            .filter(|item| item.is_candidate() && !self.banned.contains(&item.id))
     }
 
     /// Whether `id` is in this catalog and may be picked.
     pub fn is_candidate(&self, id: &ItemId) -> bool {
-        self.get(id).is_some_and(Item::is_candidate)
+        self.get(id).is_some_and(Item::is_candidate) && !self.banned.contains(id)
+    }
+
+    /// Bans `id`: it is no candidate from now on.
+    pub fn ban(&mut self, id: ItemId) {
+        self.banned.insert(id);
+    }
+
+    /// Lifts the ban of `id`, if any.
+    pub fn unban(&mut self, id: &ItemId) {
+        self.banned.remove(id);
     }
 
     /// Records a probe result. An id that is not in this catalog is ignored.

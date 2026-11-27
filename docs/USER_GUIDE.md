@@ -214,6 +214,7 @@ style under `[light]` or `[dark]`.
 | `link` | `true` | Hardlink images into the slot when possible; `false` always copies |
 | `apply_mode` | `"slots"` | `uri` writes each image's own path to GNOME instead of using slot files |
 | `max_pixels` | `100_000_000` | Skip images larger than this (width × height) |
+| `favorites_dir` | not set | Folder that `gpaperctl favorite` copies into, such as `"~/Pictures/Favorites"`. Created when missing |
 
 `~/.config/gpaperd/config.example.toml` shows every key with comments.
 
@@ -256,6 +257,9 @@ gpaperctl next                 # next image now, for the style on screen
 gpaperctl next --style both    # both styles
 gpaperctl previous             # back to the image before (20 kept per style)
 gpaperctl set ~/Pictures/Wallpapers/lake.jpg   # show this one now
+gpaperctl ban                  # never show this image again; show the next
+gpaperctl unban /home/me/Pictures/Wallpapers/grey.jpg   # undo a ban
+gpaperctl favorite             # copy this image into favorites_dir
 gpaperctl pause                # stop changing; resume continues
 gpaperctl resume
 gpaperctl status               # what is shown, when it changes next
@@ -271,6 +275,19 @@ gpaperctl restore              # put your original wallpaper back and pause
 the config lists it. A file elsewhere is refused and nothing changes: add
 its folder to `sources` first. The image gets a full interval, a pause
 stays on, and `gpaperctl previous` brings back the image before it.
+
+`gpaperctl ban` is for an image you never want to see again. gpaperd shows
+the next one at once and skips the banned one from then on, in both styles,
+also after a restart. The file stays where it is. `gpaperctl status` lists
+banned images; `gpaperctl unban` with a path from that list brings one
+back. If you ban a style's last image, it shows the other style's image,
+or with `empty_style = "keep-current"` keeps the banned one until you add
+images.
+
+`gpaperctl favorite` copies the image on screen into `favorites_dir`. Set
+that key first; without it the command says so. A downloaded image is
+named after the end of its URL. An existing file is never overwritten: a
+second copy of `lake.jpg` becomes `lake-1.jpg`.
 
 If you choose a wallpaper in GNOME Settings, gpaperd pauses that style
 (with the default `on_external_change = "pause"`). `gpaperctl resume` or a

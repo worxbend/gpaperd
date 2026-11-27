@@ -3,7 +3,7 @@
 gpaperctl \- control a running gpaperd
 .SH SYNOPSIS
 .B gpaperctl
-.RB ( next | previous | pause | resume )
+.RB ( next | previous | ban | favorite | pause | resume )
 .RB [ \-\-style
 .IR STYLE ]
 .br
@@ -11,6 +11,9 @@ gpaperctl \- control a running gpaperd
 .RB [ \-\-style
 .IR STYLE ]
 .I IMAGE
+.br
+.B gpaperctl unban
+.I ID
 .br
 .B gpaperctl
 .RB ( reload | refresh | restore )
@@ -36,6 +39,15 @@ is an absolute, canonical path or an
 or
 .B https
 URL.
+.BR ban ,
+.B unban
+and
+.B favorite
+call
+.BR Ban(style) ,
+.B Unban(id)
+and
+.BR Favorite(style) .
 .SH COMMANDS
 .TP
 .B next
@@ -66,6 +78,65 @@ remote image is not downloaded yet, and when the image fails its check.
 When the image fails its check or cannot be written, the image on screen
 stays and its interval starts again.
 Setting the image already on screen only starts the interval again.
+.TP
+.B ban
+Ban the image on screen in each style meant, then rotate each one as
+.B next
+does.
+A banned image is never shown again in either style: no rotation,
+.BR next ,
+.B previous
+or
+.B set
+picks it, until
+.BR unban .
+The ban is saved and survives a restart.
+No file is deleted or moved.
+A style left without another image follows
+.BR empty_style :
+it shows the other style's image, or with
+.B keep\-current
+keeps the banned image on screen, and the command fails while the ban
+stays.
+A style that shows nothing, whose background key is missing or locked,
+or that is paused by an outside key change or by
+.BR restore ,
+fails and bans nothing.
+A
+.B pause
+does not stop a ban.
+.TP
+.BI unban " ID"
+Lift the ban of
+.IR ID ,
+the path or URL as
+.B status
+lists it.
+A URL with credentials or a query string must be typed as the config
+lists it, since
+.B status
+does not print those parts.
+The image is in rotation again, as a new file is.
+An
+.I ID
+that is not banned fails with
+.BR org.freedesktop.DBus.Error.InvalidArgs .
+.TP
+.B favorite
+Copy the image on screen in each style meant into
+.B favorites_dir
+of the config, which is created when missing.
+The copy keeps the image's file name; a remote image is named after the
+last path segment of its URL.
+A file that is there already is never replaced: the copy gets a numeric
+suffix, such as
+.IR day\-1.jpg .
+Fails when the config sets no
+.BR favorites_dir ,
+when a style meant shows nothing or is paused by an outside key change or
+by
+.BR restore ,
+and with the I/O error when a copy cannot be written.
 .TP
 .B pause
 Stop the timer of a style.
@@ -107,7 +178,7 @@ writes that image back.
 .B status
 Print the style on screen, the next change in local time, and for each
 style the image in its slot, its catalog size, its usable and bad images,
-and why it is paused.
+and why it is paused, then the banned images.
 A remote image is shown by its URL without credentials and without the
 query string.
 .SH OPTIONS
@@ -132,9 +203,11 @@ Print the daemon's JSON document as it is sent:
 .BR items ,
 .B usable
 and
-.BR bad .
-Remote ids are printed in full, credentials and query string included;
-do not share this output as it is.
+.BR bad ,
+then
+.BR banned ,
+the list of banned ids.
+Remote ids are printed without credentials, query string or fragment.
 .TP
 .BR \-h ", " \-\-help
 Print help and exit.
@@ -150,7 +223,10 @@ The daemon carried out the command.
 The daemon is not running or did not answer, the session bus cannot be
 reached, the reload was refused, the image of
 .B set
-cannot be found, or the daemon reported an error.
+cannot be found, or the daemon reported an error: for example a
+.B favorite
+without
+.BR favorites_dir .
 With
 .BR "apply_mode = \(dquri\(dq" ,
 .BR next ,
@@ -170,6 +246,9 @@ A usage error, such as an unknown command or style.
 gpaperctl next \-\-style both
 gpaperctl pause \-\-style dark
 gpaperctl set \-\-style both ~/Pictures/Wallpapers/lake.jpg
+gpaperctl ban
+gpaperctl unban /home/me/Pictures/Wallpapers/grey.jpg
+gpaperctl favorite \-\-style both
 gpaperctl status
 gpaperctl status \-\-json | jq .styles.light.current
 .EE

@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod config_watch;
 pub mod dbus;
+pub mod favorites;
 pub mod fetch;
 pub mod gnome;
 pub mod interp;

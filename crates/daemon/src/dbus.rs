@@ -199,6 +199,7 @@ fn redacted_report(mut report: StatusReport) -> StatusReport {
         let bad = style.bad.iter_mut().map(|bad| &mut bad.id);
         style.current.iter_mut().chain(bad).for_each(redact);
     }
+    report.banned.iter_mut().for_each(redact);
     report
 }
 
@@ -231,6 +232,21 @@ impl Control {
     async fn set(&self, style: &str, id: &str) -> fdo::Result<()> {
         let command = Command::Set(parse_style(style)?, parse_image(id)?);
         done(self.ask(command).await?)
+    }
+
+    /// Ban the image on screen and rotate, as `Next` does.
+    async fn ban(&self, style: &str) -> fdo::Result<()> {
+        done(self.ask(Command::Ban(parse_style(style)?)).await?)
+    }
+
+    /// Lift the ban of the image `id`.
+    async fn unban(&self, id: &str) -> fdo::Result<()> {
+        done(self.ask(Command::Unban(parse_image(id)?)).await?)
+    }
+
+    /// Copy the image on screen into `favorites_dir`.
+    async fn favorite(&self, style: &str) -> fdo::Result<()> {
+        done(self.ask(Command::Favorite(parse_style(style)?)).await?)
     }
 
     /// Stop the style's timer.
@@ -306,9 +322,9 @@ pub fn parse_style(style: &str) -> fdo::Result<StyleTarget> {
         })
 }
 
-/// Parses the `id` argument of `Set`: an absolute path, or an `http` or
-/// `https` URL, which becomes the form the catalog keeps. Anything else is
-/// `org.freedesktop.DBus.Error.InvalidArgs`.
+/// Parses the `id` argument of `Set` and `Unban`: an absolute path, or an
+/// `http` or `https` URL, which becomes the form the catalog keeps. Anything
+/// else is `org.freedesktop.DBus.Error.InvalidArgs`.
 fn parse_image(id: &str) -> fdo::Result<ItemId> {
     control::image_id(id).map_err(|error| fdo::Error::InvalidArgs(error.to_string()))
 }

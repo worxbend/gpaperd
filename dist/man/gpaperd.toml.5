@@ -143,6 +143,21 @@ reports it on the session bus.
 A change that fell due meanwhile happens at unlock.
 A session without that service is no error: the daemon logs it once and
 keeps listening.
+.TP
+.BR favorites_dir " (unset)"
+Where
+.B gpaperctl favorite
+copies the image on screen.
+A path or a
+.B file://
+URI, expanded as a source path is:
+.BR \(ti ,
+.B $VAR
+and
+.BR ${VAR} ,
+relative to the config file's directory.
+It is created at the first copy.
+Unset, the command fails.
 .SH [light] AND [dark]
 .TP
 .B interval

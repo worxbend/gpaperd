@@ -3,9 +3,11 @@
 //! One test crate, so the fixtures in `support` are shared without dead-code
 //! warnings. The reducer has one module per topic, one behaviour per test.
 
+mod ban;
 mod catalog;
 mod control;
 mod external_changes;
+mod favorite;
 mod files;
 mod hidden_refresh;
 mod keys;

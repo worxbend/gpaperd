@@ -306,6 +306,23 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     an item that failed its probe fails. A failed probe or publish tries
 ///     no other image and, as a rotation that gives up, starts a fresh
 ///     interval. A `Set` of the image on screen only restarts the interval.
+///   - `Ban` bans the image that each style meant shows, saved, then
+///     rotates each one as `Next` does, with the same checks, waits and
+///     reply. A banned item is no candidate in either style: no order
+///     draws it, `Previous` skips it, a `Set` of it fails, and a slot that
+///     is filled again does not get it back. It counts as an item that left
+///     the catalog: what the slot shows stays until the next change, and a
+///     style left without images follows `empty_style`. A style that shows
+///     nothing, that has no config, or whose key is missing, locked or not
+///     the daemon's, fails and bans nothing. `Unban` lifts one ban, saved,
+///     and the item is like a new file from then on; an item that is not
+///     banned is `Rejected`.
+///   - `Favorite` emits [`Effect::SaveFavorites`] with the file of the image
+///     each style meant shows, once per file, named after the file or the
+///     URL's last path segment. [`Event::FavoritesSaved`] for it is
+///     answered with `Done`, or `Failed` with the I/O error. Without
+///     `favorites_dir`, or when a style meant shows nothing, it fails at
+///     once.
 ///   - `Pause` sets the user pause ([`Pause::User`], saved), next to any
 ///     other pause: no tick, and no rotation in flight is published. A
 ///     requested rotation and a repair of the slot go on, with their key
@@ -419,6 +436,7 @@ impl Turn<'_> {
             | Event::Fetched { .. }
             | Event::ConfigRead { .. }
             | Event::KeysRestored { .. }
+            | Event::FavoritesSaved { .. }
             | Event::KeyWriteFailed { .. }
             | Event::Gnome(_) => {}
         }
@@ -453,6 +471,7 @@ impl Turn<'_> {
             Event::Control { id, command } => self.on_control(id, command),
             Event::ConfigRead { id, result } => self.on_config_read(id, result),
             Event::KeysRestored { id, result } => self.on_keys_restored(id, result),
+            Event::FavoritesSaved { id, result } => self.on_favorites_saved(id, result),
             Event::KeyWriteFailed {
                 uris,
                 picture_options,

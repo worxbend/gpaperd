@@ -96,6 +96,13 @@ pub enum Event {
         id: ReplyId,
         result: Result<(), String>,
     },
+    /// Answer to [`Effect::SaveFavorites`] for the [`Command::Favorite`]
+    /// with this `id`: whether every copy was written, with the I/O error
+    /// text when not. Answered with [`Reply::Done`] or [`Reply::Failed`].
+    FavoritesSaved {
+        id: ReplyId,
+        result: Result<(), String>,
+    },
     /// Keys of an [`Effect::SetKeys`] that were not stored, or whose write
     /// was not confirmed. A `Some` names such a key. A `None` key was stored
     /// or was not part of the write. An unconfirmed write may still land
@@ -346,6 +353,24 @@ pub enum Effect {
     /// schema does not have (`picture_uri_dark` is `None`) is left alone.
     /// Answer with [`Event::KeysRestored`] for `id`, exactly once.
     RestoreKeys { id: ReplyId, keys: BackgroundKeys },
+    /// Copy each of `images` into `dir`, creating `dir` when it is missing:
+    /// `gpaperctl favorite`. A copy never replaces a file: when `name` is
+    /// taken it gets a numeric suffix. No source file is changed. Answer
+    /// with [`Event::FavoritesSaved`] for `id`, exactly once.
+    SaveFavorites {
+        id: ReplyId,
+        dir: PathBuf,
+        images: Vec<Favorite>,
+    },
+}
+
+/// One image for [`Effect::SaveFavorites`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Favorite {
+    /// The file to copy: a local image, or a remote image's cached blob.
+    pub source: PathBuf,
+    /// The name of the copy: one path component, never empty, `.` or `..`.
+    pub name: String,
 }
 
 /// A summary of the daemon's state.

@@ -113,6 +113,7 @@ fn report() -> StatusReport {
             },
             dark: StyleReport::default(),
         },
+        banned: vec![ItemId::new("/pics/b.jpg")],
     }
 }
 
@@ -509,6 +510,68 @@ async fn status_names_a_remote_image_without_credentials_or_query() {
     let parsed: StatusReport = serde_json::from_str(&json).expect("status is the report");
     assert_eq!(parsed.styles.light.current, Some(ItemId::new(REDACTED_URL)));
     assert_eq!(parsed.styles.dark.bad[0].id, ItemId::new(REDACTED_URL));
+}
+
+#[tokio::test]
+async fn status_names_a_banned_remote_image_without_credentials_or_query() {
+    let bus = PrivateBus::start();
+    let answer = |_| {
+        let mut report = report();
+        report.banned = vec![ItemId::new(SECRET_URL)];
+        Some(Reply::Status(report))
+    };
+    let (_server, _) = serve(&bus, Duration::from_secs(30), answer).await;
+    let client = bus.client().await;
+
+    let json = within(client.status()).await.unwrap();
+
+    assert_no_secret(&json);
+    let parsed: StatusReport = serde_json::from_str(&json).expect("status is the report");
+    assert_eq!(parsed.banned, [ItemId::new(REDACTED_URL)]);
+}
+
+#[tokio::test]
+async fn ban_unban_and_favorite_pass_their_arguments_to_the_core() {
+    let bus = PrivateBus::start();
+    let (_server, seen) = serve(&bus, Duration::from_secs(30), healthy).await;
+    let client = bus.client().await;
+
+    within(client.ban("visible")).await.unwrap();
+    within(client.unban("/pics/a b.jpg")).await.unwrap();
+    within(client.unban("HTTPS://Example.com/x.jpg"))
+        .await
+        .unwrap();
+    within(client.favorite("both")).await.unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            Command::Ban(StyleTarget::Visible),
+            Command::Unban(ItemId::new("/pics/a b.jpg")),
+            Command::Unban(ItemId::new("https://example.com/x.jpg")),
+            Command::Favorite(StyleTarget::Both),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ban_unban_and_favorite_refuse_bad_arguments_before_the_core() {
+    let bus = PrivateBus::start();
+    let (_server, seen) = serve(&bus, Duration::from_secs(30), healthy).await;
+    let client = bus.client().await;
+
+    let results = [
+        within(client.ban("all")).await,
+        within(client.favorite("Light")).await,
+        within(client.unban("pics/a.jpg")).await,
+        within(client.unban("ftp://example.com/a.jpg")).await,
+    ];
+
+    for result in results {
+        let error = result.unwrap_err();
+        assert_eq!(error_name(&error), "org.freedesktop.DBus.Error.InvalidArgs");
+    }
+    assert!(seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

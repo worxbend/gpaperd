@@ -32,7 +32,7 @@ use gpaperd_core::catalog::{BadReason, FileId, FsChange, ItemId, RemoteBlob};
 use gpaperd_core::config::{Config, ConfigError, LinkPolicy, Source};
 use gpaperd_core::control::{Command, ReplyId};
 use gpaperd_core::event::{
-    BackgroundKeys, Effect, Event, FetchOutcome, Fired, GnomeEvent, ScreenLock, Status,
+    BackgroundKeys, Effect, Event, Favorite, FetchOutcome, Fired, GnomeEvent, ScreenLock, Status,
 };
 use gpaperd_core::model::{Model, ModelInit, Persisted};
 use gpaperd_core::step::step;
@@ -53,7 +53,7 @@ use crate::probe::Prober;
 use crate::scan::Scan;
 use crate::timer::WallTimer;
 use crate::watch::{SlotsWatch, SourceNews, SourceWatch};
-use crate::{fetch, slots, state};
+use crate::{favorites, fetch, slots, state};
 
 /// The wall clock and the one alarm set on it.
 ///
@@ -728,8 +728,23 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             }
             Effect::ReadConfig(id) => self.read_config_later(id, config_file.clone()),
             Effect::RestoreKeys { id, keys } => self.restore_keys(id, keys, config_file).await?,
+            Effect::SaveFavorites { id, dir, images } => self.save_favorites_later(id, dir, images),
         }
         Ok(())
+    }
+
+    /// Copies the favorites on the blocking pool, and answers with exactly
+    /// one `Event::FavoritesSaved`.
+    fn save_favorites_later(&self, id: ReplyId, dir: PathBuf, images: Vec<Favorite>) {
+        let copy = tokio::task::spawn_blocking(move || {
+            let saved = favorites::save(&dir, &images);
+            log_favorites(&dir, &saved);
+            saved.map_err(|error| error.to_string())
+        });
+        self.answer_later(copy, move |result| Event::FavoritesSaved {
+            id,
+            result: result.flatten(),
+        });
     }
 
     /// Collects the remote cache's garbage on the blocking pool. Nothing
@@ -1142,14 +1157,26 @@ fn slot_uri(paths: &Paths, style: Style) -> String {
     slots::file_uri(&paths.slot(style)).expect("an absolute slots directory")
 }
 
-/// Logs a control request. A `Set` names its image as the log does
-/// everywhere: a URL may hold credentials.
+/// Logs a control request. A `Set` or an `Unban` names its image as the
+/// log does everywhere: a URL may hold credentials.
 fn log_command(command: &Command) {
     match command {
         Command::Set(target, item) => {
             tracing::info!(command = "Set", style = %target, item = %fetch::loggable(item), "control request");
         }
+        Command::Unban(item) => {
+            tracing::info!(command = "Unban", item = %fetch::loggable(item), "control request");
+        }
         other => tracing::info!(command = ?other, "control request"),
+    }
+}
+
+/// Logs how copying favorites into `dir` went.
+fn log_favorites(dir: &Path, saved: &io::Result<()>) {
+    let path = dir.display();
+    match saved {
+        Ok(()) => tracing::info!(%path, "favorite saved"),
+        Err(error) => tracing::warn!(%path, reason = %error, "favorite not saved"),
     }
 }
 
