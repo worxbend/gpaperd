@@ -5,6 +5,7 @@
 //! just before use, by [`crate::probe`]. Filters are the plan's "Sources,
 //! catalog and ordering" section.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, Metadata};
@@ -34,12 +35,12 @@ pub struct Scan {
     /// Image files in discovery order. A file reached twice (overlapping
     /// sources, symlinks) appears twice; the catalog removes duplicates.
     pub files: Vec<LocalFile>,
-    /// Directories a watch of the sources has to cover, in discovery order:
-    /// each source directory and, with `recursive`, the directories below it
-    /// down to the depth limit. With `follow_symlinks`, the canonical parent
-    /// of a file symlink is here too, so a later write to the target is
-    /// scanned again. Walk paths are as the walk built them. A directory that
-    /// could not be listed is here too, next to its warning.
+    /// Directories a watch of the sources has to cover, in discovery order
+    /// and each once: each source directory and, with `recursive`, the
+    /// directories below it down to the depth limit. The canonical parent of
+    /// a followed file symlink is here too, so a later write to the target
+    /// is scanned again. Walk paths are as the walk built them. A directory
+    /// that could not be listed is here too, next to its warning.
     pub dirs: Vec<PathBuf>,
     /// Sources and entries that were skipped, for the log.
     pub warnings: Vec<ScanWarning>,
@@ -63,7 +64,8 @@ pub struct ScanWarning {
 /// - A path that does not exist yields a warning and no files. So does a
 ///   `dir` that is no directory and a `file` that is no regular file.
 /// - A file named directly is taken whatever its name. The filters below
-///   apply to directory entries only.
+///   apply to directory entries only. When that file is a symlink, the
+///   parent of its canonical path is listed in [`Scan::dirs`].
 /// - Directory entries: regular files, after following symlinks when
 ///   `follow_symlinks` is set, with an extension from the plan's list
 ///   (compared without case). Hidden entries are skipped unless `hidden` is
@@ -72,7 +74,8 @@ pub struct ScanWarning {
 ///   16 levels deep. A followed symlink to a file is catalogued at its
 ///   canonical path, and that parent is listed in [`Scan::dirs`].
 /// - An entry that cannot be read (permission denied, dangling symlink,
-///   symlink loop) yields one warning and the scan goes on.
+///   symlink loop) yields one warning and the scan goes on. So does a file
+///   whose canonical path is not UTF-8, which the catalog cannot hold.
 ///
 /// Every [`LocalFile`] has a canonical path and a stamp from `stat` of that
 /// path.
@@ -86,6 +89,8 @@ pub fn scan(sources: &[Source]) -> Scan {
             Source::Url(_) => {}
         }
     }
+    let mut seen = HashSet::new();
+    found.dirs.retain(|dir| seen.insert(dir.clone()));
     found
 }
 
@@ -107,39 +112,46 @@ impl Scan {
     }
 
     fn add_file(&mut self, path: &Path) {
-        if let Some(file) = self.catalog_file(path) {
-            self.files.push(file);
+        let Some(file) = self.catalog_file(path) else {
+            return;
+        };
+        if path.is_symlink() {
+            self.list_target_dir(&file);
         }
+        self.files.push(file);
     }
 
-    /// Catalogues one directory entry. A followed file symlink also lists the
-    /// target's parent: the directory that holds the link does not see a
-    /// later write to the target.
     fn add_image(&mut self, entry: &DirEntry, options: DirOptions) {
         let Some(file) = self.catalog_file(entry.path()) else {
             return;
         };
         if options.follow_symlinks && entry.path_is_symlink() {
-            if let Some(parent) = file.path.parent() {
-                self.list_dir(parent.to_owned());
-            }
+            self.list_target_dir(&file);
         }
         self.files.push(file);
     }
 
+    /// Lists the parent of a file reached through a symlink: the directory
+    /// that holds the link does not see a later write to the target.
+    fn list_target_dir(&mut self, file: &LocalFile) {
+        if let Some(parent) = file.path.parent() {
+            self.dirs.push(parent.to_owned());
+        }
+    }
+
+    /// A file whose canonical path is not UTF-8 is warned about and left out:
+    /// the catalog keys items by path text and cannot hold it.
     fn catalog_file(&mut self, path: &Path) -> Option<LocalFile> {
         match local_file(path) {
+            Ok(file) if file.path.to_str().is_none() => {
+                self.warn(path, "file name is not UTF-8");
+                None
+            }
             Ok(file) => Some(file),
             Err(err) => {
                 self.warn(path, err);
                 None
             }
-        }
-    }
-
-    fn list_dir(&mut self, dir: PathBuf) {
-        if !self.dirs.iter().any(|listed| listed == &dir) {
-            self.dirs.push(dir);
         }
     }
 
@@ -155,7 +167,7 @@ impl Scan {
         for entry in entries {
             match entry {
                 Ok(entry) if is_image_file(&entry) => self.add_image(&entry, options),
-                Ok(entry) if is_listed_dir(&entry, max_depth) => self.list_dir(entry.into_path()),
+                Ok(entry) if is_listed_dir(&entry, max_depth) => self.dirs.push(entry.into_path()),
                 Ok(_) => {}
                 Err(err) => self.warn(err.path().unwrap_or(dir), walk_failure(&err)),
             }
@@ -528,6 +540,24 @@ mod tests {
     }
 
     #[test]
+    fn file_source_symlink_lists_the_target_directory() {
+        let (_dir, root) = temp_root();
+        touch(&root.join("store/real.png"));
+        fs::create_dir(root.join("walls")).expect("create dir");
+        let link = root.join("walls/link.png");
+        symlink(root.join("store/real.png"), &link).expect("symlink");
+
+        let named_file = scan(&[Source::File(link.clone())]);
+        let plain_path = scan(&[Source::Path(link)]);
+
+        for found in [named_file, plain_path] {
+            assert_eq!(relative_paths(&root, &found), ["store/real.png"]);
+            assert_eq!(found.dirs, [root.join("store")]);
+            assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+        }
+    }
+
+    #[test]
     fn symlinks_are_ignored_when_follow_symlinks_is_off() {
         let (_dir, root) = temp_root();
         touch(&root.join("store/real.png"));
@@ -612,6 +642,24 @@ mod tests {
         let expected = ScanWarning {
             path: root.join("a.png"),
             reason: "not a directory".to_owned(),
+        };
+        assert_eq!(found.warnings, [expected]);
+    }
+
+    #[test]
+    fn non_utf8_file_name_is_skipped_with_a_warning() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_dir, root) = temp_root();
+        let latin1 = root.join(OsStr::from_bytes(b"caf\xe9.jpg"));
+        touch(&latin1);
+        touch(&root.join("ok.jpg"));
+
+        let found = scan(&[dir_source(&root, DirOptions::default())]);
+
+        assert_eq!(relative_paths(&root, &found), ["ok.jpg"]);
+        let expected = ScanWarning {
+            path: latin1,
+            reason: "file name is not UTF-8".to_owned(),
         };
         assert_eq!(found.warnings, [expected]);
     }

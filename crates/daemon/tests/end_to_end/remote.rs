@@ -1,6 +1,7 @@
 //! Remote images: the Remote rows of the plan's corner-case table. Each
 //! server is `wiremock` on 127.0.0.1, and the daemon's HTTP client goes
-//! direct, so no request leaves the machine.
+//! direct, so no request leaves the machine. The fetcher refuses a literal
+//! loopback host, so every URL names `localhost`.
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
@@ -47,7 +48,13 @@ async fn serve_once_to_revalidation(server: &MockServer, etag: &str, answer: Res
 }
 
 fn url_on(server: &MockServer) -> Url {
-    Url::parse(&format!("{}{ROUTE}", server.uri())).expect("a valid URL")
+    url_at(server.address().port())
+}
+
+/// `ROUTE` on `localhost`: a literal loopback host is refused before the
+/// GET, and this name still reaches a listener bound on 127.0.0.1.
+fn url_at(port: u16) -> Url {
+    Url::parse(&format!("http://localhost:{port}{ROUTE}")).expect("a valid URL")
 }
 
 async fn requests(server: &MockServer) -> usize {
@@ -125,7 +132,7 @@ fn a_remote_only_style_fills_its_slot_when_the_first_blob_lands() {
 fn a_cached_blob_is_shown_at_start_while_the_server_is_down() {
     scenario(async {
         let world = World::new();
-        let url = Url::parse(&format!("http://{}{ROUTE}", closed_address())).expect("a URL");
+        let url = url_at(closed_address().port());
         world.cache_remote_image(&url, "cached", "\"v1\"").await;
         let mut daemon = start(&world, ALPHABETICAL, &[url.as_str()]);
 
@@ -240,7 +247,7 @@ fn an_offline_start_fetches_again_when_connectivity_becomes_full() {
     scenario(async {
         let world = World::new();
         let address = closed_address();
-        let url = Url::parse(&format!("http://{address}{ROUTE}")).expect("a URL");
+        let url = url_at(address.port());
         let mut daemon = start(&world, ALPHABETICAL, &[url.as_str()]);
         daemon.ready().await;
         world

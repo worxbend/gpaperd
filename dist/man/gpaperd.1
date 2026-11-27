@@ -1,4 +1,4 @@
-.TH GPAPERD 1 2026-11-14 "gpaperd 0.1.0" "User Commands"
+.TH GPAPERD 1 2026-11-27 "gpaperd 0.1.1" "User Commands"
 .SH NAME
 gpaperd \- rotate GNOME light and dark wallpapers
 .SH SYNOPSIS
@@ -57,7 +57,12 @@ period).
 An image is checked just before use: it must exist, its magic bytes must be
 an image, and glycin, the sandboxed loader that gnome-shell uses, must
 decode it.
-Where glycin's sandbox cannot start, the magic bytes alone decide.
+Where glycin's sandbox cannot start, every image is refused as
+.IR "file is incomplete" ,
+and the log warns
+.IR "glycin cannot decode in its sandbox" .
+Later checks try the sandbox again, but an image already checked 4 times
+waits for its file to change or for a restart.
 Random order is a shuffle bag: every image once per round.
 Alphabetical order is a natural, case-insensitive sort on the file name.
 .PP
@@ -127,7 +132,8 @@ another instance already runs, or
 found the config valid.
 .TP
 .B 1
-Any other failure.
+Any other failure, including a config file the daemon cannot read;
+systemd restarts it.
 .TP
 .B 66
 .RB ( check\-config
@@ -141,8 +147,9 @@ schema is missing, or GSettings uses a backend that does not persist
 .RB ( GSETTINGS_BACKEND=memory ).
 .TP
 .B 78
-The config file cannot be read or is invalid; the message has line and
-column.
+The config file is invalid; the message has line and column.
+.RB ( check\-config
+also exits 78 when the file cannot be read.)
 .PP
 The systemd unit lists 69 and 78 in
 .BR RestartPreventExitStatus= :

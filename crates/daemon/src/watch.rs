@@ -14,13 +14,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::future;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,7 +33,7 @@ use notify_debouncer_full::{
 };
 use rustix::io::Errno;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::sleep_until;
 
 use crate::scan::{self, Scan};
 use crate::slots;
@@ -64,6 +63,11 @@ const MAX_BURST: Duration = Duration::from_secs(5);
 /// `IN_UNMOUNT`.)
 const WATCH_CHECK_PERIOD: Duration = Duration::from_secs(30);
 
+/// How long the first scan of a watch waits for its remote scans. A remote
+/// scan that takes longer is reported later, as found files, so a stuck
+/// server does not hold the other sources.
+const FIRST_SCAN_REMOTE_WAIT: Duration = Duration::from_secs(5);
+
 // `f_type` values of statfs(2) for the file systems that another machine can
 // change, so that inotify does not see every change. FUSE covers sshfs,
 // rclone and the like.
@@ -77,8 +81,8 @@ const FUSE_SUPER_MAGIC: u32 = 0x6573_5546;
 pub enum SourceNews {
     /// The full scan of the sources. Always the first report of a watch, and
     /// sent only once. One path is listed once, with the greater stamp: the
-    /// catalog keeps the last listing, and that stamp is the one later
-    /// changes are compared with.
+    /// catalog keeps that stamp too, and it is the one later changes are
+    /// compared with.
     Scanned(Scan),
     /// What changed since the last report: first every
     /// [`FsChange::Removed`], then every [`FsChange::Found`], each group in
@@ -100,6 +104,9 @@ pub struct SourceWatch {
     sources: Vec<Source>,
     news: mpsc::UnboundedReceiver<SourceNews>,
     _worker: StopOnDrop<DebounceEventResult>,
+    /// When the worker was last started: the next start waits for the
+    /// watch check after it. `None` before the first start.
+    restarted_at: Option<tokio::time::Instant>,
 }
 
 impl SourceWatch {
@@ -143,6 +150,7 @@ impl SourceWatch {
             sources,
             news: mpsc::unbounded_channel().1,
             _worker: StopOnDrop::detached(),
+            restarted_at: None,
         };
         watch.restart();
         watch
@@ -170,8 +178,8 @@ impl SourceWatch {
     /// while nobody waits is returned by the next call.
     ///
     /// A thread that stops, or that never started, is replaced. The
-    /// replacement begins with a new scan. A spawn the system refuses is
-    /// tried again on the watch check, not waited out.
+    /// replacement begins with a new scan. A thread is started at most once
+    /// per watch check (30 s), so one that dies at once does not spin.
     pub async fn next(&mut self) -> SourceNews {
         loop {
             match self.news.recv().await {
@@ -186,7 +194,7 @@ impl SourceWatch {
 
     /// Starts the worker again. The previous thread, if it is still alive,
     /// is stopped.
-    fn restart(&mut self) -> bool {
+    fn restart(&mut self) {
         let (news, news_reader) = mpsc::unbounded_channel();
         let (wake, wakes) = channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -195,21 +203,17 @@ impl SourceWatch {
             stop: Arc::clone(&stop),
         };
         let sources = self.sources.clone();
-        let spawned = spawn_worker("gpaperd-sources", move || {
+        spawn_worker("gpaperd-sources", move || {
             Follower::start(&sources, news, wake, Instant::now(), stop).run(&wakes);
         });
         self.news = news_reader;
         self._worker = worker;
-        spawned
+        self.restarted_at = Some(tokio::time::Instant::now());
     }
 
     async fn restart_or_wait(&mut self) {
-        let started = self.restart();
-        // A spawn that failed, or a thread that died before its first send,
-        // leaves the channel closed. Waiting the check avoids a tight loop.
-        if !started || self.news.is_closed() {
-            sleep(WATCH_CHECK_PERIOD).await;
-        }
+        wait_for_restart(self.restarted_at).await;
+        self.restart();
     }
 }
 
@@ -221,6 +225,9 @@ pub struct SlotsWatch {
     slots_dir: PathBuf,
     lost: mpsc::UnboundedReceiver<Style>,
     _worker: StopOnDrop<notify::Result<notify::Event>>,
+    /// When the lookout was last started: the next start waits for the
+    /// watch check after it.
+    restarted_at: Option<tokio::time::Instant>,
 }
 
 impl SlotsWatch {
@@ -252,12 +259,13 @@ impl SlotsWatch {
         // reported when it goes, however soon that is.
         lookout.look();
         // A failed spawn drops `lookout` and closes `lost_reader`. `lost`
-        // replaces the watch instead of waiting.
+        // replaces the watch on the watch check.
         spawn_worker("gpaperd-slots", move || lookout.run(&wakes));
         SlotsWatch {
             slots_dir,
             lost: lost_reader,
             _worker: worker,
+            restarted_at: Some(tokio::time::Instant::now()),
         }
     }
 
@@ -274,8 +282,9 @@ impl SlotsWatch {
     /// Waits forever when nothing happens. Cancel-safe: a loss that is seen
     /// while nobody waits is returned by the next call.
     ///
-    /// A thread that stops, or that never started, is replaced. A spawn the
-    /// system refuses is tried again on the watch check, not waited out.
+    /// A thread that stops, or that never started, is replaced. A thread is
+    /// started at most once per watch check (30 s), so one that dies at once
+    /// does not spin.
     pub async fn lost(&mut self) -> Style {
         loop {
             match self.lost.recv().await {
@@ -290,7 +299,7 @@ impl SlotsWatch {
 
     /// Starts the lookout again. The first look runs on that thread, so a
     /// replacement does not stat on the caller's runtime thread.
-    fn restart(&mut self) -> bool {
+    fn restart(&mut self) {
         let (lost, lost_reader) = mpsc::unbounded_channel();
         let (wake, wakes) = channel();
         let worker = StopOnDrop {
@@ -298,7 +307,7 @@ impl SlotsWatch {
             stop: Arc::new(AtomicBool::new(false)),
         };
         let slots_dir = self.slots_dir.clone();
-        let spawned = spawn_worker("gpaperd-slots", move || {
+        spawn_worker("gpaperd-slots", move || {
             let mut lookout = Lookout {
                 slots_dir,
                 inotify: None,
@@ -312,14 +321,12 @@ impl SlotsWatch {
         });
         self.lost = lost_reader;
         self._worker = worker;
-        spawned
+        self.restarted_at = Some(tokio::time::Instant::now());
     }
 
     async fn restart_or_wait(&mut self) {
-        let started = self.restart();
-        if !started || self.lost.is_closed() {
-            sleep(WATCH_CHECK_PERIOD).await;
-        }
+        wait_for_restart(self.restarted_at).await;
+        self.restart();
     }
 }
 
@@ -357,6 +364,16 @@ impl<Seen> Drop for StopOnDrop<Seen> {
         self.stop.store(true, Ordering::SeqCst);
         // An error says that the thread has ended already.
         let _ = self.wake.send(Wake::Stop);
+    }
+}
+
+/// Waits until the watch check after `restarted_at`, so that a thread that
+/// dies at once is not started again in a tight loop. Cancel-safe: a
+/// cancelled wait leaves the channel closed, and the next call waits for the
+/// same moment. `None`, never started, does not wait.
+async fn wait_for_restart(restarted_at: Option<tokio::time::Instant>) {
+    if let Some(restarted_at) = restarted_at {
+        sleep_until(restarted_at + WATCH_CHECK_PERIOD).await;
     }
 }
 
@@ -498,6 +515,34 @@ enum Following {
     Polled(Duration),
 }
 
+/// How to follow the source at `path`, as the disk is now, and whether its
+/// scan belongs off the follower: see [`Followed::place`]. `dir_options` is
+/// `None` for a source that can only be a file.
+fn locate(path: &Path, dir_options: Option<DirOptions>) -> (Following, bool) {
+    let point = dir_options
+        .and_then(|_| WatchPoint::at(path))
+        .or_else(|| WatchPoint::above(path));
+    let remote = point
+        .as_ref()
+        .is_some_and(|point| is_on_remote_fs(&point.dir));
+    if let Some(period) = dir_options.and_then(|options| options.poll) {
+        return (Following::Polled(period), remote);
+    }
+    match point {
+        Some(_) if remote => (Following::Polled(DEFAULT_POLL_PERIOD), true),
+        Some(point) => (Following::Watched(point), false),
+        None => (Following::Polled(DEFAULT_POLL_PERIOD), false),
+    }
+}
+
+/// A scan that ran off the follower, and where it found the source.
+struct RemoteScan {
+    index: usize,
+    found: Scan,
+    /// What [`locate`] said on the scan's thread.
+    placed: (Following, bool),
+}
+
 /// One local source of a [`SourceWatch`], and how it is followed.
 struct Followed {
     /// Never a [`Source::Url`].
@@ -581,24 +626,18 @@ impl Followed {
         if self.out_of_watches {
             return (Following::Polled(DEFAULT_POLL_PERIOD), false);
         }
-        let point = self.directory();
-        let remote = point
-            .as_ref()
-            .is_some_and(|point| is_on_remote_fs(&point.dir));
-        if let Some(period) = self.dir_options.and_then(|options| options.poll) {
-            return (Following::Polled(period), remote);
-        }
-        match point {
-            Some(point) if remote => (Following::Polled(DEFAULT_POLL_PERIOD), true),
-            Some(point) => (Following::Watched(point), false),
-            None => (Following::Polled(DEFAULT_POLL_PERIOD), false),
-        }
+        locate(&self.path, self.dir_options)
     }
 
-    fn directory(&self) -> Option<WatchPoint> {
-        self.dir_options
-            .and_then(|_| WatchPoint::at(&self.path))
-            .or_else(|| WatchPoint::above(&self.path))
+    /// Takes `placed`, from [`Followed::place`]: how to follow the source,
+    /// and whether its scan belongs off the follower.
+    fn settle(&mut self, (planned, remote): (Following, bool)) {
+        self.seat = if remote || self.forced_off_thread() {
+            ScanSeat::Aside
+        } else {
+            ScanSeat::Here
+        };
+        self.follow(planned);
     }
 
     /// Follows the source as `planned`. A watched source starts over with
@@ -621,8 +660,9 @@ impl Followed {
         tracing::warn!(
             path = %self.path.display(),
             reason = %limit,
-            "inotify limit reached: the source is polled every 5 min; raise the sysctl \
-             fs.inotify.max_user_watches (or fs.inotify.max_user_instances) to watch it"
+            "inotify limit reached: the source is polled every 5 min; to watch it, raise the \
+             sysctl fs.inotify.max_user_watches (or fs.inotify.max_user_instances), then run \
+             `systemctl --user restart gpaperd`"
         );
         self.out_of_watches = true;
         self.seat = ScanSeat::Here;
@@ -680,38 +720,18 @@ impl Followed {
     }
 
     /// Scans the source, and takes the directories of the scan as the ones
-    /// to watch. With `follow_symlinks`, the canonical parent of a file
-    /// symlink is one of them even when the walk did not list it: a write
-    /// to the target is not an event on the link's directory.
+    /// to watch.
     fn scan(&mut self) {
         self.found = scan::scan(slice::from_ref(&self.source));
         let Following::Watched(first) = &self.following else {
             return;
         };
         let scanned = self.found.dirs.iter().filter_map(|dir| WatchPoint::at(dir));
-        let targets = self.symlink_target_dirs();
         self.dirs = [first.clone()]
             .into_iter()
             .chain(scanned)
-            .chain(targets)
             .map(|point| (point.dir, point.id))
             .collect();
-    }
-
-    fn symlink_target_dirs(&self) -> Vec<WatchPoint> {
-        if !self
-            .dir_options
-            .is_some_and(|options| options.follow_symlinks)
-        {
-            return Vec::new();
-        }
-        self.found
-            .files
-            .iter()
-            .filter_map(|file| file.path.parent())
-            .filter(|parent| !self.found.dirs.iter().any(|dir| dir == parent))
-            .filter_map(WatchPoint::at)
-            .collect()
     }
 
     /// Notes an event of the source at `now`. Its burst is over once
@@ -754,8 +774,8 @@ struct Follower {
     /// Where a new debouncer sends what inotify reports.
     wake: Sender<Wake<DebounceEventResult>>,
     /// Scans of remote file systems, finished off this thread.
-    remote_done: mpsc::UnboundedReceiver<(usize, Scan)>,
-    remote_tx: mpsc::UnboundedSender<(usize, Scan)>,
+    remote_done: Receiver<RemoteScan>,
+    remote_tx: Sender<RemoteScan>,
     /// Set when the watch is dropped, so a rescan returns before the wake
     /// loop would see [`Wake::Stop`].
     stop: Arc<AtomicBool>,
@@ -770,8 +790,21 @@ impl Follower {
         now: Instant,
         stop: Arc<AtomicBool>,
     ) -> Follower {
-        let (remote_tx, remote_done) = mpsc::unbounded_channel();
-        let mut follower = Follower {
+        let mut follower = Follower::new(sources, news, wake, now, stop);
+        follower.report_first_scan(now);
+        follower
+    }
+
+    /// A follower that has looked at nothing yet.
+    fn new(
+        sources: &[Source],
+        news: mpsc::UnboundedSender<SourceNews>,
+        wake: Sender<Wake<DebounceEventResult>>,
+        now: Instant,
+        stop: Arc<AtomicBool>,
+    ) -> Follower {
+        let (remote_tx, remote_done) = channel();
+        Follower {
             sources: sources
                 .iter()
                 .filter_map(|source| Followed::new(source, now))
@@ -784,14 +817,20 @@ impl Follower {
             remote_done,
             remote_tx,
             stop,
-        };
-        follower.refresh((0..follower.sources.len()).collect());
-        for followed in &mut follower.sources {
+        }
+    }
+
+    /// Scans and watches every source, and reports the scan. The reader
+    /// takes this report as the whole catalog, so it waits for the remote
+    /// scans, up to [`FIRST_SCAN_REMOTE_WAIT`].
+    fn report_first_scan(&mut self, now: Instant) {
+        self.refresh((0..self.sources.len()).collect());
+        self.wait_for_remote_scans(Instant::now() + FIRST_SCAN_REMOTE_WAIT);
+        for followed in &mut self.sources {
             followed.rest(now);
         }
-        follower.reported = follower.files_on_disk();
-        follower.report(SourceNews::Scanned(follower.whole_scan()));
-        follower
+        self.reported = self.files_on_disk();
+        self.report(SourceNews::Scanned(self.whole_scan()));
     }
 
     /// Follows the sources until the watch is dropped.
@@ -902,15 +941,42 @@ impl Follower {
     /// Applies remote scans that finished, and schedules their next poll from
     /// `now` so a finished scan is not started again in this look.
     fn take_remote_scans(&mut self, now: Instant) {
-        while let Ok((index, found)) = self.remote_done.try_recv() {
-            let Some(followed) = self.sources.get_mut(index) else {
-                continue;
-            };
-            followed.seat = ScanSeat::Aside;
-            followed.found = found;
-            followed.report_scan = true;
-            followed.rest(now);
+        while let Ok(done) = self.remote_done.try_recv() {
+            let index = done.index;
+            self.apply_remote_scan(done);
+            if let Some(followed) = self.sources.get_mut(index) {
+                followed.report_scan = true;
+                followed.rest(now);
+            }
         }
+    }
+
+    /// Blocks until no remote scan is out, `deadline` passes, or the watch
+    /// is dropped. A scan still out is taken by a later look.
+    fn wait_for_remote_scans(&mut self, deadline: Instant) {
+        while self.sources.iter().any(Followed::scan_is_out) && !self.stop.load(Ordering::SeqCst) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            // `Disconnected` cannot come: this follower holds a sender.
+            let Ok(done) = self.remote_done.recv_timeout(left) else {
+                return;
+            };
+            self.apply_remote_scan(done);
+        }
+    }
+
+    fn apply_remote_scan(&mut self, done: RemoteScan) {
+        let Some(followed) = self.sources.get_mut(done.index) else {
+            return;
+        };
+        followed.found = done.found;
+        // A source that ran out of watches meanwhile is placed without the
+        // disk: polled, on this thread.
+        let placed = if followed.out_of_watches {
+            followed.place()
+        } else {
+            done.placed
+        };
+        followed.settle(placed);
     }
 
     fn report_changes(&mut self) {
@@ -932,8 +998,9 @@ impl Follower {
     /// meanwhile. [`Wake::Stop`] ends the loop between those passes.
     ///
     /// A remote file system is scanned on its own thread, after the passes
-    /// have scanned the sources that stay on this one. A stuck NFS, CIFS,
-    /// SMB, or FUSE server then does not hold the other sources.
+    /// have scanned the sources that stay on this one. Once a source scans
+    /// there, its `stat` and `statfs` run there too. A stuck NFS, CIFS, SMB,
+    /// or FUSE server then does not hold the other sources.
     fn refresh(&mut self, mut stale: BTreeSet<usize>) {
         while !stale.is_empty() {
             if self.stop.load(Ordering::SeqCst) {
@@ -941,13 +1008,12 @@ impl Follower {
             }
             for &index in &stale {
                 let followed = &mut self.sources[index];
-                let (planned, scan_off_thread) = followed.place();
-                followed.seat = if scan_off_thread || followed.forced_off_thread() {
-                    ScanSeat::Aside
-                } else {
-                    ScanSeat::Here
-                };
-                followed.follow(planned);
+                // A source that already scans aside is placed on its scan's
+                // thread: a stat of a stalled mount blocks.
+                if matches!(followed.seat, ScanSeat::Here) {
+                    let placed = followed.place();
+                    followed.settle(placed);
+                }
             }
             let watched_before_the_scan = self.sync_watches();
             stale.extend(self.sources_holding(&watched_before_the_scan));
@@ -967,7 +1033,7 @@ impl Follower {
             let watched_after_the_scan = self.sync_watches();
             stale.retain(|&index| {
                 let followed = &self.sources[index];
-                !followed.scan_is_out() && followed.plan() != followed.following
+                !followed.scans_off_thread() && followed.plan() != followed.following
             });
             let holding = self.sources_holding(&watched_after_the_scan);
             stale.extend(
@@ -984,14 +1050,21 @@ impl Follower {
         if self.sources[index].scan_is_out() {
             return;
         }
-        let source = self.sources[index].source.clone();
+        let followed = &self.sources[index];
+        let source = followed.source.clone();
+        let (path, dir_options) = (followed.path.clone(), followed.dir_options);
         let tx = self.remote_tx.clone();
         let wake = self.wake.clone();
         let spawned = spawn_worker("gpaperd-remote-scan", move || {
             #[cfg(test)]
             remote_scan_hold::wait();
+            let placed = locate(&path, dir_options);
             let found = scan::scan(slice::from_ref(&source));
-            let _ = tx.send((index, found));
+            let _ = tx.send(RemoteScan {
+                index,
+                found,
+                placed,
+            });
             let _ = wake.send(Wake::Due);
         });
         if spawned {
@@ -1129,7 +1202,11 @@ impl Follower {
     /// hide the newer one. That is the observation reported for the path.
     fn files_on_disk(&self) -> FileTable {
         let mut by_path = FileTable::new();
-        for file in self.sources.iter().flat_map(|followed| &followed.found.files) {
+        for file in self
+            .sources
+            .iter()
+            .flat_map(|followed| &followed.found.files)
+        {
             by_path
                 .entry(file.path.clone())
                 .and_modify(|stamp| {
@@ -1144,8 +1221,8 @@ impl Follower {
 
     /// The last scans as one report. One path is listed once, with the
     /// greater stamp from [`Self::files_on_disk`]. The catalog keeps the
-    /// last listing of a path, so a second listing would stay if it were
-    /// not that stamp, and the watcher would not emit it again.
+    /// greatest stamp of a path in a scan (catalog.rs `record_local`), the
+    /// same stamp that `files_on_disk` stores as `reported`.
     fn whole_scan(&self) -> Scan {
         let mut whole = Scan::default();
         for followed in &self.sources {
@@ -1341,6 +1418,7 @@ mod remote_scan_hold {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
     use std::io;
     use std::os::unix::fs::symlink;
 
@@ -1446,16 +1524,23 @@ mod tests {
 
     impl Driven {
         fn start(root: &Path, sources: &[Source]) -> Driven {
+            Driven::start_prepared(root, sources, |_| {})
+        }
+
+        /// [`Driven::start`], with `prepare` run on the follower before its
+        /// first look.
+        fn start_prepared(
+            root: &Path,
+            sources: &[Source],
+            prepare: impl FnOnce(&mut Follower),
+        ) -> Driven {
             let (news_writer, mut news) = mpsc::unbounded_channel();
             let (wake, wakes) = channel();
             let began = Instant::now();
-            let follower = Follower::start(
-                sources,
-                news_writer,
-                wake,
-                began,
-                Arc::new(AtomicBool::new(false)),
-            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut follower = Follower::new(sources, news_writer, wake, began, stop);
+            prepare(&mut follower);
+            follower.report_first_scan(began);
             let scan = match news.try_recv() {
                 Ok(SourceNews::Scanned(scan)) => scan,
                 other => panic!("expected the scan first, got {other:?}"),
@@ -2117,10 +2202,7 @@ mod tests {
         assert_eq!(flow, ControlFlow::Continue(()));
         assert!(too_early.is_empty(), "{too_early:?}");
         assert_eq!(at_the_check, ["found walls/nested/b.png"]);
-        assert_eq!(
-            driven.follower.watched.get(&nested),
-            Some(&nested_point.id)
-        );
+        assert_eq!(driven.follower.watched.get(&nested), Some(&nested_point.id));
     }
 
     #[test]
@@ -2131,6 +2213,24 @@ mod tests {
         fs::create_dir(&walls).expect("create the link directory");
         symlink(store.join("real.png"), walls.join("link.png")).expect("symlink");
         let mut driven = Driven::start(&root, &[flat(&walls)]);
+
+        fs::write(store.join("real.png"), "edited").expect("edit the target");
+        driven.see_created(&store.join("real.png"), SECOND);
+        let told = driven.told_after(SECOND + BURST_GAP);
+
+        assert!(driven.follower.sources[0].dirs.contains_key(&store));
+        assert!(driven.follower.watched.contains_key(&store));
+        assert_eq!(told, ["found store/real.png"]);
+    }
+
+    #[test]
+    fn file_source_symlink_watches_the_targets_directory() {
+        let (_dir, root) = temp_root();
+        let (walls, store) = (root.join("walls"), root.join("store"));
+        write(&store.join("real.png"), "real");
+        fs::create_dir(&walls).expect("create the link directory");
+        symlink(store.join("real.png"), walls.join("link.png")).expect("symlink");
+        let mut driven = Driven::start(&root, &[Source::File(walls.join("link.png"))]);
 
         fs::write(store.join("real.png"), "edited").expect("edit the target");
         driven.see_created(&store.join("real.png"), SECOND);
@@ -2170,6 +2270,7 @@ mod tests {
             sources: vec![flat(&root.join("walls"))],
             news: mpsc::unbounded_channel().1,
             _worker: StopOnDrop::detached(),
+            restarted_at: None,
         };
 
         let news = tokio::time::timeout(PATIENCE, watch.next())
@@ -2181,12 +2282,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dead_source_worker_is_not_started_again_before_the_watch_check() {
+        let (_dir, root) = temp_root();
+        write(&root.join("walls/a.png"), "a");
+        let mut watch = SourceWatch {
+            sources: vec![flat(&root.join("walls"))],
+            news: mpsc::unbounded_channel().1,
+            _worker: StopOnDrop::detached(),
+            restarted_at: Some(tokio::time::Instant::now()),
+        };
+
+        tokio::select! {
+            biased;
+            news = watch.next() => panic!("restarted at once: {news:?}"),
+            _ = future::ready(()) => {}
+        }
+
+        assert!(watch.news.is_closed());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn closed_slots_channel_is_replaced_with_an_open_one() {
         let (_dir, root) = temp_root();
         let mut watch = SlotsWatch {
             slots_dir: root.join("slots"),
             lost: mpsc::unbounded_channel().1,
             _worker: StopOnDrop::detached(),
+            restarted_at: None,
         };
 
         assert!(watch.lost.is_closed());
@@ -2218,7 +2340,10 @@ mod tests {
             .iter()
             .map(|file| file.path.clone())
             .collect();
-        assert!(names.iter().all(|path| !path.ends_with("b.png")), "{names:?}");
+        assert!(
+            names.iter().all(|path| !path.ends_with("b.png")),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -2258,7 +2383,20 @@ mod tests {
     }
 
     /// Clears the hold even when the test panics, so later tests are not stuck.
-    struct ReleaseHold;
+    /// One test at a time holds the remote scans: the hold is global, and
+    /// one test's release would free another's scan.
+    static HOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ReleaseHold {
+        _holder: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// Holds every remote scan at its start until the guard drops.
+    fn hold_remote_scans() -> ReleaseHold {
+        let holder = HOLDER.lock().unwrap_or_else(|poison| poison.into_inner());
+        super::remote_scan_hold::set(true);
+        ReleaseHold { _holder: holder }
+    }
 
     impl Drop for ReleaseHold {
         fn drop(&mut self) {
@@ -2273,8 +2411,7 @@ mod tests {
         write(&remote_dir.join("a.png"), "a");
         write(&local_dir.join("a.png"), "a");
         let mut driven = Driven::start(&root, &[flat(&remote_dir), flat(&local_dir)]);
-        super::remote_scan_hold::set(true);
-        let _release = ReleaseHold;
+        let release = hold_remote_scans();
         driven.follower.sources[0].force_off_thread = true;
         driven.follower.sources[0].due = driven.began;
         driven.follower.sources[1].due = driven.began;
@@ -2293,7 +2430,7 @@ mod tests {
             "{told:?}"
         );
         assert!(driven.follower.sources[0].scan_is_out());
-        super::remote_scan_hold::set(false);
+        drop(release);
         let deadline = Instant::now() + PATIENCE;
         while driven.follower.sources[0].scan_is_out() && Instant::now() < deadline {
             driven.follower.take_remote_scans(driven.began + MINUTE);
@@ -2302,5 +2439,48 @@ mod tests {
             }
         }
         assert!(!driven.follower.sources[0].scan_is_out());
+    }
+
+    #[test]
+    fn first_scan_holds_the_files_of_a_remote_source() {
+        let (_dir, root) = temp_root();
+        let remote_dir = root.join("remote");
+        write(&remote_dir.join("a.png"), "a");
+
+        let driven = Driven::start_prepared(&root, &[flat(&remote_dir)], |follower| {
+            follower.sources[0].force_off_thread = true;
+        });
+
+        let files: Vec<_> = driven.scan.files.iter().map(|file| &file.path).collect();
+        assert_eq!(files, [&remote_dir.join("a.png")]);
+        assert_eq!(driven.scan.dirs, [remote_dir]);
+        assert!(!driven.follower.sources[0].scan_is_out());
+    }
+
+    #[test]
+    fn first_scan_stops_waiting_for_a_stuck_remote_scan_at_its_deadline() {
+        let (_dir, root) = temp_root();
+        let (remote_dir, local_dir) = (root.join("remote"), root.join("local"));
+        write(&remote_dir.join("a.png"), "a");
+        write(&local_dir.join("a.png"), "a");
+        let _release = hold_remote_scans();
+        let (news, _news) = mpsc::unbounded_channel();
+        let (wake, _wakes) = channel();
+        let sources = [flat(&remote_dir), flat(&local_dir)];
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut follower = Follower::new(&sources, news, wake, Instant::now(), stop);
+        follower.sources[0].force_off_thread = true;
+        follower.refresh(BTreeSet::from([0, 1]));
+
+        follower.wait_for_remote_scans(Instant::now() + Duration::from_millis(50));
+
+        assert!(follower.sources[0].scan_is_out());
+        let local: Vec<_> = follower.sources[1]
+            .found
+            .files
+            .iter()
+            .map(|file| &file.path)
+            .collect();
+        assert_eq!(local, [&local_dir.join("a.png")]);
     }
 }

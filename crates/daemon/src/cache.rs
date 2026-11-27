@@ -162,23 +162,14 @@ impl Cache {
     /// regular file. A missing root is an empty cache. One bad directory
     /// entry is logged and left out; nothing is deleted here.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// When the root is there but cannot be listed. An empty vec is what a
-    /// missing cache looks like, and startup would keep going.
-    pub fn load(&self) -> Vec<RemoteBlob> {
-        // shortcut: `Vec` cannot tell an unlistable root from a missing one,
-        // so this panics. Return `Result` when every caller can take it.
-        let dirs = match entry_dirs(&self.root) {
-            Ok(dirs) => dirs,
-            Err(error) => {
-                tracing::warn!(reason = %error, "remote cache not read");
-                panic!("remote cache not read: {error}");
-            }
-        };
+    /// When the root is there but cannot be listed.
+    pub fn load(&self) -> io::Result<Vec<RemoteBlob>> {
+        let dirs = entry_dirs(&self.root)?;
         let mut blobs: Vec<RemoteBlob> = dirs.iter().filter_map(|dir| loaded_blob(dir)).collect();
         blobs.sort();
-        blobs
+        Ok(blobs)
     }
 
     /// The `meta.toml` of `url`. `None` when there is no entry, or its
@@ -200,19 +191,22 @@ impl Cache {
 
     /// Writes `meta` as `url`'s `meta.toml`: temp file, `fsync`, rename.
     /// Creates the entry directory when needed. For a `304`, a `404`, or a
-    /// failure, where no blob changes.
+    /// failure, where no blob changes. `meta.orphaned_at` is ignored: the
+    /// one on disk stays, see [`kept_orphaned_at`].
     ///
     /// # Errors
     ///
     /// Any I/O error. The old `meta.toml` stays as it was.
     pub async fn record(&self, url: &Url, meta: &Meta) -> io::Result<()> {
         let dir = self.entry_dir(url);
-        let text = encode(meta)?;
+        let mut meta = meta.clone();
         let sweep = Arc::clone(&self.sweep);
         // On the blocking pool, so that a cancelled fetch still finishes or
         // cleans up the write.
         blocking(move || {
             let _sweep = sweep.read().unwrap_or_else(PoisonError::into_inner);
+            meta.orphaned_at = kept_orphaned_at(&dir, &meta.url);
+            let text = encode(&meta)?;
             create_entry_dir(&dir)?;
             write_durably(&dir, META_FILE, text.as_bytes())
         })
@@ -248,7 +242,8 @@ impl Cache {
 
     /// Makes `draft` the current version of `url`: `fsync`s it, renames it
     /// to `<blake3(content)>.<extension>`, then writes `meta` naming that
-    /// blob as [`Cache::record`] does. Returns the blob's absolute path.
+    /// blob as [`Cache::record`] does, `orphaned_at` included. Returns the
+    /// blob's absolute path.
     ///
     /// A blob of that name holds the same bytes already, so it is kept and
     /// the draft is dropped. The blob that the old `meta.toml` named stays:
@@ -267,14 +262,10 @@ impl Cache {
         mut meta: Meta,
     ) -> io::Result<PathBuf> {
         let BlobDraft {
-            temp,
-            file,
-            hasher,
-            ..
+            temp, file, hasher, ..
         } = draft;
         let name = format!("{}.{extension}", hasher.finalize().to_hex());
         meta.blob = Some(name.clone());
-        let text = encode(&meta)?;
         let dir = self.entry_dir(url);
         let sweep = Arc::clone(&self.sweep);
         blocking(move || {
@@ -282,6 +273,8 @@ impl Cache {
             // Exclusive: a publish of the same URL running alongside could
             // otherwise lose its new blob to this one's clean-up.
             let _sweep = sweep.write().unwrap_or_else(PoisonError::into_inner);
+            meta.orphaned_at = kept_orphaned_at(&dir, &meta.url);
+            let text = encode(&meta)?;
             install_blob(&dir, temp, &name, text.as_bytes())
         })
         .await
@@ -302,8 +295,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// An I/O error that stopped the walk. A single file that cannot be
-    /// deleted is logged and skipped.
+    /// The first I/O error of the walk: the root cannot be listed, or an
+    /// entry cannot be swept. The other entries are still collected. A
+    /// single file that cannot be deleted is logged and skipped.
     pub fn collect_garbage(&self, keep: &[Url], now: SystemTime) -> io::Result<GcReport> {
         let _sweep = self.sweep.write().unwrap_or_else(PoisonError::into_inner);
         let mut failed_clears = self
@@ -317,10 +311,17 @@ impl Cache {
             report: &mut report,
             failed_clears: &mut failed_clears,
         };
+        // One entry that cannot be swept does not keep the rest on disk.
+        let mut first_error = None;
         for dir in entry_dirs(&self.root)? {
-            collect_entry(&dir, &mut collection)?;
+            if let Err(error) = collect_entry(&dir, &mut collection) {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(report)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(report),
+        }
     }
 }
 
@@ -425,7 +426,10 @@ fn encode(meta: &Meta) -> io::Result<String> {
 /// Parses a `meta.toml`. The file lives in the user's cache, so everything
 /// that later becomes a path or a request is checked here.
 fn decode(text: &str) -> io::Result<Meta> {
-    let file: MetaFile = toml::from_str(text).map_err(invalid)?;
+    // The message only: the error's `Display` reprints the line, and that
+    // line can hold URL userinfo.
+    let file: MetaFile = toml::from_str(text)
+        .map_err(|error: toml::de::Error| invalid(error.message().to_owned()))?;
     let url = Url::parse(&file.url).map_err(invalid)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(invalid(format!(
@@ -523,6 +527,18 @@ fn entry_meta(dir: &Path) -> io::Result<Option<Meta>> {
     Ok(Some(meta))
 }
 
+/// The `orphaned_at` of `url` on disk in `dir`, for a fetch's write. Only
+/// garbage collection sets or clears it; a fetch's copy may predate that.
+/// A `meta.toml` that is missing, unreadable or names another URL records
+/// no departure, so it gives `None`. Call it under the sweep lock.
+fn kept_orphaned_at(dir: &Path, url: &Url) -> Option<SystemTime> {
+    entry_meta(dir)
+        .ok()
+        .flatten()
+        .filter(|on_disk| on_disk.url == *url)
+        .and_then(|on_disk| on_disk.orphaned_at)
+}
+
 /// The blob of the entry in `dir`, for [`Cache::load`]. Logs why there is
 /// none when that is unexpected.
 fn loaded_blob(dir: &Path) -> Option<RemoteBlob> {
@@ -531,7 +547,7 @@ fn loaded_blob(dir: &Path) -> Option<RemoteBlob> {
         Err(error) => {
             tracing::warn!(
                 entry = %dir.display(),
-                reason = %logged_reason(&error),
+                reason = %error,
                 "remote cache entry skipped"
             );
             return None;
@@ -604,18 +620,6 @@ fn create_temp_file(dir: &Path) -> io::Result<(TempFile, File)> {
     }
 }
 
-/// A parse failure's `Display` reprints the `meta.toml` line. That line can
-/// hold URL userinfo. The toml message, and our own `InvalidData` text, do not.
-fn logged_reason(error: &io::Error) -> String {
-    if let Some(parse) = error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<toml::de::Error>())
-    {
-        return parse.message().to_owned();
-    }
-    error.to_string()
-}
-
 /// Gives the draft in `temp` its blob name `name` in `dir`, then writes the
 /// `meta.toml` in `meta_text`. A new blob is deleted again when the
 /// `meta.toml` cannot be written. Then every blob but this one and the one
@@ -672,7 +676,7 @@ fn collect_entry(dir: &Path, collection: &mut Collection<'_>) -> io::Result<()> 
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
             tracing::warn!(
                 entry = %dir.display(),
-                reason = %logged_reason(&error),
+                reason = %error,
                 "remote cache entry is corrupt: deleting its files"
             );
             None
@@ -838,7 +842,7 @@ fn dir_entry(entry: io::Result<fs::DirEntry>) -> io::Result<fs::DirEntry> {
 #[cfg(test)]
 thread_local! {
     static ENTRY_FAULT: std::cell::RefCell<Option<std::ffi::OsString>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Fails one named entry on the next listing in this thread.
@@ -1056,13 +1060,19 @@ mod tests {
         let blocked = url("https://example.com/blocked.png");
         let blob = publish_bytes(&cache, &kept, b"kept").await;
         publish_bytes(&cache, &blocked, b"blocked").await;
-        let blocked_name = cache.entry_dir(&blocked).file_name().unwrap().to_os_string();
+        let blocked_name = cache
+            .entry_dir(&blocked)
+            .file_name()
+            .unwrap()
+            .to_os_string();
         let _fault = fail_directory_entry(&blocked_name);
 
-        let loaded = cache.load();
+        let loaded = cache.load().unwrap();
 
         assert!(
-            loaded.iter().any(|cached| cached.url == kept && cached.blob == blob),
+            loaded
+                .iter()
+                .any(|cached| cached.url == kept && cached.blob == blob),
             "one bad entry hid the cache: {loaded:?}"
         );
         assert!(
@@ -1100,8 +1110,37 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_meta_parse_error_log_omits_url_userinfo() {
+    #[tokio::test]
+    async fn one_unsweepable_entry_does_not_stop_the_rest_of_the_collection() {
+        // Both ways round, so the unsweepable entry comes first in one of
+        // them whatever order the directory lists in.
+        for faulted in 0..2 {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = Cache::new(dir.path().join("remote"));
+            let targets = [
+                url("https://example.com/a.png"),
+                url("https://example.com/b.png"),
+            ];
+            let mut strays = Vec::new();
+            for (index, target) in targets.iter().enumerate() {
+                publish_bytes(&cache, target, b"kept").await;
+                let stray = cache.entry_dir(target).join(format!("stray-{index}.bin"));
+                fs::write(&stray, b"x").unwrap();
+                strays.push(stray);
+            }
+            let _fault = fail_directory_entry(strays[faulted].file_name().unwrap());
+
+            let outcome = cache.collect_garbage(&targets, UNIX_EPOCH);
+
+            assert!(outcome.is_err(), "the sweep error was dropped: {outcome:?}");
+            assert!(strays[faulted].exists(), "the unread entry was deleted");
+            let swept = &strays[1 - faulted];
+            assert!(!swept.exists(), "the collection stopped before {swept:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_meta_parse_error_log_omits_url_userinfo() {
         let root = tempfile::tempdir().unwrap();
         let cache = Cache::new(root.path().join("remote"));
         let target = url("https://user:secret@example.com/a.png?token=hide");
@@ -1121,8 +1160,12 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(collector);
 
-        assert!(cache.load().is_empty());
+        let read = cache.meta(&target).await.unwrap_err().to_string();
+        assert!(cache.load().unwrap().is_empty());
         assert!(cache.collect_garbage(&[], UNIX_EPOCH).unwrap().entries == 0);
+
+        assert!(!read.contains("secret"), "{read}");
+        assert!(!read.contains("token=hide"), "{read}");
 
         let text = String::from_utf8(
             lines

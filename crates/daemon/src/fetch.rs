@@ -18,7 +18,8 @@
 //! | `401`, `403` | old blob kept, not retried: [`FetchOutcome::NotModified`] |
 //! | `200` that is not an image, by magic bytes | rejected, old blob kept, not retried: `NotModified` |
 //! | `Content-Length` or body over [`MAX_BODY_BYTES`] | rejected, old blob kept, not retried: `NotModified` |
-//! | too many redirects, `https` to `http`, or a reserved literal host | rejected: `Failed` |
+//! | too many redirects, or `https` to `http` | rejected: `Failed` |
+//! | a reserved literal host in the configured URL | not requested, not retried: `NotModified` |
 //! | `ENOSPC` while writing | temp file deleted, old blob kept: `Failed` |
 //!
 //! Only `http` and `https` are fetched. Every log line names the URL by
@@ -135,6 +136,9 @@ enum FetchError {
     Network(String),
     #[error("{0}")]
     Redirect(String),
+    /// The configured URL names a reserved literal host: never requested.
+    #[error("{0}")]
+    Reserved(&'static str),
     #[error("body is larger than {limit} bytes")]
     TooLarge { limit: u64 },
     #[error("body is not an image")]
@@ -170,12 +174,13 @@ impl FetchError {
         }
     }
 
-    /// `401`, `403`, a non-image, and an oversized body. The core retries
+    /// `401`, `403`, a non-image, an oversized body, and a configured
+    /// reserved literal host. The core retries
     /// every [`FetchOutcome::Failed`]. These stay off that path, and off
     /// [`FetchOutcome::Gone`], which is only `404` and `410`.
     fn refuses_retry(&self) -> bool {
         match self {
-            FetchError::NotAnImage | FetchError::TooLarge { .. } => true,
+            FetchError::NotAnImage | FetchError::TooLarge { .. } | FetchError::Reserved(_) => true,
             FetchError::Status { status, .. } => {
                 matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
             }
@@ -187,7 +192,7 @@ impl FetchError {
 /// What the cache knew before this fetch. A read error is not a missing file.
 enum KnownMeta {
     Missing,
-    Ready(Meta),
+    Ready(Box<Meta>),
     Unreadable,
 }
 
@@ -238,8 +243,8 @@ impl Fetcher {
     /// is left in place.
     ///
     /// A URL that is not `http` or `https` is not requested: `Failed` with
-    /// [`BACKOFF_CEILING`]. A literal loopback, link-local, or private host
-    /// is not requested either.
+    /// [`BACKOFF_CEILING`]. A literal loopback, unspecified, link-local, or
+    /// private host is not requested either, and not retried.
     ///
     /// Cancel-safe: dropping the future deletes a draft in progress and
     /// leaves the cache as it was. The future is `Send`.
@@ -271,7 +276,7 @@ impl Fetcher {
     async fn known_meta(&self, url: &Url) -> KnownMeta {
         match self.cache.meta(url).await {
             Ok(None) => KnownMeta::Missing,
-            Ok(Some(meta)) => KnownMeta::Ready(self.without_lost_blob(url, meta).await),
+            Ok(Some(meta)) => KnownMeta::Ready(Box::new(self.without_lost_blob(url, meta).await)),
             Err(error) => {
                 tracing::warn!(url = %redacted(url), reason = %error, "cached metadata not read");
                 KnownMeta::Unreadable
@@ -302,7 +307,7 @@ impl Fetcher {
 
     async fn download(&self, url: &Url, known: &KnownMeta) -> Result<Answer, FetchError> {
         if let Some(reason) = reserved_literal(url) {
-            return Err(FetchError::Redirect(reason.to_owned()));
+            return Err(FetchError::Reserved(reason));
         }
         let known = known.as_meta();
         let has_blob = known.is_some_and(|meta| meta.blob.is_some());
@@ -460,7 +465,7 @@ impl Fetcher {
         let base = match known {
             KnownMeta::Unreadable => return,
             KnownMeta::Missing => None,
-            KnownMeta::Ready(meta) => Some(meta),
+            KnownMeta::Ready(meta) => Some(*meta),
         };
         let mut meta = meta_or_new(base, url);
         edit(&mut meta);
@@ -536,15 +541,21 @@ fn scheme_refusal(previous: &[Url], next: &Url) -> Option<&'static str> {
     }
 }
 
-/// A literal host in a loopback, link-local, or private range. Checked on
-/// the URL itself and on each redirect. A name is not checked: the
-/// connected address is not visible before the GET.
+/// A literal host in a loopback, unspecified, link-local, or private range.
+/// On Linux a connection to the unspecified address reaches local listeners.
+/// Checked on the URL itself and on each redirect. A name is not checked:
+/// the connected address is not visible before the GET.
 fn reserved_literal(next: &Url) -> Option<&'static str> {
     let reserved = match next.host() {
         Some(url::Host::Ipv4(ip)) => is_reserved_v4(ip),
         Some(url::Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
             Some(mapped) => is_reserved_v4(mapped),
-            None => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+            None => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+            }
         },
         _ => false,
     };
@@ -552,7 +563,7 @@ fn reserved_literal(next: &Url) -> Option<&'static str> {
 }
 
 fn is_reserved_v4(ip: std::net::Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local()
+    ip.is_loopback() || ip.is_unspecified() || ip.is_private() || ip.is_link_local()
 }
 
 /// `If-None-Match` and `If-Modified-Since` from the cached version. A value
@@ -851,6 +862,10 @@ mod tests {
             "https://[fc00::1]/x",
             "https://[::ffff:127.0.0.1]/x",
             "https://[::ffff:192.168.1.1]/x",
+            "https://0.0.0.0/x",
+            "https://0/x",
+            "https://[::]/x",
+            "https://[::ffff:0.0.0.0]/x",
         ] {
             assert_eq!(
                 redirect_refusal(&chain, &url(target)),

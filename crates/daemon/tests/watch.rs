@@ -329,10 +329,8 @@ async fn path_that_two_sources_reach_is_removed_when_the_last_one_loses_it() {
     symlink(root.join("store/real.png"), root.join("walls/link.png")).expect("symlink");
     let sources = vec![flat(&root.join("walls")), flat(&root.join("store"))];
     let (mut watch, scan) = watching(sources).await;
-    assert_eq!(
-        scanned_paths(&root, &scan),
-        ["store/real.png", "store/real.png"]
-    );
+    // The scan lists a path once, however many sources reach it.
+    assert_eq!(scanned_paths(&root, &scan), ["store/real.png"]);
 
     fs::remove_file(root.join("walls/link.png")).expect("delete the link");
     write(&root.join("walls/marker.png"), "marker");

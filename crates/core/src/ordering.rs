@@ -22,8 +22,8 @@ pub struct ShuffleBag {
     /// a second place in the round.
     shown: Vec<ItemId>,
     /// The round was restored without what it showed. The scan is that
-    /// catalog: none of it joins the round. A remote id before the scan is
-    /// new and may join.
+    /// catalog: none of it joins the round. An id inserted before the scan
+    /// is new and may join.
     is_shown_unknown: bool,
 }
 
@@ -45,7 +45,7 @@ impl ShuffleBag {
 
     /// Restores the rest of a round from a persisted queue, next item first,
     /// when what the round showed was not saved: a state file from before
-    /// M2. The scan's [`ShuffleBag::insert`] tells it.
+    /// M2. [`ShuffleBag::scanned`] tells it.
     pub fn restore_queue_only(queue: Vec<ItemId>) -> ShuffleBag {
         ShuffleBag {
             is_shown_unknown: true,
@@ -113,34 +113,34 @@ impl ShuffleBag {
     /// round showed, is left out: no item has two turns in a round.
     ///
     /// A round from [`ShuffleBag::restore_queue_only`] does not know what it
-    /// showed until the scan. The cache load before that scan is not the
-    /// scan: it leaves the round unknown, and a remote id the round does not
-    /// hold joins it. The scan passes local ids and joins nothing. Each local
-    /// id the round does not hold was shown, including the one on screen when
-    /// the scan passes it.
+    /// showed until [`ShuffleBag::scanned`]. Until then it stays unknown, and
+    /// an id the round does not hold joins it: a cached remote image, say.
     pub fn insert(&mut self, ids: impl IntoIterator<Item = ItemId>, rng: &mut impl Rng) {
         if self.queue.is_empty() {
             return;
         }
-        let incoming: Vec<ItemId> = ids.into_iter().collect();
-        let in_round: BTreeSet<&ItemId> = self.queue.iter().chain(&self.shown).collect();
-        let newcomers: BTreeSet<ItemId> = incoming
-            .iter()
-            .filter(|id| !in_round.contains(*id))
-            .cloned()
-            .collect();
-        // Local ids are the scan. The cache load before it is only remote
-        // ids, and an empty newcomer set must not end the unknown state.
-        let is_scan = self.is_shown_unknown && incoming.iter().any(|id| !is_remote_id(id));
-        if is_scan {
-            self.shown.extend(newcomers);
-            self.is_shown_unknown = false;
-            return;
-        }
-        for id in newcomers {
+        for id in self.newcomers(ids) {
             let position = rng.random_range(0..=self.queue.len());
             self.queue.insert(position, id);
         }
+    }
+
+    /// Adds the scan's new or changed catalog items, as
+    /// [`ShuffleBag::insert`] does.
+    ///
+    /// A round from [`ShuffleBag::restore_queue_only`] learns here what it
+    /// showed: each id the round does not hold, including the one on screen
+    /// when the scan passes it. None of them joins, and the round knows what
+    /// it showed from now on, even when the scan passed nothing. With no
+    /// round in progress it does nothing: the next round starts known.
+    pub fn scanned(&mut self, ids: impl IntoIterator<Item = ItemId>, rng: &mut impl Rng) {
+        if !self.is_shown_unknown || self.queue.is_empty() {
+            self.insert(ids, rng);
+            return;
+        }
+        let newcomers = self.newcomers(ids);
+        self.shown.extend(newcomers);
+        self.is_shown_unknown = false;
     }
 
     /// Puts an item that was drawn but not shown back at the front of the
@@ -152,6 +152,14 @@ impl ShuffleBag {
         if !self.queue.contains(&id) && !self.shown.contains(&id) {
             self.queue.push_front(id);
         }
+    }
+
+    /// The ids of `ids` that the round neither holds nor showed, once each.
+    fn newcomers(&self, ids: impl IntoIterator<Item = ItemId>) -> BTreeSet<ItemId> {
+        let in_round: BTreeSet<&ItemId> = self.queue.iter().chain(&self.shown).collect();
+        ids.into_iter()
+            .filter(|id| !in_round.contains(id))
+            .collect()
     }
 
     fn pop_next(
@@ -223,9 +231,10 @@ pub fn next_alphabetical(catalog: &Catalog, cursor: Option<&ItemId>) -> Option<I
     after_cursor.or_else(first).cloned()
 }
 
-/// Sort order of two ids: natural and case-insensitive on the file name (the
-/// text after the last `/`, and before any `?` or `#`), ties broken by the
-/// whole id.
+/// Sort order of two ids: natural and case-insensitive on the file name, ties
+/// broken by the whole id. The file name is the text after the last `/`. A
+/// URL loses its query and fragment first; a local path keeps every `?` and
+/// `#`, which are file-name characters there.
 ///
 /// It takes ids, not items, because the cursor may name a file that is gone.
 pub fn compare_ids(a: &ItemId, b: &ItemId) -> Ordering {
@@ -233,15 +242,17 @@ pub fn compare_ids(a: &ItemId, b: &ItemId) -> Ordering {
 }
 
 fn file_name(id: &ItemId) -> &str {
-    let id = id.as_str();
-    let segment = id.rsplit_once('/').map_or(id, |(_, name)| name);
-    segment
-        .split_once(['?', '#'])
-        .map_or(segment, |(name, _)| name)
+    let text = id.as_str();
+    let path = if is_remote_id(id) {
+        text.split_once(['?', '#']).map_or(text, |(path, _)| path)
+    } else {
+        text
+    };
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
 /// `http` and `https` ids are the cache. Anything else is a scan path.
-fn is_remote_id(id: &ItemId) -> bool {
+pub(crate) fn is_remote_id(id: &ItemId) -> bool {
     let id = id.as_str();
     id.starts_with("https://") || id.starts_with("http://")
 }

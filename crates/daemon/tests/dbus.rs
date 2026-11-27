@@ -256,7 +256,11 @@ async fn a_caller_who_is_still_waiting_is_delivered() {
     let control = Control::with_timeout(sender, REPLY_TIMEOUT);
     let asking = tokio::spawn(async move { control.ask(Command::Status).await });
 
-    let request = port.requests.recv().await.expect("the command is delivered");
+    let request = port
+        .requests
+        .recv()
+        .await
+        .expect("the command is delivered");
     assert_eq!(request.command, Command::Status);
     request
         .reply

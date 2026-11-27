@@ -25,13 +25,13 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libglib2.0-dev libseccomp-dev libfontconfig-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-27
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Check the tag matches the crate version
@@ -52,7 +52,7 @@ jobs:
           cp -r docs "pkg/$name/"
           tar -C pkg -czf "$name.tar.gz" "$name"
           "pkg/$name/gpaperd" --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gpaperd-${{ matrix.arch }}
           path: gpaperd-*.tar.gz
@@ -64,8 +64,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
           merge-multiple: true

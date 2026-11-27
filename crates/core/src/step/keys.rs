@@ -142,18 +142,21 @@ impl Turn<'_> {
     }
 
     /// The GNOME write failed. The keys still hold what they held. Each style
-    /// whose recorded URI is still the one that failed is dropped and tried
-    /// again after [`KEY_WRITE_RETRY`]. A style that already moved on is left
-    /// alone. A failure that names only `picture-options` arms the same retry
-    /// on every key this run still holds, and clears `written` so the 1s cap
-    /// is not applied to that wait.
+    /// whose recorded URI is still the one that failed goes back to the URI
+    /// on record before it, and is tried again after [`KEY_WRITE_RETRY`]. An
+    /// `unconfirmed` write keeps that URI on record instead: when it lands
+    /// late, the retry is called off. A style that already moved on is left
+    /// alone. A failure that names only `picture-options` arms the same
+    /// retry on every key this run still holds. The failed options are owed
+    /// again only while the running config still asks for them.
     pub(super) fn on_key_write_failed(
         &mut self,
         uris: PerStyle<Option<String>>,
         picture_options: Option<PictureOptions>,
+        unconfirmed: bool,
     ) {
         let due = self.now.checked_add(KEY_WRITE_RETRY);
-        let reassert = due.map_or(Reassert::Now, Reassert::At);
+        let reassert = due.map_or(Reassert::Now, Reassert::Retry);
         let mut matched = false;
         for style in Style::ALL {
             let Some(uri) = uris[style].as_deref() else {
@@ -161,30 +164,44 @@ impl Turn<'_> {
             };
             let key = &mut self.model.styles[style].key;
             if key.written.as_deref() == Some(uri) {
-                key.written = None;
+                // An unconfirmed write may still land. Its report then settles
+                // the key, and a later change of it stays an external change.
+                if !unconfirmed {
+                    key.written = key.before_write.clone();
+                }
                 key.reassert = Some(reassert);
                 matched = true;
             }
         }
-        let options_only = picture_options.is_some()
-            && Style::ALL.into_iter().all(|style| uris[style].is_none());
+        let options_only =
+            picture_options.is_some() && Style::ALL.into_iter().all(|style| uris[style].is_none());
         if options_only {
             self.arm_held_keys(reassert);
             matched = true;
         }
-        if matched && picture_options.is_some() && self.model.picture_options_owed.is_none() {
+        let still_owed = picture_options.is_some_and(|options| self.config_owes(options));
+        if matched && still_owed && self.model.picture_options_owed.is_none() {
             self.model.picture_options_owed = picture_options;
         }
     }
 
+    /// Whether the running config still asks for `options`: a reload may
+    /// have dropped it while the failed write was out. Without a value of its
+    /// own the config still owes the `zoom` that replaces `none`.
+    fn config_owes(&self, options: PictureOptions) -> bool {
+        let configured = self.model.config().general.picture_options;
+        configured.map_or(options == PictureOptions::Zoom, |wanted| wanted == options)
+    }
+
     /// Arms [`KEY_WRITE_RETRY`] on every key this run still holds and is not
-    /// already waiting. Clearing `written` marks the wait as a refused write.
+    /// already waiting. `written` stays: the key holds that URI, so a user
+    /// change during the wait is still an external change.
     fn arm_held_keys(&mut self, reassert: Reassert) {
         for style in Style::ALL {
             let key = &mut self.model.styles[style].key;
-            let already_waits = matches!(key.reassert, Some(Reassert::At(_)));
+            let already_waits = matches!(key.reassert, Some(Reassert::At(_) | Reassert::Retry(_)));
             if key.written.is_some() && key.pause.is_none() && !already_waits {
-                key.written = None;
+                key.before_write = key.written.clone();
                 key.reassert = Some(reassert);
             }
         }
@@ -209,7 +226,7 @@ impl Turn<'_> {
     pub(super) fn end_reassert_waits(&mut self) {
         for style in Style::ALL {
             let key = &mut self.model.styles[style].key;
-            if let Some(Reassert::At(due)) = key.reassert
+            if let Some(Reassert::At(due) | Reassert::Retry(due)) = key.reassert
                 && due <= self.now
             {
                 key.reassert = Some(Reassert::Now);
@@ -234,7 +251,7 @@ impl Turn<'_> {
         let retries_later = Style::ALL.iter().any(|&style| {
             matches!(
                 self.model.styles[style].key.reassert,
-                Some(Reassert::At(_))
+                Some(Reassert::At(_) | Reassert::Retry(_))
             )
         });
         // `picture-options` alone is written only next to a key that is the

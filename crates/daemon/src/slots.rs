@@ -182,18 +182,23 @@ pub fn file_uri(path: &Path) -> io::Result<String> {
         })
 }
 
-/// Deletes the temp files (`.*.tmp-*`) that a crashed publish left in
-/// `slots_dir`. A missing directory has nothing to sweep. Blocking I/O.
+/// Sets `slots_dir` to mode `0700`, then deletes the temp files (`.*.tmp-*`)
+/// that a crashed publish left in it. A missing directory has nothing to
+/// sweep. Blocking I/O.
 ///
 /// # Errors
 ///
-/// The first failure to list the directory or to delete a temp file.
+/// The first failure to list the directory, to set its mode or to delete a
+/// temp file.
 pub fn sweep_temp_files(slots_dir: &Path) -> io::Result<()> {
     let entries = match fs::read_dir(slots_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    // An older version left this directory 0755. A run that never publishes,
+    // in uri mode or with both styles paused, must still close it.
+    fs::set_permissions(slots_dir, fs::Permissions::from_mode(0o700))?;
     for entry in entries {
         let entry = entry?;
         if is_temp_name(&entry.file_name()) {
@@ -276,7 +281,10 @@ mod tests {
 
         publish(&day, &slots_dir.join("light"), LinkPolicy::PreferLink).unwrap();
 
-        assert_eq!(fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS, 0o700);
+        assert_eq!(
+            fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS,
+            0o700
+        );
     }
 
     #[test]
@@ -289,7 +297,10 @@ mod tests {
 
         publish(&day, &slots_dir.join("light"), LinkPolicy::PreferLink).unwrap();
 
-        assert_eq!(fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS, 0o700);
+        assert_eq!(
+            fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS,
+            0o700
+        );
     }
 
     #[test]
@@ -599,6 +610,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         sweep_temp_files(&dir.path().join("slots")).unwrap();
+    }
+
+    #[test]
+    fn sweep_makes_an_existing_slots_directory_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("slots");
+        fs::create_dir(&slots_dir).unwrap();
+        fs::set_permissions(&slots_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        sweep_temp_files(&slots_dir).unwrap();
+
+        assert_eq!(
+            fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS,
+            0o700
+        );
     }
 
     #[test]

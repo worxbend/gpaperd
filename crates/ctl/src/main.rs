@@ -113,7 +113,11 @@ impl fmt::Display for Failure {
                 Some(message) => write!(f, "{}", summary::replace_controls(message)),
                 None => write!(f, "{}", summary::replace_controls(&error.to_string())),
             },
-            Failure::BadStatus(error) => write!(f, "cannot read the daemon's status: {error}"),
+            Failure::BadStatus(error) => write!(
+                f,
+                "cannot read the daemon's status: {}",
+                summary::replace_controls(&error.to_string())
+            ),
         }
     }
 }
@@ -305,5 +309,11 @@ mod tests {
         let bus = fdo::Error::Failed("no\r\n\0\u{1b}keys".to_owned());
         let failure = Failure::from_call(zbus::Error::FDO(Box::new(bus)));
         assert_eq!(failure.to_string(), "no????keys");
+
+        let unknown = r#"{"version":1,"visible":"\u001b]0;x\u0007"}"#;
+        let error = serde_json::from_str::<StatusReport>(unknown).unwrap_err();
+        let shown = Failure::BadStatus(error).to_string();
+        assert!(shown.starts_with("cannot read the daemon's status: "));
+        assert!(!shown.contains(char::is_control), "{shown:?}");
     }
 }

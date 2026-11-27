@@ -224,9 +224,6 @@ fn a_failed_start_kills_and_reaps_the_child() {
     let pid = child.id();
     let started = SpawnedBus { child: Some(child) }.finish(files);
 
-    assert!(
-        started.is_err(),
-        "a start that prints no address must fail"
-    );
+    assert!(started.is_err(), "a start that prints no address must fail");
     assert_child_reaped(pid);
 }

@@ -95,11 +95,15 @@ pub enum Event {
         id: ReplyId,
         result: Result<(), String>,
     },
-    /// The [`Effect::SetKeys`] with these values did not land. The shell
-    /// still holds the previous keys.
+    /// Keys of an [`Effect::SetKeys`] that were not stored, or whose write
+    /// was not confirmed. A `Some` names such a key. A `None` key was stored
+    /// or was not part of the write.
     KeyWriteFailed {
         uris: PerStyle<Option<String>>,
         picture_options: Option<PictureOptions>,
+        /// Settings did not answer in time. The write may still land later,
+        /// and GNOME then reports it as any other change.
+        unconfirmed: bool,
     },
     /// The screen was locked or unlocked: `org.gnome.ScreenSaver`'s
     /// `ActiveChanged`, or its `GetActive` at start. May come before
@@ -134,7 +138,9 @@ pub enum FetchOutcome {
     /// A new version is in the cache: a `200` with an image. `blob` is its
     /// absolute path, under a name no earlier version had.
     Stored { blob: PathBuf },
-    /// `304 Not Modified`: the cached blob is still current.
+    /// `304 Not Modified`, or a refusal that is not retried: `401`, `403`,
+    /// a body that is not an image or is too large. A cached blob, if any,
+    /// stays.
     NotModified,
     /// `404` or `410`. A cached blob stays in the cache and may still be
     /// shown.
@@ -143,10 +149,10 @@ pub enum FetchOutcome {
     /// TLS error, a timeout, or a body cut short. A cached blob stays. Fetch
     /// again `retry_in` from now, or sooner when connectivity becomes full.
     Unreachable { retry_in: Duration },
-    /// Anything else: a `429`, a `5xx`, a body that is not an image or is
-    /// too large, a refused redirect, or a cache write that failed. A cached
-    /// blob stays. Fetch again no sooner than `retry_in` from now, which
-    /// honours the server's `Retry-After`, whatever the connectivity does.
+    /// Anything else: a `429`, a `5xx`, a refused redirect, or a cache write
+    /// that failed. A cached blob stays. Fetch again no sooner than
+    /// `retry_in` from now, which honours the server's `Retry-After`,
+    /// whatever the connectivity does.
     Failed { retry_in: Duration },
 }
 
@@ -252,7 +258,8 @@ pub enum Effect {
     /// `uris.light`, `picture-uri-dark` to `uris.dark` and, with `Some`,
     /// `picture-options`. A value that is `None` leaves its key as it is; at
     /// least one of the three is `Some`. A failure is logged and answered
-    /// with [`Event::KeyWriteFailed`].
+    /// with [`Event::KeyWriteFailed`], which names the keys that were not
+    /// stored, or the whole write when settings did not answer.
     ///
     /// A URI is the style's slot URI in slots mode and the image's own
     /// `file://` URI in uri mode. A key that later holds anything but the

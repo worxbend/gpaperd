@@ -676,7 +676,8 @@ fn expand_path(text: &str, ctx: &ParseContext<'_>) -> Result<PathBuf, String> {
             (ctx.home_dir.as_os_str().to_owned(), rest)
         }
         Some(_) => {
-            return Err("`~user` is not expanded: only `~` and `~/…` are;                         for a file named like that, write `./~…`"
+            return Err("`~user` is not expanded: only `~` and `~/…` are; \
+                        for a file named like that, write `./~…`"
                 .to_owned());
         }
         None => (OsString::new(), text),
@@ -1229,10 +1230,10 @@ order = "random"
         let err = source_error(r#"["~bob/walls"]"#);
 
         assert_eq!((err.line, err.column), (2, 12));
-        assert!(
-            err.message.starts_with("`~user` is not expanded"),
-            "{}",
-            err.message
+        assert_eq!(
+            err.message,
+            "`~user` is not expanded: only `~` and `~/…` are; \
+             for a file named like that, write `./~…`"
         );
     }
 

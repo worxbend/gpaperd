@@ -27,13 +27,14 @@ pub enum StateError {
 
 /// Reads the state file. `Ok(None)` when it does not exist. Blocking I/O.
 ///
-/// An existing file is left mode `0600` and its directory mode `0700` before
-/// the bytes are treated as state. A missing file does not create the directory.
+/// An existing file is set to mode `0600` and its directory to `0700` before
+/// the bytes are treated as state. When that fails, it logs a warning and
+/// parses the bytes anyway. A missing file does not create the directory.
 ///
 /// # Errors
 ///
-/// [`StateError::Io`] when an existing file cannot be read or its mode cannot
-/// be tightened. The file stays where it is. [`StateError::Corrupt`] for
+/// [`StateError::Io`] when an existing file cannot be read. The file stays
+/// where it is. [`StateError::Corrupt`] for
 /// invalid JSON or a wrong shape, including a missing version.
 /// [`StateError::UnsupportedVersion`] when the version is not `STATE_VERSION`.
 /// The caller logs those two and starts without state; the next [`save`]
@@ -41,15 +42,24 @@ pub enum StateError {
 pub fn load(path: &Path) -> Result<Option<Persisted>, StateError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A file where a parent directory belongs: no state file can exist.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error.into()),
     };
     // Remote URLs live in this file. Tighten the modes before a parse error
-    // can return and leave a world-readable copy behind.
-    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        ensure_private_dir(dir)?;
+    // can return and leave a world-readable copy behind. A file the user
+    // does not own, or a read-only mount, still loads; the next `save`
+    // writes a private file in its place.
+    if let Err(error) = make_private(path) {
+        tracing::warn!(reason = %error, "state file mode not tightened");
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let json: Value = serde_json::from_slice(&bytes).map_err(corrupt)?;
     // The version is checked before the shape, so that a file from a newer
     // gpaperd is reported as unsupported and not as corrupt.
@@ -99,6 +109,14 @@ pub fn save(path: &Path, state: &Persisted) -> Result<(), StateError> {
         File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Sets the existing file at `path` to mode `0600` and its directory to `0700`.
+fn make_private(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        ensure_private_dir(dir)?;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 /// Creates `dir` when it is missing, then makes it readable by the user only.
@@ -222,6 +240,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         assert_eq!(load(&dir.path().join("state.json")).unwrap(), None);
+    }
+
+    #[test]
+    fn load_under_a_file_where_the_directory_belongs_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("state");
+        fs::write(&blocker, "").unwrap();
+
+        assert_eq!(load(&blocker.join("state.json")).unwrap(), None);
     }
 
     #[test]
@@ -360,6 +387,28 @@ mod tests {
         let mode = |path: &Path| MetadataExt::mode(&fs::metadata(path).unwrap()) & 0o777;
         assert_eq!(mode(&state_dir), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn load_parses_the_bytes_when_the_mode_cannot_be_tightened() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A readable file this user does not own: chmod on it fails with
+        // EPERM, as on a state file a `sudo` run left behind.
+        let foreign = Path::new("/proc/version");
+        let me = fs::metadata(dir.path()).unwrap().uid();
+        if fs::metadata(foreign).map_or(true, |meta| meta.uid() == me) {
+            eprintln!(
+                "skipped: {} is missing or owned by this user",
+                foreign.display()
+            );
+            return;
+        }
+        let path = dir.path().join("state.json");
+        symlink(foreign, &path).unwrap();
+
+        assert!(matches!(load(&path), Err(StateError::Corrupt(_))));
     }
 
     #[test]

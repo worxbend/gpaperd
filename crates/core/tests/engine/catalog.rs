@@ -355,16 +355,40 @@ fn an_older_hardlink_does_not_replace_the_item_stamp() {
 }
 
 #[test]
-fn a_smaller_hardlink_does_not_replace_the_item_stamp() {
+fn a_newer_smaller_hardlink_replaces_the_item_stamp() {
     let mut original = file("/w/a.png");
     original.stamp.size = 40;
     let mut link = linked("/w/z-link.png", original.stamp.id.ino);
     link.stamp.size = 4;
     link.stamp.mtime += std::time::Duration::from_secs(9);
 
-    let catalog = Catalog::from_local_files(vec![original.clone(), link]);
+    let catalog = Catalog::from_local_files(vec![original.clone(), link.clone()]);
 
-    assert_eq!(origin_of(&catalog, "/w/a.png"), Origin::Local(original));
+    assert_eq!(
+        origin_of(&catalog, "/w/a.png"),
+        Origin::Local(LocalFile {
+            path: original.path,
+            stamp: link.stamp,
+        })
+    );
+}
+
+#[test]
+fn an_item_edited_smaller_outranks_its_stale_larger_hardlink() {
+    let mut original = file("/w/a.png");
+    original.stamp.size = 40;
+    let mut link = linked("/w/z-link.png", original.stamp.id.ino);
+    link.stamp.size = 40;
+    let mut catalog = Catalog::from_local_files(vec![original.clone(), link]);
+    catalog.set_check(&id("/w/a.png"), Check::Usable);
+    let mut shrunk = edited(original, 2);
+    shrunk.stamp.size = 4;
+
+    let delta = catalog.apply(vec![FsChange::Found(shrunk.clone())]);
+
+    assert_eq!(origin_of(&catalog, "/w/a.png"), Origin::Local(shrunk));
+    assert_eq!(check_of(&catalog, "/w/a.png"), Some(Check::Unchecked));
+    assert_eq!(delta.modified, [id("/w/a.png")]);
 }
 
 #[cfg(unix)]

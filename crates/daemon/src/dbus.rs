@@ -102,7 +102,10 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Control {
     requests: mpsc::UnboundedSender<ControlRequest>,
     timeout: Duration,
+    /// What the getters read: the last report, signaled or not.
     properties: Arc<Mutex<Properties>>,
+    /// Each property's value as last announced by `PropertiesChanged`.
+    signaled: Mutex<Properties>,
 }
 
 impl Control {
@@ -122,6 +125,7 @@ impl Control {
             requests,
             timeout,
             properties: Arc::default(),
+            signaled: Mutex::default(),
         }
     }
 
@@ -278,7 +282,8 @@ impl Control {
         self.snapshot().next_change
     }
 
-    /// After every successful publish.
+    /// A new image is on screen in `style`: after every successful publish,
+    /// and in uri mode after the key write that shows it.
     #[zbus(signal)]
     async fn changed(emitter: &SignalEmitter<'_>, style: &str, id: &str) -> zbus::Result<()>;
 }
@@ -365,18 +370,18 @@ pub async fn emit_changed(
 }
 
 /// Stores the properties derived from `status` and emits
-/// `PropertiesChanged` for each one that differs: for `Effect::Report`.
+/// `PropertiesChanged` for each one that differs from its last signaled
+/// value: for `Effect::Report`.
 ///
-/// The snapshot is stored before the signals, because each signal reads
-/// its getter. A property whose signal is not sent is put back, so a later
-/// report tries it again. One failure does not skip the later properties
-/// of this update.
+/// The getters always read the new values. A property whose signal is not
+/// sent keeps its old signaled value, so the next report signals it again
+/// unless the property is back to that value. One failure does not skip the
+/// later properties of this update.
 ///
 /// # Errors
 ///
 /// When a signal cannot be sent. The first such error is returned after
-/// the rest have been attempted. Properties whose signals were sent stay
-/// stored.
+/// the rest have been attempted.
 pub async fn update_properties(
     control: &InterfaceRef<Control>,
     status: &Status,
@@ -384,91 +389,60 @@ pub async fn update_properties(
     let new = Properties::from_status(status);
     // A read lock only: a method call waiting for the core holds one too.
     let iface = control.get().await;
-    let old = {
-        let mut stored = lock(&iface.properties);
-        std::mem::replace(&mut *stored, new.clone())
-    };
+    *lock(&iface.properties) = new.clone();
+    let mut signaled = lock(&iface.signaled).clone();
     let emitter = control.signal_emitter();
     let mut first_error = None;
-    let mut signaled = Signaled::default();
-    if old.style != new.style {
-        let (error, sent) = record_signal(first_error, iface.style_changed(emitter)).await;
-        first_error = error;
-        signaled.style = sent;
+    if signaled.style != new.style {
+        first_error = record_signal(first_error, iface.style_changed(emitter), || {
+            signaled.style.clone_from(&new.style);
+        })
+        .await;
     }
-    if old.paused != new.paused {
-        let (error, sent) = record_signal(first_error, iface.paused_changed(emitter)).await;
-        first_error = error;
-        signaled.paused = sent;
+    if signaled.paused != new.paused {
+        first_error = record_signal(first_error, iface.paused_changed(emitter), || {
+            signaled.paused.clone_from(&new.paused);
+        })
+        .await;
     }
-    if old.current_light != new.current_light {
-        let (error, sent) = record_signal(first_error, iface.current_light_changed(emitter)).await;
-        first_error = error;
-        signaled.current_light = sent;
+    if signaled.current_light != new.current_light {
+        first_error = record_signal(first_error, iface.current_light_changed(emitter), || {
+            signaled.current_light.clone_from(&new.current_light);
+        })
+        .await;
     }
-    if old.current_dark != new.current_dark {
-        let (error, sent) = record_signal(first_error, iface.current_dark_changed(emitter)).await;
-        first_error = error;
-        signaled.current_dark = sent;
+    if signaled.current_dark != new.current_dark {
+        first_error = record_signal(first_error, iface.current_dark_changed(emitter), || {
+            signaled.current_dark.clone_from(&new.current_dark);
+        })
+        .await;
     }
-    if old.next_change != new.next_change {
-        let (error, sent) = record_signal(first_error, iface.next_change_changed(emitter)).await;
-        first_error = error;
-        signaled.next_change = sent;
+    if signaled.next_change != new.next_change {
+        first_error = record_signal(first_error, iface.next_change_changed(emitter), || {
+            signaled.next_change = new.next_change;
+        })
+        .await;
     }
-    restore_unsignaled(&iface.properties, &old, &new, &signaled);
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    *lock(&iface.signaled) = signaled;
+    first_error.map_or(Ok(()), Err)
 }
 
-/// Which changed properties were actually signaled.
-#[derive(Default)]
-struct Signaled {
-    style: bool,
-    paused: bool,
-    current_light: bool,
-    current_dark: bool,
-    next_change: bool,
-}
-
-/// Keeps the first send error and reports whether this one was sent.
+/// Waits for one property's signal, runs `on_sent` once it is sent, and
+/// keeps the first send error.
 ///
-/// The pair is the result, not a `Result`, so `?` cannot skip the later
+/// The error is the result, not a `Result`, so `?` cannot skip the later
 /// properties of the same update.
 async fn record_signal(
     first_error: Option<zbus::Error>,
     emit: impl Future<Output = zbus::Result<()>>,
-) -> (Option<zbus::Error>, bool) {
+    on_sent: impl FnOnce(),
+) -> Option<zbus::Error> {
     match emit.await {
-        Ok(()) => (first_error, true),
-        Err(error) => (first_error.or(Some(error)), false),
-    }
-}
-
-/// Puts back each changed property whose signal was not sent.
-fn restore_unsignaled(
-    properties: &Mutex<Properties>,
-    old: &Properties,
-    new: &Properties,
-    signaled: &Signaled,
-) {
-    let mut stored = lock(properties);
-    if !signaled.style && old.style != new.style {
-        stored.style.clone_from(&old.style);
-    }
-    if !signaled.paused && old.paused != new.paused {
-        stored.paused.clone_from(&old.paused);
-    }
-    if !signaled.current_light && old.current_light != new.current_light {
-        stored.current_light.clone_from(&old.current_light);
-    }
-    if !signaled.current_dark && old.current_dark != new.current_dark {
-        stored.current_dark.clone_from(&old.current_dark);
-    }
-    if !signaled.next_change && old.next_change != new.next_change {
-        stored.next_change = old.next_change;
+        Ok(()) => {
+            on_sent();
+            first_error
+        }
+        Err(error) => first_error.or(Some(error)),
     }
 }
 
@@ -611,59 +585,128 @@ impl PendingReplies {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command as Process, Stdio};
+    use std::time::Duration;
 
-    use super::{Properties, Signaled, lock, record_signal, restore_unsignaled};
+    use gpaperd_core::catalog::ItemId;
+    use gpaperd_core::event::Status;
+    use gpaperd_core::style::{PerStyle, Style};
+    use tokio::sync::mpsc;
+    use zbus::connection;
+    use zbus::object_server::InterfaceRef;
+
+    use super::{Control, control_ref, lock, own_name_on, record_signal, update_properties};
+
+    /// A private session bus, killed on drop.
+    struct PrivateBus {
+        child: Child,
+        address: String,
+    }
+
+    impl PrivateBus {
+        fn start() -> PrivateBus {
+            let mut child = Process::new("dbus-daemon")
+                .args(["--session", "--print-address", "--nofork", "--nopidfile"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("dbus-daemon starts");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let mut address = String::new();
+            BufReader::new(stdout)
+                .read_line(&mut address)
+                .expect("dbus-daemon prints its address");
+            let address = address.trim().to_owned();
+            assert!(!address.is_empty(), "dbus-daemon printed no address");
+            PrivateBus { child, address }
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn showing(light: &str) -> Status {
+        Status {
+            visible: Style::Light,
+            current: PerStyle {
+                light: Some(ItemId::new(light)),
+                dark: None,
+            },
+            next_change: None,
+            paused: PerStyle {
+                light: None,
+                dark: None,
+            },
+        }
+    }
+
+    /// Reports `light` as shown; a send on a closed bus must fail fast.
+    async fn report(control: &InterfaceRef<Control>, light: &str) -> zbus::Result<()> {
+        let status = showing(light);
+        tokio::time::timeout(Duration::from_secs(10), update_properties(control, &status))
+            .await
+            .expect("the update finishes")
+    }
+
+    #[tokio::test]
+    async fn a_failed_signal_keeps_the_new_value_readable_and_unsignaled() {
+        let bus = PrivateBus::start();
+        let (requests, _inbox) = mpsc::unbounded_channel();
+        let builder = connection::Builder::address(bus.address.as_str());
+        let connection = own_name_on(builder, Control::new(requests))
+            .await
+            .expect("serves");
+        let control = control_ref(&connection).await.expect("control is served");
+        update_properties(&control, &showing("/a.jpg"))
+            .await
+            .expect("the first report is signaled");
+        connection.clone().close().await.expect("closes");
+
+        let sent = report(&control, "/b.jpg").await;
+        assert!(sent.is_err(), "a signal went out on a closed connection");
+        {
+            let iface = control.get().await;
+            assert_eq!(iface.current_light(), "/b.jpg", "the getter rolled back");
+            assert_eq!(lock(&iface.signaled).current_light, "/a.jpg");
+        }
+
+        let sent = report(&control, "/c.jpg").await;
+        assert!(sent.is_err(), "the unsignaled change was not tried again");
+
+        let sent = report(&control, "/a.jpg").await;
+        assert!(
+            sent.is_ok(),
+            "the value clients last saw was signaled again"
+        );
+        assert_eq!(control.get().await.current_light(), "/a.jpg");
+    }
 
     #[tokio::test]
     async fn a_failed_property_signal_does_not_drop_the_next_one() {
-        let (first_error, style) =
-            record_signal(None, async { Err(zbus::Error::Unsupported) }).await;
-        let (first_error, paused) = record_signal(first_error, async {
-            Err(zbus::Error::MissingParameter("paused"))
+        let mut sent = Vec::new();
+        let first_error = record_signal(None, async { Err(zbus::Error::Unsupported) }, || {
+            sent.push("style");
         })
         .await;
+        let first_error =
+            record_signal(first_error, async { Ok(()) }, || sent.push("paused")).await;
+        let first_error = record_signal(
+            first_error,
+            async { Err(zbus::Error::MissingParameter("light")) },
+            || sent.push("light"),
+        )
+        .await;
 
-        assert!(!style, "the failed property was treated as signaled");
-        assert!(!paused, "the later failure was treated as signaled");
+        assert_eq!(sent, ["paused"], "only the sent property was recorded");
         assert!(
             matches!(&first_error, Some(zbus::Error::Unsupported)),
             "the first failure was replaced or dropped: {first_error:?}"
         );
-    }
-
-    #[test]
-    fn an_unsignaled_property_stays_put_and_a_signaled_one_stays_new() {
-        let old = Properties {
-            style: "light".to_owned(),
-            paused: Vec::new(),
-            current_light: String::new(),
-            current_dark: "/same.jpg".to_owned(),
-            next_change: 0,
-        };
-        let new = Properties {
-            style: "dark".to_owned(),
-            paused: vec!["dark".to_owned()],
-            current_light: "/pics/a.jpg".to_owned(),
-            current_dark: "/same.jpg".to_owned(),
-            next_change: 9,
-        };
-        let properties = Mutex::new(new.clone());
-        let signaled = Signaled {
-            style: false,
-            paused: true,
-            current_light: true,
-            current_dark: false,
-            next_change: false,
-        };
-
-        restore_unsignaled(&properties, &old, &new, &signaled);
-
-        let stored = lock(&properties);
-        assert_eq!(stored.style, "light");
-        assert_eq!(stored.paused, vec!["dark".to_owned()]);
-        assert_eq!(stored.current_light, "/pics/a.jpg");
-        assert_eq!(stored.current_dark, "/same.jpg");
-        assert_eq!(stored.next_change, 0);
     }
 }

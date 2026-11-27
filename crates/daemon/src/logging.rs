@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level};
+use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 
 /// Installs the global logger. Call it once, before the first log line.
 ///
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn a_full_journal_socket_is_not_opened() {
         let (_dir, _peer, path) = bound_socket();
-        fill(&path);
+        let _senders = fill(&path);
         assert!(
             JournalLayer::open(&path).is_none(),
             "a full journal socket must not be opened; stderr is the fallback"
@@ -239,7 +239,7 @@ mod tests {
     fn a_later_datagram_does_not_wait_on_a_full_socket() {
         let (_dir, _peer, path) = bound_socket();
         let journal = JournalLayer::open(&path).expect("an open socket accepts one datagram");
-        fill(&path);
+        let _senders = fill(&path);
         let error = journal
             .send_to_journal(&[0])
             .expect_err("a full socket must refuse another datagram");
@@ -290,13 +290,33 @@ mod tests {
         (dir, peer, path)
     }
 
-    fn fill(path: &Path) {
-        let sender = UnixDatagram::unbound().expect("a sender");
-        sender.set_nonblocking(true).expect("filling must not block");
+    /// Fills the receiver queue, not only one sender's send buffer.
+    ///
+    /// One sender stops at its own send buffer, which can hold fewer
+    /// datagrams than the receiver queue (`max_dgram_qlen`). So each round
+    /// uses a new sender, and a new sender whose first datagram would wait
+    /// proves the queue is full. Keep the senders alive through the asserts.
+    fn fill(path: &Path) -> Vec<UnixDatagram> {
+        let mut senders = Vec::new();
+        loop {
+            let sender = UnixDatagram::unbound().expect("a sender");
+            sender
+                .set_nonblocking(true)
+                .expect("filling must not block");
+            if !send_until_blocked(&sender, path) {
+                return senders;
+            }
+            senders.push(sender);
+        }
+    }
+
+    /// Whether any datagram went out before a send would wait.
+    fn send_until_blocked(sender: &UnixDatagram, path: &Path) -> bool {
+        let mut sent_any = false;
         loop {
             match sender.send_to(&[0], path) {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Ok(_) => sent_any = true,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return sent_any,
                 Err(error) => panic!("filling the socket failed: {error}"),
             }
         }

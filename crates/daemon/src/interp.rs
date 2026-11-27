@@ -2,13 +2,16 @@
 //! executes the effects it returns.
 //!
 //! One task owns the [`Model`]. Adapters turn the outside world into
-//! [`Event`]s, and every [`Effect`] runs through an adapter. A probe, a
-//! slot write and a state save run off the event loop. A probe's or a slot
-//! write's answer comes back as an event. A scan runs on the thread of its
-//! [`SourceWatch`]. A fetch of a remote image runs as a task of its own.
-//! So a stalled network mount, a slow server or a stalled `fsync` cannot
-//! hold up a style switch or a shutdown. A state save is still awaited, so
-//! a healthy one finishes before a key write that waits on it.
+//! [`Event`]s, and every [`Effect`] runs through an adapter. A probe and a
+//! slot write run off the event loop, and the answer comes back as an
+//! event. A scan runs on the thread of its [`SourceWatch`]. A fetch of a
+//! remote image runs as a task of its own. So a stalled network mount or a
+//! slow server cannot hold up a style switch or a shutdown.
+//!
+//! A state save runs on the blocking pool, but the loop awaits it, so a
+//! healthy save finishes before a key write that waits on it. The loop
+//! reads no event while a save runs: a stalled `fsync` delays the next
+//! event, a shutdown included.
 //!
 //! Control requests from the D-Bus server come in through the
 //! [`ControlPort`]. Each one gets a [`ReplyId`] from [`PendingReplies`],
@@ -40,7 +43,9 @@ use crate::cache::Cache;
 use crate::config_watch::{ConfigFile, ConfigWatch, LoadError};
 use crate::dbus::{BusNews, ControlPort, ControlRequest, PendingReplies};
 use crate::fetch::{FetchSettings, Fetcher};
-use crate::gnome::{GnomeError, GnomePort, KeyWrite};
+use crate::gnome::{
+    GnomeError, GnomePort, KeyWrite, PICTURE_OPTIONS, PICTURE_URI, PICTURE_URI_DARK,
+};
 use crate::paths::Paths;
 use crate::probe::Prober;
 use crate::scan::Scan;
@@ -604,9 +609,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     /// not own the bus name: another gpaperd may be sweeping the same cache.
     fn collect_garbage_later(&self, keep: Vec<Url>) {
         if self.ports.control.news.is_closed() {
-            tracing::warn!(
-                "remote cache not collected: this process does not own the bus name"
-            );
+            tracing::warn!("remote cache not collected: this process does not own the bus name");
             return;
         }
         let cache = Arc::clone(&self.cache);
@@ -637,7 +640,9 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     /// loop. The reply is then sent before a shutdown queued on the same
     /// select can answer `Failed`. The write is awaited here, so that no
     /// later key write overtakes it. `KeysRestored` does not emit
-    /// `RestoreKeys`, so the feed does not re-enter this method.
+    /// `RestoreKeys`, so the feed does not re-enter this method. The feed
+    /// is boxed: `feed` reaches here through `execute`, and an async cycle
+    /// needs a heap step to have a finite size.
     async fn restore_keys(
         &mut self,
         id: ReplyId,
@@ -651,14 +656,11 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 tracing::error!(reason = %error, "the user's background keys not restored");
             }
         }
-        self.feed(
-            Event::KeysRestored {
-                id,
-                result: result.map_err(|error| error.to_string()),
-            },
-            config_file,
-        )
-        .await
+        let restored = Event::KeysRestored {
+            id,
+            result: result.map_err(|error| error.to_string()),
+        };
+        Box::pin(self.feed(restored, config_file)).await
     }
 
     fn probe_later(&self, style: Style, item: ItemId, path: PathBuf, max_pixels: u64) {
@@ -739,42 +741,52 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             Err(error) => {
                 tracing::error!(reason = %error, "background keys not written");
                 match &error {
-                    GnomeError::Write { unstored, .. } => self.fail_key_write(&write, Some(unstored)),
+                    GnomeError::Write { unstored, .. } => {
+                        self.fail_key_write(&write, Some(unstored))
+                    }
+                    GnomeError::NoAnswer => self.leave_key_write_unconfirmed(&write),
                     _ => self.fail_key_write(&write, None),
                 }
             }
         }
     }
 
-    /// Tells the core which keys of `write` were not stored. An empty
-    /// `unstored`, or none, means the whole write is unconfirmed.
+    /// Tells the core which keys of `write` were not stored. `None` means
+    /// none was.
     fn fail_key_write(&self, write: &KeyWrite, unstored: Option<&[String]>) {
-        let keeps = |key: &str, value: Option<String>| -> Option<String> {
-            let named = match unstored {
-                None | Some([]) => true,
-                Some(names) => names.iter().any(|name| name == key),
-            };
-            named.then_some(value).flatten()
-        };
-        let options_named = match unstored {
-            None | Some([]) => true,
-            Some(names) => names.iter().any(|name| name == "picture-options"),
-        };
+        let named = |key: &str| unstored.is_none_or(|names| names.iter().any(|name| name == key));
+        let keeps = |key: &str, value: Option<String>| named(key).then_some(value).flatten();
         let failed = Event::KeyWriteFailed {
             uris: PerStyle {
-                light: keeps("picture-uri", write.uris.light.clone()),
-                dark: keeps("picture-uri-dark", write.uris.dark.clone()),
+                light: keeps(PICTURE_URI, write.uris.light.clone()),
+                dark: keeps(PICTURE_URI_DARK, write.uris.dark.clone()),
             },
-            picture_options: options_named.then_some(write.picture_options).flatten(),
+            picture_options: named(PICTURE_OPTIONS)
+                .then_some(write.picture_options)
+                .flatten(),
+            unconfirmed: false,
         };
         let _ = self.answer_sender.send(failed);
     }
 
+    /// Tells the core that settings did not answer `write`. It is not
+    /// refused: it may still land, and GNOME then reports it as any other
+    /// change.
+    fn leave_key_write_unconfirmed(&self, write: &KeyWrite) {
+        let unconfirmed = Event::KeyWriteFailed {
+            uris: write.uris.clone(),
+            picture_options: write.picture_options,
+            unconfirmed: true,
+        };
+        let _ = self.answer_sender.send(unconfirmed);
+    }
+
     /// Saves the model as it is after the step that asked for it. The save
     /// runs on the blocking pool and is awaited, so a healthy one finishes
-    /// before a later key write in this step. A stalled `sync_all` does not
-    /// freeze the loop's other tasks. It does not flush a key write that
-    /// was refused because an earlier save failed.
+    /// before a later key write in this step. Spawned tasks go on while it
+    /// runs, but the loop reads no event until it ends, so a stalled
+    /// `sync_all` delays the next event, a shutdown included. It does not
+    /// flush a key write that was refused because an earlier save failed.
     async fn persist(&mut self) {
         let path = self.paths.state_file.clone();
         let saved = self.model.persisted();
@@ -796,7 +808,7 @@ fn lay_groundwork(
     seed: u64,
 ) -> Result<Groundwork, StartError> {
     if let Err(error) = slots::sweep_temp_files(&paths.slots_dir) {
-        tracing::warn!(reason = %error, "temp files of an earlier run are still there");
+        tracing::warn!(reason = %error, "slots directory not made private or not swept");
     }
     let restored = restore_state(&paths.state_file)?;
     let originals_saved = restored
@@ -814,7 +826,16 @@ fn lay_groundwork(
         model,
         originals_saved,
         slots_watch: SlotsWatch::start(paths.slots_dir.clone()),
-        cached: cache.load(),
+        cached: cached_blobs(cache),
+    })
+}
+
+/// The remote cache's blobs. An unreadable cache is logged and starts as an
+/// empty one, so local sources still rotate; each URL is then fetched again.
+fn cached_blobs(cache: &Cache) -> Vec<RemoteBlob> {
+    cache.load().unwrap_or_else(|error| {
+        tracing::warn!(reason = %error, "remote cache not read: starting without it");
+        Vec::new()
     })
 }
 
@@ -825,7 +846,9 @@ fn lay_groundwork(
 fn restore_state(state_file: &Path) -> Result<Option<Persisted>, state::StateError> {
     match state::load(state_file) {
         Ok(saved) => Ok(saved),
-        Err(error @ (state::StateError::Corrupt(_) | state::StateError::UnsupportedVersion { .. })) => {
+        Err(
+            error @ (state::StateError::Corrupt(_) | state::StateError::UnsupportedVersion { .. }),
+        ) => {
             tracing::warn!(reason = %error, "state file ignored");
             Ok(None)
         }

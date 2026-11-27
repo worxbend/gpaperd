@@ -116,6 +116,9 @@ pub struct Daemon<'a> {
     /// When the shell has had its time with the style on screen: from then
     /// on its slot may be republished.
     refresh_from: SystemTime,
+    /// The style left the screen while its republish was unanswered: the
+    /// write may have landed unwatched.
+    hidden_while_refreshing: PerStyle<bool>,
     /// Foreign wallpapers written to the keys so far.
     foreign_wallpapers: u64,
     /// The saved state from before the step in progress.
@@ -129,8 +132,11 @@ pub struct Daemon<'a> {
     tried: PerStyle<Vec<Probed>>,
     /// What each style probed last.
     probing: PerStyle<Option<Probed>>,
-    /// Versions whose probe failed for good in this run of the daemon.
-    known_bad: BTreeSet<Version>,
+    /// Versions whose probe failed for good in this run of the daemon, per
+    /// catalog. A catalog that learns the file later knows no verdict.
+    known_bad: PerStyle<BTreeSet<Version>>,
+    /// Versions each catalog holds back while their truncated wait runs.
+    held_back: PerStyle<BTreeSet<Version>>,
     /// Versions that wait for another probe.
     still_copied: BTreeMap<Version, StillCopied>,
     pub is_ready: bool,
@@ -198,11 +204,13 @@ impl<'a> Daemon<'a> {
             reassert_after: PerStyle::default(),
             write_back_due: PerStyle::default(),
             refresh_from: at(0),
+            hidden_while_refreshing: PerStyle::default(),
             foreign_wallpapers: 0,
             unanswered: VecDeque::new(),
             tried: PerStyle::default(),
             probing: PerStyle::default(),
-            known_bad: BTreeSet::new(),
+            known_bad: PerStyle::default(),
+            held_back: PerStyle::default(),
             still_copied: BTreeMap::new(),
             is_ready: false,
             is_stopped: false,
@@ -251,14 +259,20 @@ impl<'a> Daemon<'a> {
                 .flat_map(|history| history.iter().cloned())
                 .collect()
         });
+        // Original keys that no save wrote are gone with the killed process.
+        self.original_keys = state_file
+            .as_ref()
+            .and_then(|saved| saved.original_keys.clone());
         let files = PerStyle::from_fn(|style| self.told[style].as_ref().map(local_files));
         self.model = new_model(&self.config, files, boot.seed, state_file);
         self.visible = boot.visible;
         self.armed = None;
         self.unanswered.clear();
+        self.hidden_while_refreshing = PerStyle::default();
         self.tried = PerStyle::default();
         self.probing = PerStyle::default();
-        self.known_bad.clear();
+        self.known_bad = PerStyle::default();
+        self.held_back = PerStyle::default();
         self.still_copied.clear();
         self.is_ready = false;
         // A request to the killed process gets no reply: its caller times
@@ -268,7 +282,13 @@ impl<'a> Daemon<'a> {
         self.find_keys(boot);
         self.refresh_from = self.now() + HIDDEN_REFRESH_DELAY;
         let keys = self.gnome_keys();
-        self.original_keys.get_or_insert_with(|| keys.clone());
+        // Keys left on the slots are the daemon's, not the user's originals.
+        let names_a_slot = Style::ALL
+            .into_iter()
+            .any(|style| keys.uri(style) == Some(slot_uris()[style].as_str()));
+        if !names_a_slot {
+            self.original_keys.get_or_insert_with(|| keys.clone());
+        }
         // The screensaver's state at start may come before `Started`, when
         // the daemon has nothing to do yet.
         self.has_started = false;
@@ -416,6 +436,10 @@ impl<'a> Daemon<'a> {
             Op::Switch(style) if self.has_dark_key => {
                 if *style != self.visible {
                     self.refresh_from = self.now() + HIDDEN_REFRESH_DELAY;
+                    let hidden = self.visible;
+                    if self.unanswered.contains(&Effect::Republish(hidden)) {
+                        self.hidden_while_refreshing[hidden] = true;
+                    }
                 }
                 self.visible = *style;
                 self.send(Event::Gnome(GnomeEvent::StyleChanged(*style)))?;
@@ -500,7 +524,8 @@ impl<'a> Daemon<'a> {
                     );
                 }
             }
-            Command::Restore => {
+            // With no original keys saved, restore fails and pauses nothing.
+            Command::Restore if self.original_keys.is_some() => {
                 for style in Style::ALL {
                     prop_assert!(self.is_user_paused(style), "restore did not pause {style}");
                 }
@@ -672,8 +697,13 @@ impl<'a> Daemon<'a> {
     /// The daemon handles an event now, and sees which waits are over.
     fn end_waits(&mut self) {
         let now = self.now();
-        for wait in self.still_copied.values_mut() {
+        for (version, wait) in &mut self.still_copied {
             wait.waits_until = wait.waits_until.filter(|until| now < *until);
+            if wait.waits_until.is_none() {
+                for style in Style::ALL {
+                    self.held_back[style].remove(version);
+                }
+            }
         }
         for style in Style::ALL {
             if self.reassert_after[style].is_some_and(|after| after <= now) {
@@ -692,6 +722,10 @@ impl<'a> Daemon<'a> {
         self.scanning[style] = false;
         let found = self.scan(style);
         let files = local_files(&found);
+        // A version that left this catalog comes back with no verdict.
+        let still_holds = |(item, saves): &Version| found.get(item) == Some(saves);
+        self.known_bad[style].retain(still_holds);
+        self.held_back[style].retain(still_holds);
         self.told[style] = Some(found);
         // The other style's catalog was not replaced, so its bad, truncated,
         // and tried sets stay. Clearing them hides a probe the reducer still
@@ -704,7 +738,10 @@ impl<'a> Daemon<'a> {
     fn report_file(&mut self, image: &'static str) -> Result<(), TestCaseError> {
         let item = id(image);
         // Whatever was known of the file is void.
-        self.known_bad.retain(|(bad, _)| *bad != item);
+        for style in Style::ALL {
+            self.known_bad[style].retain(|(bad, _)| *bad != item);
+            self.held_back[style].retain(|(held, _)| *held != item);
+        }
         self.still_copied.retain(|(copied, _), _| *copied != item);
         for style in Style::ALL {
             self.tried[style].retain(|(tried, _)| *tried != item);
@@ -779,7 +816,15 @@ impl<'a> Daemon<'a> {
                     Some(_) => self.write_slot(style, publish_fails),
                     None => Err("No such file or directory".to_owned()),
                 };
-                self.send(Event::Republished { style, result })
+                // A failure spends the mark, and so does a success that was
+                // on screen all along. Otherwise the write may have landed
+                // unwatched: the mark stays for the next refresh.
+                let was_hidden = mem::take(&mut self.hidden_while_refreshing[style]);
+                let keeps_mark = result.is_ok() && (style != self.visible || was_hidden);
+                self.send(Event::Republished { style, result })?;
+                let is_dirty = self.model.persisted().styles[style].dirty_while_hidden;
+                prop_assert_eq!(is_dirty, keeps_mark, "the {} refresh answer", style);
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -800,38 +845,62 @@ impl<'a> Daemon<'a> {
             return;
         };
         let probed = (item.clone(), saves);
-        let holds_it = |style: Style| {
-            let told = self.told[style].as_ref();
-            told.is_some_and(|told| told.get(item) == Some(&saves))
-        };
-        if !Style::ALL.into_iter().any(holds_it) {
+        // Only the catalogs that hold the version take the verdict.
+        let holders: Vec<Style> = Style::ALL
+            .into_iter()
+            .filter(|&style| self.holds(style, &probed))
+            .collect();
+        if holders.is_empty() {
             return;
         }
         // The latest verdict about a version is the one that counts.
-        self.known_bad.remove(&probed);
+        for &style in &holders {
+            self.known_bad[style].remove(&probed);
+            self.held_back[style].remove(&probed);
+        }
         let earlier = self.still_copied.remove(&probed);
         match verdict {
             Ok(()) => {}
-            Err(BadReason::Truncated) => self.note_truncated(probed, earlier),
-            Err(_) => {
-                self.known_bad.insert(probed);
-            }
+            Err(BadReason::Truncated) => self.note_truncated(probed, earlier, &holders),
+            Err(_) => self.mark_bad(&probed, &holders),
+        }
+    }
+
+    /// Whether `style`'s catalog holds `version`.
+    fn holds(&self, style: Style, (item, saves): &Version) -> bool {
+        let told = self.told[style].as_ref();
+        told.is_some_and(|told| told.get(item) == Some(saves))
+    }
+
+    fn mark_bad(&mut self, version: &Version, holders: &[Style]) {
+        for &style in holders {
+            self.known_bad[style].insert(version.clone());
+        }
+    }
+
+    fn hold_back(&mut self, version: &Version, holders: &[Style]) {
+        for &style in holders {
+            self.held_back[style].insert(version.clone());
         }
     }
 
     /// A truncated version waits for its next probe, until it had all of
-    /// them. `earlier` is what was known of the version before.
-    fn note_truncated(&mut self, probed: Version, earlier: Option<StillCopied>) {
+    /// them. `earlier` is what was known of the version before. `holders`
+    /// are the catalogs that hold it.
+    fn note_truncated(&mut self, probed: Version, earlier: Option<StillCopied>, holders: &[Style]) {
         // Both styles can probe one file at the same time. The second
         // verdict finds the version waiting: that is no second probe spent.
         if let Some(waiting) = earlier.filter(|wait| wait.waits_until.is_some()) {
+            self.hold_back(&probed, holders);
             self.still_copied.insert(probed, waiting);
             return;
         }
         let verdicts = earlier.map_or(0, |wait| wait.verdicts) + 1;
         let has_probes_left = verdicts <= MAX_PROBE_RETRIES;
-        if !has_probes_left {
-            self.known_bad.insert(probed.clone());
+        if has_probes_left {
+            self.hold_back(&probed, holders);
+        } else {
+            self.mark_bad(&probed, holders);
         }
         let wait = StillCopied {
             verdicts,
@@ -840,13 +909,38 @@ impl<'a> Daemon<'a> {
         self.still_copied.insert(probed, wait);
     }
 
-    /// Whether the daemon may probe this version now.
-    fn is_candidate(&self, version: &Version) -> bool {
-        let waits = self
-            .still_copied
-            .get(version)
-            .is_some_and(|wait| wait.waits_until.is_some());
-        !waits && !self.known_bad.contains(version)
+    /// Whether `style` may probe this version now.
+    fn is_candidate(&self, style: Style, version: &Version) -> bool {
+        let is_refused = |pool: Style| {
+            self.known_bad[pool].contains(version) || self.held_back[pool].contains(version)
+        };
+        !self.is_refused_by_every_pool(style, version, is_refused)
+    }
+
+    /// Whether every catalog that `style` may pick from and that holds
+    /// `version` knows it is bad. A catalog that learned the file after the
+    /// verdict still probes it.
+    fn is_known_bad(&self, style: Style, version: &Version) -> bool {
+        self.is_refused_by_every_pool(style, version, |pool| {
+            self.known_bad[pool].contains(version)
+        })
+    }
+
+    /// Whether at least one catalog that `style` may pick from holds
+    /// `version`, and each of them refuses it.
+    fn is_refused_by_every_pool(
+        &self,
+        style: Style,
+        version: &Version,
+        refuses: impl Fn(Style) -> bool,
+    ) -> bool {
+        let may_borrow = self.config.general.empty_style == EmptyStylePolicy::UseOtherStyle;
+        let mut holders = [Some(style), may_borrow.then(|| style.other())]
+            .into_iter()
+            .flatten()
+            .filter(|&pool| self.holds(pool, version))
+            .peekable();
+        holders.peek().is_some() && holders.all(refuses)
     }
 
     fn write_slot(&mut self, style: Style, fails: bool) -> Result<SlotWrite, String> {
@@ -1229,7 +1323,10 @@ impl<'a> Daemon<'a> {
             self.before.styles[style].dirty_while_hidden,
             "a clean slot was republished"
         );
-        prop_assert!(!saved.dirty_while_hidden, "a refresh left its mark");
+        prop_assert!(
+            saved.dirty_while_hidden,
+            "a refresh dropped its mark before its answer"
+        );
         prop_assert!(
             self.refresh_from <= self.now(),
             "a slot was republished before the shell watches it"
@@ -1320,11 +1417,11 @@ impl<'a> Daemon<'a> {
         );
         let is_known_bad = |sighting: &Sighting| match sighting {
             Sighting::SavedState => false,
-            Sighting::File(saves) => self.known_bad.contains(&(item.clone(), *saves)),
+            Sighting::File(saves) => self.is_known_bad(style, &(item.clone(), *saves)),
         };
         let may_be_probed = |sighting: &Sighting| match sighting {
             Sighting::SavedState => true,
-            Sighting::File(saves) => self.is_candidate(&(item.clone(), *saves)),
+            Sighting::File(saves) => self.is_candidate(style, &(item.clone(), *saves)),
         };
         prop_assert!(
             !sightings.iter().all(is_known_bad),
@@ -1389,13 +1486,20 @@ impl<'a> Daemon<'a> {
     }
 
     /// The timer is armed for the next change, or for something sooner: the
-    /// next probe of a truncated image.
+    /// next probe of a truncated image, or a key that waits on its own.
     fn check_next_change(&self, next_change: Option<SystemTime>) -> Result<(), TestCaseError> {
         match (self.armed, next_change) {
             (None, None) => {}
             (Some(armed), None) => {
-                let latest_retry = self.now() + PROBE_RETRY_DELAY;
-                prop_assert!(armed <= latest_retry, "armed although nothing is due");
+                let longest = self
+                    .own_reassert_waits()
+                    .chain([PROBE_RETRY_DELAY])
+                    .max()
+                    .expect("there is the probe retry");
+                prop_assert!(
+                    armed <= self.now() + longest,
+                    "armed although nothing is due"
+                );
             }
             (armed, Some(next_change)) => {
                 let is_armed_in_time = armed.is_some_and(|armed| armed <= next_change);
@@ -1484,9 +1588,21 @@ impl<'a> Daemon<'a> {
             .map(|style| self.config.styles[style].interval);
         let short_waits = [PROBE_RETRY_DELAY, REASSERT_DELAY, HIDDEN_REFRESH_DELAY];
         intervals
+            .chain(self.own_reassert_waits())
             .chain(short_waits)
             .max()
             .expect("there are short waits")
+    }
+
+    /// Under `reassert-next-tick` a hidden style with no clock to wait on
+    /// writes its taken key back one interval of its own later.
+    fn own_reassert_waits(&self) -> impl Iterator<Item = Duration> + '_ {
+        let applies =
+            self.config.general.on_external_change == ExternalChangePolicy::ReassertNextTick;
+        Style::ALL
+            .into_iter()
+            .filter(move |style| applies && !self.disabled[*style])
+            .map(|style| self.config.styles[style].interval)
     }
 
     /// How the daemon knows of `item` as an image that `style` may show: a
@@ -1559,7 +1675,13 @@ fn a_missing_key_keeps_the_saved_uri_for_persist() {
         key_uri: Some(saved_uri.clone()),
         ..StylePersisted::default()
     };
-    let mut model = restored(PerStyle { light: style.clone(), dark: style }, PerStyle::default());
+    let mut model = restored(
+        PerStyle {
+            light: style.clone(),
+            dark: style,
+        },
+        PerStyle::default(),
+    );
     let mut keys = user_keys();
     keys.picture_uri_dark = None;
 

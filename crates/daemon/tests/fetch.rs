@@ -237,7 +237,7 @@ async fn stored_image_is_in_the_loaded_cache() {
 
     let blob = harness.stored(&url).await;
 
-    let loaded = harness.cache.load();
+    let loaded = harness.cache.load().unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!((&loaded[0].url, &loaded[0].blob), (&url, &blob));
 }
@@ -392,7 +392,7 @@ async fn status_404_and_410_mark_gone_and_keep_the_stale_blob() {
         assert!(meta.gone, "{status}");
         assert_eq!(meta.blob, Some(blake3_name(PNG, "png")));
         assert!(blob.is_file());
-        assert_eq!(harness.cache.load().len(), 1);
+        assert_eq!(harness.cache.load().unwrap().len(), 1);
     }
 }
 
@@ -406,7 +406,7 @@ async fn gone_without_a_cached_copy_records_it() {
     assert_eq!(harness.fetcher.fetch(&url).await, FetchOutcome::Gone);
 
     assert!(harness.cache.meta(&url).await.unwrap().unwrap().gone);
-    assert!(harness.cache.load().is_empty());
+    assert!(harness.cache.load().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -880,6 +880,8 @@ async fn redirect_to_a_literal_loopback_address_is_refused() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+/// A configured reserved literal can never be fetched: refused like a `403`,
+/// with no retry armed.
 #[tokio::test]
 async fn configured_literal_reserved_address_is_not_fetched() {
     let server = MockServer::start().await;
@@ -887,7 +889,10 @@ async fn configured_literal_reserved_address_is_not_fetched() {
     let harness = Harness::new();
     let literal = Url::parse(&format!("{}/a.png", server.uri())).unwrap();
 
-    harness.failed(&literal).await;
+    assert_eq!(
+        harness.fetcher.fetch(&literal).await,
+        FetchOutcome::NotModified
+    );
 
     let error = harness
         .cache
@@ -910,9 +915,15 @@ async fn configured_literal_reserved_address_is_not_fetched() {
         "http://[::1]/x",
         "http://[fe80::1]/x",
         "http://[fc00::1]/x",
+        "http://0.0.0.0/x",
+        "http://[::]/x",
     ] {
         let url = Url::parse(target).unwrap();
-        harness.failed(&url).await;
+        assert_eq!(
+            harness.fetcher.fetch(&url).await,
+            FetchOutcome::NotModified,
+            "{target}"
+        );
         let error = harness
             .cache
             .meta(&url)

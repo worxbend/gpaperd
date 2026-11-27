@@ -10,7 +10,7 @@ impl Turn<'_> {
     /// Makes `new` the running config and applies what it changes. The
     /// rotations that an interval makes due start when the step settles.
     pub(super) fn reload(&mut self, new: Config) {
-        self.drop_partial_marker();
+        self.model.partial_move = None;
         self.fail_listed_reloads();
         let old = self.model.replace_config(new);
         // Before `apply_mode` clears the wallpapers and refills: an empty
@@ -34,9 +34,9 @@ impl Turn<'_> {
 
     pub(super) fn reload_general(&mut self, old: &General) {
         let new = self.model.config().general.clone();
-        if new.picture_options.is_none() {
-            self.model.picture_options_owed = None;
-        } else if new.picture_options != old.picture_options {
+        // A value that stays leaves owed alone: that may be the `zoom` that
+        // replaces `none`.
+        if new.picture_options != old.picture_options {
             self.model.picture_options_owed = new.picture_options;
         }
         if new.apply_mode != old.apply_mode {
@@ -53,7 +53,7 @@ impl Turn<'_> {
             self.follow_dropped_checks(fit_now);
         } else if new.max_pixels < old.max_pixels {
             for style in Style::ALL {
-                self.publish_again(style);
+                self.model.styles[style].reprobe_owed = true;
             }
         }
     }
@@ -64,7 +64,6 @@ impl Turn<'_> {
         if new.sources != old.sources {
             let sources = new.sources.clone();
             self.effects.push(Effect::Watch { style, sources });
-            self.model.await_rescan(style);
         }
         if has_new_order {
             self.model.reset_round(style);

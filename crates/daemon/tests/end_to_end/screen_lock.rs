@@ -1,16 +1,16 @@
 //! `pause_when_locked` against a fake `org.gnome.ScreenSaver` on a private
 //! bus: the watch on its own, then the whole daemon.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpaperd_core::event::{Pause, ScreenLock};
 use gpaperd_core::style::Style;
 use gpaperd_daemon::dbus::REPLY_TIMEOUT;
 use gpaperd_daemon::screensaver;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use zbus::object_server::SignalEmitter;
 use zbus::{Connection, interface};
 
@@ -80,6 +80,52 @@ impl FailOnceShield {
 
     #[zbus(signal)]
     async fn active_changed(emitter: &SignalEmitter<'_>, active: bool) -> zbus::Result<()>;
+}
+
+/// Every `GetActive` fails with an error reply.
+struct BrokenShield;
+
+#[interface(name = "org.gnome.ScreenSaver")]
+impl BrokenShield {
+    fn get_active(&self) -> zbus::fdo::Result<bool> {
+        Err(zbus::fdo::Error::Failed("wedged".into()))
+    }
+
+    #[zbus(signal)]
+    async fn active_changed(emitter: &SignalEmitter<'_>, active: bool) -> zbus::Result<()>;
+}
+
+/// The first `GetActive` answers only after the watch's call timeout.
+/// Later calls report the shield up.
+struct StallOnceShield {
+    calls: AtomicUsize,
+}
+
+#[interface(name = "org.gnome.ScreenSaver")]
+impl StallOnceShield {
+    async fn get_active(&self) -> bool {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(REPLY_TIMEOUT + QUIET).await;
+        }
+        true
+    }
+
+    #[zbus(signal)]
+    async fn active_changed(emitter: &SignalEmitter<'_>, active: bool) -> zbus::Result<()>;
+}
+
+/// Serves `shield` as `org.gnome.ScreenSaver` on `bus` until the connection
+/// is dropped.
+async fn serve_shield<T: zbus::object_server::Interface>(
+    bus: &PrivateBus,
+    shield: T,
+) -> Connection {
+    zbus::connection::Builder::address(bus.address())
+        .name(SERVICE)
+        .serve_at(PATH, shield)
+        .build()
+        .await
+        .expect("serve the shield")
 }
 
 async fn serve_hung_shield(bus: &PrivateBus) -> Connection {
@@ -249,9 +295,7 @@ fn a_locked_screen_holds_the_deadline_until_unlock() {
         }
 
         let armed = world.clock.times_armed();
-        world
-            .clock
-            .step_to(start_time() + LIGHT_INTERVAL + MINUTE);
+        world.clock.step_to(start_time() + LIGHT_INTERVAL + MINUTE);
         eventually("the locked screen's deadline is observed", || {
             world.clock.times_armed() > armed
         })
@@ -311,6 +355,76 @@ fn a_new_owner_whose_get_active_fails_still_reports_the_initial_lock() {
         assert_eq!(
             later.expect("the retry of GetActive").expect("the watch"),
             ScreenLock::Locked
+        );
+    });
+}
+
+#[test]
+fn a_lock_during_a_new_owners_hung_get_active_is_still_heard() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let mut locks = screensaver::watch(bus.connect().await);
+        let early = tokio::time::timeout(QUIET, locks.recv()).await;
+        assert!(early.is_err(), "no state without the service: {early:?}");
+
+        let service = serve_hung_shield(&bus).await;
+        // The new owner's `GetActive` hangs. The shield locks meanwhile.
+        tokio::time::sleep(QUIET).await;
+        let shield = service
+            .object_server()
+            .interface::<_, HungShield>(PATH)
+            .await
+            .expect("the hung shield is served");
+        HungShield::active_changed(shield.signal_emitter(), true)
+            .await
+            .expect("emit ActiveChanged");
+
+        let unanswered = tokio::time::timeout(REPLY_TIMEOUT + PATIENCE, locks.recv()).await;
+        assert_eq!(
+            unanswered.expect("the unanswered ask").expect("the watch"),
+            ScreenLock::Unlocked
+        );
+        assert_eq!(next_lock(&mut locks).await, ScreenLock::Locked);
+    });
+}
+
+#[test]
+fn a_first_get_active_that_times_out_is_asked_again() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let _service = serve_shield(
+            &bus,
+            StallOnceShield {
+                calls: AtomicUsize::new(0),
+            },
+        )
+        .await;
+        let mut locks = screensaver::watch(bus.connect().await);
+
+        let lock = tokio::time::timeout(REPLY_TIMEOUT * 2 + PATIENCE, locks.recv()).await;
+
+        assert_eq!(
+            lock.expect("the retry of GetActive").expect("the watch"),
+            ScreenLock::Locked
+        );
+    });
+}
+
+#[test]
+fn a_get_active_that_keeps_failing_reports_unlocked_once() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let mut locks = screensaver::watch(bus.connect().await);
+        let early = tokio::time::timeout(QUIET, locks.recv()).await;
+        assert!(early.is_err(), "no state without the service: {early:?}");
+
+        let _service = serve_shield(&bus, BrokenShield).await;
+        assert_eq!(next_lock(&mut locks).await, ScreenLock::Unlocked);
+        let repeated = tokio::time::timeout(REPLY_TIMEOUT + PATIENCE, locks.recv()).await;
+
+        assert!(
+            repeated.is_err(),
+            "a failed retry reported the same owner again: {repeated:?}"
         );
     });
 }

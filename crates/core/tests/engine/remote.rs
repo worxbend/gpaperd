@@ -107,6 +107,18 @@ fn a_remote_only_style_whose_urls_are_gone_borrows_the_other_styles_images() {
 }
 
 #[test]
+fn a_remote_only_style_whose_uncached_urls_are_refused_borrows_the_other_styles_images() {
+    let mut world = World::new(init(remote_config(&[DAWN], &[]), &[], &["/d/a.jpg"]));
+    world.start(at(0), Style::Light);
+    world.run(at(0), cache_loaded(&[]));
+
+    // A 401, 403 or rejected body keeps the missing blob missing.
+    let trace = world.run(at(5), fetched(DAWN, FetchOutcome::NotModified));
+
+    assert_eq!(published(&trace), [(Style::Light, "/d/a.jpg")]);
+}
+
+#[test]
 fn every_listed_url_is_fetched_at_start_once_even_when_both_styles_list_it() {
     let mut world = World::new(init(remote_config(&[DAWN, NOON], &[DAWN]), &[], &[]));
     world.start(at(0), Style::Light);

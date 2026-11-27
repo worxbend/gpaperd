@@ -8,8 +8,9 @@
 //! claims 30000 x 30000 pixels. `notes.png` is text.
 //!
 //! Where glycin's sandbox cannot start, a file that passed the magic-byte
-//! read still fails the check. Every test that needs a decode asks
-//! [`decodes_here`] first and asserts that failure instead of `Ok(())`.
+//! read still fails the check, as [`BadReason::Truncated`]: probed again
+//! later. Every test that needs a decode asks [`decodes_here`] first and
+//! asserts that failure instead of `Ok(())`.
 //!
 //! glycin only reads below the XDG directories: the loader configuration.
 //! The one cache it writes is for the SVG loader, and no fixture is an SVG.
@@ -24,7 +25,7 @@ use std::time::{Duration, SystemTime};
 
 use gpaperd_core::catalog::BadReason;
 use gpaperd_core::config::DEFAULT_MAX_PIXELS;
-use gpaperd_daemon::probe::{Prober, SANDBOX_DID_NOT_START};
+use gpaperd_daemon::probe::Prober;
 use tempfile::TempDir;
 
 /// Width times height of the `tiny` fixtures.
@@ -78,7 +79,7 @@ fn verdict_here(decoded: Result<(), BadReason>) -> Result<(), BadReason> {
     if decodes_here() {
         decoded
     } else {
-        Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()))
+        Err(BadReason::Truncated)
     }
 }
 
@@ -131,10 +132,7 @@ fn assert_undecodable(verdict: &Result<(), BadReason>) {
             "{verdict:?}"
         );
     } else {
-        assert_eq!(
-            verdict,
-            &Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()))
-        );
+        assert_eq!(verdict, &Err(BadReason::Truncated));
     }
 }
 
@@ -236,9 +234,7 @@ async fn image_of_one_pixel_more_than_max_pixels_is_too_large() {
         height: 12,
     }));
 
-    let verdict = prober()
-        .check(&fixture("tiny.png"), TINY_PIXELS - 1)
-        .await;
+    let verdict = prober().check(&fixture("tiny.png"), TINY_PIXELS - 1).await;
 
     assert_eq!(verdict, too_large);
 }
@@ -355,17 +351,74 @@ async fn with_a_bwrap_that_may_not_make_namespaces_a_check_does_not_pass() {
         assert_missing_sandbox_is_not_a_pass().await;
     } else {
         let bin_dir = TempDir::new().expect("temp dir");
-        let refusing_bwrap = bin_dir.path().join("bwrap");
-        let script =
-            "#!/bin/sh\necho 'bwrap: No permissions to create a new namespace' >&2\nexit 1\n";
-        fs::write(&refusing_bwrap, script).expect("write the bwrap stand-in");
-        fs::set_permissions(&refusing_bwrap, fs::Permissions::from_mode(0o755))
-            .expect("make the bwrap stand-in executable");
+        install_script(&bin_dir, "bwrap", REFUSING_BWRAP);
         expect_child_to_pass(
             "with_a_bwrap_that_may_not_make_namespaces_a_check_does_not_pass",
             bin_dir.path(),
         );
     }
+}
+
+/// A sandbox that failed once is tried again: the known-good decode may only
+/// have timed out, or `bwrap` was fixed meanwhile.
+#[tokio::test]
+async fn sandbox_that_works_later_is_used_by_a_later_check() {
+    if is_child_without_sandbox() {
+        assert_sandbox_is_tried_again().await;
+    } else {
+        let Some(bwrap) = bwrap_on_path().filter(|_| decodes_here()) else {
+            // Without a bwrap that works here, a later start cannot be staged.
+            eprintln!("skipped: no bwrap on PATH, or glycin cannot decode here");
+            return;
+        };
+        let bin_dir = TempDir::new().expect("temp dir");
+        install_script(&bin_dir, "bwrap", REFUSING_BWRAP);
+        let forward = format!("#!/bin/sh\nexec '{}' \"$@\"\n", bwrap.display());
+        install_script(&bin_dir, WORKING_BWRAP, &forward);
+        expect_child_to_pass(
+            "sandbox_that_works_later_is_used_by_a_later_check",
+            bin_dir.path(),
+        );
+    }
+}
+
+/// A `bwrap` stand-in that fails as bwrap does in a container that blocks
+/// namespaces.
+const REFUSING_BWRAP: &str =
+    "#!/bin/sh\necho 'bwrap: No permissions to create a new namespace' >&2\nexit 1\n";
+
+/// File name of a stand-in that runs the real `bwrap`. The child renames it
+/// to `bwrap` once its first check has failed.
+const WORKING_BWRAP: &str = "bwrap.works";
+
+fn install_script(bin_dir: &TempDir, name: &str, script: &str) {
+    let path = bin_dir.path().join(name);
+    fs::write(&path, script).expect("write the bwrap stand-in");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("make the bwrap stand-in executable");
+}
+
+fn bwrap_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("bwrap"))
+        .find(|bwrap| bwrap.is_file())
+}
+
+/// What the child of [`sandbox_that_works_later_is_used_by_a_later_check`]
+/// must see: refused while bwrap fails, passed once it works.
+async fn assert_sandbox_is_tried_again() {
+    assert!(!decodes_here(), "the child must not have a sandbox");
+    let checker = prober();
+    let image = fixture("tiny.png");
+    let refused = checker.check(&image, DEFAULT_MAX_PIXELS).await;
+    let bin_dir = PathBuf::from(std::env::var_os("PATH").expect("the child's PATH"));
+    fs::rename(bin_dir.join(WORKING_BWRAP), bin_dir.join("bwrap"))
+        .expect("put the working bwrap in place");
+
+    let passed = checker.check(&image, DEFAULT_MAX_PIXELS).await;
+
+    assert_eq!((refused, passed), (Err(BadReason::Truncated), Ok(())));
 }
 
 fn is_child_without_sandbox() -> bool {
@@ -396,7 +449,7 @@ fn expect_child_to_pass(name: &str, path_dir: &Path) {
 async fn assert_missing_sandbox_is_not_a_pass() {
     assert!(!decodes_here(), "the child must not have a sandbox");
     let checker = prober();
-    let failed = Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()));
+    let failed = Err(BadReason::Truncated);
 
     let corrupt = checker
         .check(&fixture("corrupt.png"), DEFAULT_MAX_PIXELS)

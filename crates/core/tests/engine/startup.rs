@@ -52,7 +52,10 @@ fn a_first_run_writes_the_keys_once_after_both_slots_exist() {
         .iter()
         .rposition(is_publish)
         .expect("a slot is published");
-    let set_keys = trace.iter().position(is_set_keys).expect("keys are written");
+    let set_keys = trace
+        .iter()
+        .position(is_set_keys)
+        .expect("keys are written");
     assert_eq!(count(&trace, is_set_keys), 1);
     assert!(last_publish < set_keys);
 }
@@ -507,6 +510,39 @@ fn a_restored_round_goes_on_when_its_scan_arrives() {
 }
 
 #[test]
+fn a_restored_round_keeps_only_known_paths_and_web_urls_once_scanned() {
+    let saved = light_showing(
+        "/l/3.jpg",
+        &[
+            "/l/1.jpg",
+            "a:1",
+            "/l/gone.jpg",
+            "data:image/png;base64,AA",
+            "https://example.org/x.jpg",
+            "/l/2.jpg",
+        ],
+        &["/l/3.jpg"],
+    );
+
+    let mut world = World::new(ModelInit {
+        restored: Some(saved),
+        ..unscanned(Config::default())
+    });
+    world.slots.light = foreign_slot();
+    world.start(at(100), Style::Light);
+    world.run(at(101), scanned(Style::Light, &SIX_LIGHT));
+    world.run(at(102), scanned(Style::Dark, &["/d/only.jpg"]));
+
+    let rest_of_round = world.model.persisted().styles.light.bag;
+    assert!(rest_of_round.contains(&id("/l/1.jpg")));
+    assert!(rest_of_round.contains(&id("/l/2.jpg")));
+    assert!(rest_of_round.contains(&id("https://example.org/x.jpg")));
+    assert!(!rest_of_round.contains(&id("/l/gone.jpg")));
+    assert!(!rest_of_round.contains(&id("a:1")));
+    assert!(!rest_of_round.contains(&id("data:image/png;base64,AA")));
+}
+
+#[test]
 fn an_image_that_is_new_since_the_last_run_joins_the_restored_round() {
     let mut first = World::new(six_shuffled());
     first.start(at(0), Style::Light);
@@ -603,6 +639,21 @@ fn a_round_restored_from_before_m2_gives_what_it_showed_no_second_turn() {
             "seed {seed}"
         );
     }
+}
+
+#[test]
+fn a_scan_that_finds_only_the_image_on_screen_ends_a_restore_from_before_m2() {
+    let mut saved = light_showing("/l/3.jpg", &["https://cdn.example/a.jpg"], &[]);
+    saved.styles.light.shown = None;
+
+    let restored = Model::new(ModelInit {
+        restored: Some(saved),
+        ..init(Config::default(), &["/l/3.jpg"], &["/d/only.jpg"])
+    });
+
+    let persisted = restored.persisted().styles.light;
+    assert_eq!(persisted.bag, [id("https://cdn.example/a.jpg")]);
+    assert_eq!(persisted.shown, Some(Vec::new()));
 }
 
 #[test]

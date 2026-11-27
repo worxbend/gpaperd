@@ -105,7 +105,7 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// - [`Event::Started`]: ask for the scan and the watch of each style's
 ///   sources with [`Effect::Watch`], record the visible style, and keep the
 ///   snapshot's keys as the original keys unless restored state already has
-///   some. Then the first apply, per style, hidden or not: a slot that is
+///   some, or a key names its slot file. Then the first apply, per style, hidden or not: a slot that is
 ///   missing or has another inode than the restored one is still to be
 ///   filled, with its current item when that is still usable, else with a
 ///   first pick. An intact slot is left alone, even when its item left the
@@ -212,10 +212,14 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     [`MAX_KEY_FLIPS_PER_MINUTE`] within a minute pauses the style, as
 ///     `pause` does.
 /// - [`Event::KeyWriteFailed`]: the write did not land. Each style whose
-///   recorded URI is still the one that failed is dropped and tried again
-///   after [`KEY_WRITE_RETRY`]. A style the failure does not name is left
-///   alone. A failure of `picture-options` alone arms the same retry.
-///   Options owed for a write that still matches are restored.
+///   recorded URI is still the one that failed goes back to the URI on record
+///   before it, and is tried again after [`KEY_WRITE_RETRY`]. Another value
+///   of the key meanwhile is an external change. An unconfirmed write keeps
+///   the URI on record: when GNOME reports it landed, the retry is called
+///   off, and a later change is an external change. A style the failure does
+///   not name is left alone. A failure of `picture-options` alone arms the same retry.
+///   Options owed for a write that still matches are restored, unless a
+///   reload dropped them meanwhile.
 /// - [`Event::ConfigChanged`] with `Err`: nothing. The running config stays.
 /// - [`Event::ConfigChanged`] with `Ok`: the new config is the running one
 ///   from here on, and what differs is applied:
@@ -431,10 +435,12 @@ impl Turn<'_> {
             Event::KeyWriteFailed {
                 uris,
                 picture_options,
-            } => self.on_key_write_failed(uris, picture_options),
+                unconfirmed,
+            } => self.on_key_write_failed(uris, picture_options, unconfirmed),
             Event::Scanned { style, files } => {
                 let delta = self.model.replace_catalog(style, files);
-                self.follow_catalog(style, &delta);
+                self.model.join_rounds_after_scan(style, &delta);
+                self.follow_joined_catalog(style, &delta);
             }
             Event::Fs { style, changes } => {
                 let delta = self.model.apply_changes(style, changes);
@@ -460,7 +466,11 @@ impl Turn<'_> {
         self.model.picture_options_owed = picture_options;
         self.watch_sources();
         self.adopt_keys(&gnome);
-        self.model.original_keys.get_or_insert(gnome.keys);
+        // A lost state file leaves the keys on the slots: saving those as the
+        // originals would make `restore` write the slots back.
+        if self.model.original_keys.is_none() && !self.model.names_a_slot(&gnome.keys) {
+            self.model.original_keys = Some(gnome.keys);
+        }
         self.absorb_clock_steps();
         for style in Style::ALL {
             self.first_apply(style, slots[style]);
@@ -501,17 +511,15 @@ impl Turn<'_> {
         for style in Style::ALL {
             let state = &mut self.model.styles[style];
             state.clock.absorb_clock_step(now);
-            // A refused write clears `written` before it arms `KEY_WRITE_RETRY`.
-            // That wait is not the 1s reassert and not the hidden interval.
-            let delay = if state.key.written.is_none() {
-                KEY_WRITE_RETRY
-            } else if policy == ExternalChangePolicy::ReassertNow {
+            let reassert_delay = if policy == ExternalChangePolicy::ReassertNow {
                 REASSERT_DELAY
             } else {
                 interval[style]
             };
-            if let Some(Reassert::At(due)) = &mut state.key.reassert {
-                *due = no_later_than(*due, now, delay);
+            match &mut state.key.reassert {
+                Some(Reassert::At(due)) => *due = no_later_than(*due, now, reassert_delay),
+                Some(Reassert::Retry(due)) => *due = no_later_than(*due, now, KEY_WRITE_RETRY),
+                Some(Reassert::Now | Reassert::AtNextTick) | None => {}
             }
             state.refresh_due = state
                 .refresh_due
@@ -597,6 +605,11 @@ impl Turn<'_> {
     /// waited for an image gets one.
     fn follow_catalog(&mut self, changed: Style, delta: &CatalogDelta) {
         self.model.join_rounds(changed, delta);
+        self.follow_joined_catalog(changed, delta);
+    }
+
+    /// [`Turn::follow_catalog`] once the new items have joined the rounds.
+    fn follow_joined_catalog(&mut self, changed: Style, delta: &CatalogDelta) {
         for style in Style::ALL {
             let on_screen = self.model.styles[style].current.as_ref();
             let on_screen_changed = self.model.pool(style) == Some(changed)
@@ -655,6 +668,11 @@ impl Turn<'_> {
         let Some(rotation) = self.model.take_rotation(style, item, Stage::Probing) else {
             return;
         };
+        // A reload changed `max_pixels` while the probe ran: its verdict is
+        // about a cap that no longer holds.
+        if rotation.max_pixels != self.model.config().general.max_pixels {
+            return self.probe(style, rotation.candidate, rotation.failed);
+        }
         let passed = verdict.is_ok();
         let lost_blob = match (&verdict, &rotation.candidate.version) {
             (Err(BadReason::Missing), Some(Version::Blob(remote))) => Some(remote.clone()),
@@ -805,16 +823,18 @@ impl Turn<'_> {
     /// Starts or continues a rotation: `failed` are the candidates it gave up
     /// on before this one.
     fn probe(&mut self, style: Style, candidate: Candidate, failed: Vec<ItemId>) {
+        let max_pixels = self.model.config().general.max_pixels;
         self.effects.push(Effect::Probe {
             style,
             item: candidate.id.clone(),
             path: candidate.path.clone(),
-            max_pixels: self.model.config().general.max_pixels,
+            max_pixels,
         });
         self.model.styles[style].rotation = Some(Rotation {
             candidate,
             stage: Stage::Probing,
             failed,
+            max_pixels,
         });
     }
 
@@ -913,6 +933,7 @@ impl Turn<'_> {
     /// that are due, the key write, the timer, readiness and the status.
     fn settle(&mut self) {
         self.serve_requests();
+        self.reprobe_owed_images();
         self.refresh_stale_slots();
         self.rotate_due_styles();
         self.end_reassert_waits();
@@ -922,6 +943,19 @@ impl Turn<'_> {
         self.arm_timer();
         self.signal_ready_once();
         self.report_status();
+    }
+
+    /// Probes the image on screen of every style that owes it and has
+    /// nothing in flight: an image that passed under a higher `max_pixels`
+    /// may be over the cap now.
+    fn reprobe_owed_images(&mut self) {
+        for style in Style::ALL {
+            let state = &mut self.model.styles[style];
+            if state.reprobe_owed && !state.is_busy() {
+                state.reprobe_owed = false;
+                self.publish_again(style);
+            }
+        }
     }
 
     fn rotate_due_styles(&mut self) {

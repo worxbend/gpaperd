@@ -176,6 +176,17 @@ pub(crate) enum RequestStage {
     Running { before: Option<ItemId> },
     /// Over: `Err` says why the style shows no other image.
     Finished(Result<(), String>),
+    /// Over without a rotation: the last both-style command of this
+    /// direction moved the style, and it still shows that image.
+    Carried,
+}
+
+/// What a both-style `Next` or `Previous` moved before its other style
+/// failed: each moved style with the item it showed then.
+#[derive(Debug, Clone)]
+pub(crate) struct PartialMove {
+    pub(crate) direction: Direction,
+    pub(crate) moved: Vec<(Style, Option<ItemId>)>,
 }
 
 impl Request {
@@ -206,7 +217,7 @@ impl Request {
         let mut failures = Vec::new();
         for part in &self.styles {
             match &part.stage {
-                RequestStage::Finished(Ok(())) => {}
+                RequestStage::Finished(Ok(())) | RequestStage::Carried => {}
                 RequestStage::Finished(Err(why)) => failures.push(why.as_str()),
                 RequestStage::Queued | RequestStage::Running { .. } => return None,
             }

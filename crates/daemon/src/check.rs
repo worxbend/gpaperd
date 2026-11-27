@@ -9,7 +9,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -111,11 +110,7 @@ enum Found {
 /// [`CheckError::Unusable`] when it cannot be read or does not validate, and
 /// [`CheckError::CacheUnread`] when the cache directory cannot be listed. A
 /// missing cache directory is an empty cache, not an error.
-pub fn check(
-    file: &ConfigFile,
-    cache_dir: &Path,
-    cache: &Cache,
-) -> Result<Report, CheckError> {
+pub fn check(file: &ConfigFile, cache_dir: &Path, cache: &Cache) -> Result<Report, CheckError> {
     let config = match file.load() {
         Ok(Some(config)) => config,
         Ok(None) => return Err(CheckError::Missing(file.path.clone())),
@@ -126,10 +121,12 @@ pub fn check(
             });
         }
     };
-    // `Cache::load` maps every listing error to an empty set. A missing
-    // directory stays empty; any other error must not become "not cached".
-    list_cache_dir(cache_dir)?;
-    let cached: BTreeSet<Url> = cache.load().into_iter().map(|blob| blob.url).collect();
+    let cached: BTreeSet<Url> = cache
+        .load()
+        .map_err(|error| cache_unread(cache_dir, error))?
+        .into_iter()
+        .map(|blob| blob.url)
+        .collect();
     let styles = PerStyle::from_fn(|style| {
         config.styles[style]
             .sources
@@ -172,22 +169,6 @@ fn distinct_images(files: &[LocalFile]) -> usize {
         .map(|file| file.stamp.id)
         .collect::<BTreeSet<_>>()
         .len()
-}
-
-/// Lists `dir` the way the cache load does. A missing directory is empty.
-/// Any other error is [`CheckError::CacheUnread`], because load would hide it.
-fn list_cache_dir(dir: &Path) -> Result<(), CheckError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(cache_unread(dir, error)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| cache_unread(dir, error))?;
-        // `file_type` is part of the listing `Cache::load` hides on error.
-        let _ = entry.file_type().map_err(|error| cache_unread(dir, error))?;
-    }
-    Ok(())
 }
 
 fn cache_unread(dir: &Path, reason: io::Error) -> CheckError {

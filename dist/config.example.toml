@@ -8,6 +8,8 @@
 # is shown at once, even offline, and checked again in the background; no
 # rotation waits for the network. Downloads go through HTTP(S)_PROXY when it
 # is set. GNOME's own proxy settings are not read.
+# A URL whose host is a loopback, unspecified (0.0.0.0, [::]), private or
+# link-local IP address is not fetched and not retried; use a host name.
 
 [general]
 interval = "15m"                 # 1m ..= 1h
@@ -18,7 +20,7 @@ rotate_hidden = false            # rotate the style that is not on screen
 empty_style = "use-other-style"  # or "keep-current"
 remote_refresh = "startup"       # check http(s) sources for a new version:
                                  # "startup": once per daemon start
-                                 # a duration like "24h": at start, then that often
+                                 # a duration of 1h or more, like "24h": at start, then that often
                                  # "never": only download what is not cached
 link = true                      # hardlink or reflink when possible; false = always copy
 apply_mode = "slots"             # "slots": rotate two slot files, keys written once

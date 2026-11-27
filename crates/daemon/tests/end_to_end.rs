@@ -31,8 +31,8 @@ mod world;
 
 use std::fs;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpaperd_core::config::Config;
@@ -398,8 +398,14 @@ fn io_on_an_existing_state_file_fails_startup_and_leaves_the_file() {
 
         let started = Interpreter::start(None, world.paths(), SEED, ports).await;
 
-        assert!(started.is_err(), "I/O on an existing state file must fail start");
-        assert_eq!(fs::read(state_file.join("marker")).expect("the marker"), b"stay");
+        assert!(
+            started.is_err(),
+            "I/O on an existing state file must fail start"
+        );
+        assert_eq!(
+            fs::read(state_file.join("marker")).expect("the marker"),
+            b"stay"
+        );
     });
 }
 
@@ -415,7 +421,7 @@ fn a_corrupt_state_file_lets_start_succeed_and_leaves_the_bytes() {
 
         let started = Interpreter::start(None, world.paths(), SEED, ports).await;
 
-        assert!(started.is_ok(), "{started:?}");
+        assert!(started.is_ok(), "{:?}", started.as_ref().err());
         assert_eq!(fs::read(&state_file).expect("the state file"), b"not json");
     });
 }
@@ -503,17 +509,12 @@ fn a_failed_shutdown_disarm_still_saves() {
 fn a_url_only_style_does_not_warn_that_no_local_image_was_found() {
     scenario(async {
         let world = World::new();
-        let text = world.config_text_with_light_sources(
-            ALPHABETICAL,
-            &["https://images.example/wall.jpg"],
-        );
+        let text = world
+            .config_text_with_light_sources(ALPHABETICAL, &["https://images.example/wall.jpg"]);
         world.save_config_file(&text);
         let mut daemon = world.start_daemon_from_config_file(SEED);
         daemon.ready().await;
-        eventually("both scans", || {
-            world.times_logged("sources scanned") == 2
-        })
-        .await;
+        eventually("both scans", || world.times_logged("sources scanned") == 2).await;
 
         assert!(
             !world.logged("no image found"),
@@ -536,10 +537,8 @@ fn a_daemon_without_the_bus_name_does_not_sweep_the_cache() {
         // A listed URL makes Ready wait for the cache, so the sweep decision
         // is already logged when ready returns. The planted blob is not that
         // URL: a sweep would be allowed to delete it.
-        let text = world.config_text_with_light_sources(
-            ALPHABETICAL,
-            &["https://images.example/other.jpg"],
-        );
+        let text = world
+            .config_text_with_light_sources(ALPHABETICAL, &["https://images.example/other.jpg"]);
         world.save_config_file(&text);
         let mut daemon = world.start_daemon_from_config_file(SEED);
         daemon.ready().await;
@@ -557,10 +556,8 @@ fn a_daemon_that_owns_the_bus_name_does_not_skip_the_sweep() {
         let world = World::new();
         let planted = Url::parse("https://images.example/wall.jpg").expect("a URL");
         world.cache_remote_image(&planted, "kept", "etag").await;
-        let text = world.config_text_with_light_sources(
-            ALPHABETICAL,
-            &["https://images.example/other.jpg"],
-        );
+        let text = world
+            .config_text_with_light_sources(ALPHABETICAL, &["https://images.example/other.jpg"]);
         world.save_config_file(&text);
         let mut daemon = world.start_daemon_on_bus(bus.address(), SEED).await;
         daemon.ready().await;

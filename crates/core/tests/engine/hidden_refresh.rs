@@ -278,3 +278,59 @@ fn a_clock_that_goes_back_does_not_delay_the_refresh() {
     assert_eq!(armed(&at_clock_step), [Some(refresh_after(100))]);
     assert_eq!(republished(&at_refresh), [Style::Dark]);
 }
+
+/// Starts dark's refresh at a switch at second 300, then takes dark off the
+/// screen and back before the republish is answered.
+fn refresh_dark_and_switch_away_and_back(world: &mut World) {
+    world.run(at(300), switch_to(Style::Dark));
+    let refreshing = step(&mut world.model, refresh_after(300), DEADLINE);
+    assert_eq!(republished(&refreshing), [Style::Dark]);
+    let away = refresh_after(300) + Duration::from_millis(100);
+    step(&mut world.model, away, switch_to(Style::Light));
+    step(
+        &mut world.model,
+        away + Duration::from_millis(100),
+        switch_to(Style::Dark),
+    );
+}
+
+/// The write may have landed while dark was hidden, so the shell may still
+/// show the old texture.
+#[test]
+fn a_switch_back_during_a_refresh_refreshes_again_after_it() {
+    let mut world = running_world();
+    refresh_dark_and_switch_away_and_back(&mut world);
+    let refreshed = Event::Republished {
+        style: Style::Dark,
+        result: Ok(SlotWrite {
+            method: Method::Copy,
+            slot: FileId { dev: 2, ino: 77 },
+        }),
+    };
+
+    let after_refresh = step(&mut world.model, at(301), refreshed);
+    let is_dirty_after_refresh = is_dirty(&world, Style::Dark);
+    let later = world.run(at(302), DEADLINE);
+
+    assert!(republished(&after_refresh).is_empty());
+    assert!(is_dirty_after_refresh);
+    assert_eq!(republished(&later), [Style::Dark]);
+    assert!(!is_dirty(&world, Style::Dark));
+}
+
+#[test]
+fn a_switch_back_during_a_failed_refresh_does_not_try_it_again() {
+    let mut world = running_world();
+    refresh_dark_and_switch_away_and_back(&mut world);
+    let failed = Event::Republished {
+        style: Style::Dark,
+        result: Err("No space left on device".to_owned()),
+    };
+
+    let after_failure = step(&mut world.model, at(301), failed);
+    let later = world.run(at(302), DEADLINE);
+
+    assert!(republished(&after_failure).is_empty());
+    assert!(republished(&later).is_empty());
+    assert!(!is_dirty(&world, Style::Dark));
+}

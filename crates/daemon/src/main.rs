@@ -44,9 +44,10 @@ const EXIT_CONFIG: u8 = 78;
 /// Any other failure. systemd restarts the service after it.
 const EXIT_FAILURE: u8 = 1;
 
-/// How long systemd waits for `READY=1` once the first apply begins: five
-/// minutes. The unit's `TimeoutStartSec` alone would fail a start whose
-/// first image comes from a slow network mount.
+/// How long systemd waits for `READY=1` once the GNOME session is opened:
+/// five minutes. The unit's `TimeoutStartSec` alone would fail a start whose
+/// session bus is slow to answer, or whose first image comes from a slow
+/// network mount.
 const FIRST_APPLY_ALLOWANCE_USEC: u32 = 5 * 60 * 1_000_000;
 
 /// Rotates the wallpapers of GNOME's light and dark styles.
@@ -83,12 +84,13 @@ enum Failure {
 impl Failure {
     fn exit_code(&self) -> u8 {
         match self {
-            // I/O on a file that exists can clear. Exit 1 so systemd restarts.
-            // 78 stays in RestartPreventExitStatus for a config that is invalid.
+            // Most I/O on a file that exists can clear. Exit 1 so systemd restarts.
+            // Bytes that are not UTF-8 (InvalidData) never clear: they fall through
+            // to 78, which stays in RestartPreventExitStatus, as check-config does.
             Failure::Config {
-                reason: LoadError::Io(_),
+                reason: LoadError::Io(error),
                 ..
-            } => EXIT_FAILURE,
+            } if error.kind() != io::ErrorKind::InvalidData => EXIT_FAILURE,
             Failure::Config { .. } => EXIT_CONFIG,
             Failure::NotGnome(_) => EXIT_UNAVAILABLE,
             Failure::Other(_) => EXIT_FAILURE,
@@ -102,7 +104,9 @@ impl From<GnomeError> for Failure {
             GnomeError::SchemaMissing { .. } | GnomeError::VolatileBackend { .. } => {
                 Failure::NotGnome(error)
             }
-            GnomeError::Write { .. } | GnomeError::Stopped => Failure::Other(error.into()),
+            GnomeError::Write { .. } | GnomeError::NoAnswer | GnomeError::Stopped => {
+                Failure::Other(error.into())
+            }
         }
     }
 }
@@ -223,6 +227,9 @@ async fn serve(
     let shutdown = stop_request().context("cannot listen for termination signals")?;
     let mut shutdown = pin!(shutdown);
     let (gnome_sender, gnome_events) = mpsc::unbounded_channel();
+    // Before `GnomeThread::spawn`: its bounded session-bus open alone may
+    // outlast the unit's `TimeoutStartSec`.
+    notify_systemd(&[NotifyState::ExtendTimeoutUsec(FIRST_APPLY_ALLOWANCE_USEC)]);
     let ports = Ports {
         gnome: GnomeThread::spawn(gnome_sender)?,
         clock: WallTimer::new().context("cannot create the wall-clock timer")?,
@@ -231,7 +238,6 @@ async fn serve(
         control,
         screen_lock,
     };
-    notify_systemd(&[NotifyState::ExtendTimeoutUsec(FIRST_APPLY_ALLOWANCE_USEC)]);
     let start = Interpreter::start(config, paths, seed_from_clock(), ports);
     let started = tokio::select! {
         interpreter = start => Some(interpreter.context("cannot start")?),
@@ -417,6 +423,16 @@ mod tests {
     }
 
     #[test]
+    fn a_config_file_that_is_not_utf8_exits_78_like_check_config() {
+        let (_dir, paths) = paths_in_temp_dir();
+        fs::write(&paths.config_file, b"\xff").expect("write the config");
+
+        let failure = load_config(&config_file(&paths)).expect_err("0xff is not UTF-8");
+
+        assert_eq!(failure.exit_code(), 78);
+    }
+
+    #[test]
     fn relative_source_resolves_against_the_real_config_file() {
         let (dir, mut paths) = paths_in_temp_dir();
         let dotfiles = dir.path().join("dotfiles");
@@ -472,6 +488,11 @@ mod tests {
     #[test]
     fn a_dead_settings_thread_is_an_ordinary_failure() {
         assert_eq!(Failure::from(GnomeError::Stopped).exit_code(), 1);
+    }
+
+    #[test]
+    fn settings_that_do_not_answer_are_an_ordinary_failure() {
+        assert_eq!(Failure::from(GnomeError::NoAnswer).exit_code(), 1);
     }
 
     #[test]

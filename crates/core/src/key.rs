@@ -14,6 +14,9 @@ pub(crate) struct KeyState {
     /// The URI that the daemon put in the key, as far as this run knows.
     /// `None` while the key is still the user's.
     pub(crate) written: Option<String>,
+    /// What `written` was before the last write: what the key still holds
+    /// when GNOME refuses that write.
+    pub(crate) before_write: Option<String>,
     /// Why the style idles.
     pub(crate) pause: Option<Pause>,
     /// Something else changed the key, and the daemon is to write it back.
@@ -33,6 +36,10 @@ pub(crate) enum Reassert {
     Now,
     /// At this instant.
     At(SystemTime),
+    /// At this instant, because the last key write did not land. The key
+    /// holds `before_write` meanwhile: another value of it is an external
+    /// change.
+    Retry(SystemTime),
     /// When the next rotation of any style is due.
     AtNextTick,
 }
@@ -50,7 +57,11 @@ impl KeyState {
     /// Whether something else changed the key after the daemon wrote it,
     /// and the daemon has not written it back.
     pub(crate) fn is_foreign(&self) -> bool {
-        self.pause == Some(Pause::ExternalChange) || self.reassert.is_some()
+        let reasserts = matches!(
+            self.reassert,
+            Some(Reassert::Now | Reassert::At(_) | Reassert::AtNextTick)
+        );
+        self.pause == Some(Pause::ExternalChange) || reasserts
     }
 
     /// Whether the key cannot show the style in this run. The daemon then
@@ -71,12 +82,20 @@ impl KeyState {
 
     /// What it means that the key holds `value` now. `None` when that
     /// changes nothing: the key was never the daemon's in this run, or it is
-    /// as the daemon knew it.
+    /// as the daemon knew it. During a retry the key may still hold what it
+    /// held before the write, which is no news. The daemon's URI is
+    /// `Returned` then: an unconfirmed write landed late, so the retry is
+    /// called off.
     pub(crate) fn change(&self, value: &str) -> Option<KeyChange> {
         let written = self.written.as_deref()?;
+        let is_retry = matches!(self.reassert, Some(Reassert::Retry(_)));
+        if is_retry && self.before_write.as_deref() == Some(value) {
+            return None;
+        }
         match (self.is_foreign(), value == written) {
             (false, false) => Some(KeyChange::Taken),
             (true, true) => Some(KeyChange::Returned),
+            (false, true) if is_retry => Some(KeyChange::Returned),
             (false, true) | (true, false) => None,
         }
     }
@@ -86,14 +105,14 @@ impl KeyState {
         match (self.pause, self.reassert) {
             (Some(_), _) => false,
             (None, Some(Reassert::Now)) => true,
-            (None, Some(Reassert::At(_) | Reassert::AtNextTick)) => false,
+            (None, Some(Reassert::At(_) | Reassert::Retry(_) | Reassert::AtNextTick)) => false,
             (None, None) => self.written.as_deref() != Some(wanted),
         }
     }
 
     /// Records that the daemon wrote `uri` to the key.
     pub(crate) fn record_write(&mut self, uri: String) {
-        self.written = Some(uri);
+        self.before_write = self.written.replace(uri);
         self.reassert = None;
     }
 
@@ -199,6 +218,27 @@ mod tests {
 
         assert_eq!(key.change("file:///other.jpg"), None);
         assert_eq!(key.change("file:///slot"), Some(KeyChange::Returned));
+    }
+
+    #[test]
+    fn a_key_waiting_for_a_retry_can_be_taken_and_landed() {
+        let mut key = written("file:///slot");
+        key.reassert = Some(Reassert::Retry(at(60)));
+
+        assert_eq!(key.change("file:///picked.jpg"), Some(KeyChange::Taken));
+        assert_eq!(key.change("file:///slot"), Some(KeyChange::Returned));
+        assert!(!key.owes("file:///slot"));
+    }
+
+    #[test]
+    fn a_key_waiting_for_a_retry_still_holds_what_it_held_before() {
+        let mut key = written("file:///before");
+        key.record_write("file:///refused".to_owned());
+        key.written = key.before_write.clone();
+        key.reassert = Some(Reassert::Retry(at(60)));
+
+        assert_eq!(key.change("file:///before"), None);
+        assert_eq!(key.change("file:///picked.jpg"), Some(KeyChange::Taken));
     }
 
     #[test]

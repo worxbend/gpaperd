@@ -477,6 +477,7 @@ fn a_planned_key_write_does_not_announce_the_image() {
                 dark: None,
             },
             picture_options: None,
+            unconfirmed: false,
         },
     );
 
@@ -511,4 +512,74 @@ fn next_is_not_done_before_the_uri_key_write() {
         item: id("/l/b.jpg"),
     }));
     assert_eq!(the_reply(&landed), &Reply::Done);
+}
+
+/// GNOME refused the write of `/l/b.jpg` to the light key.
+fn light_b_refused() -> Event {
+    Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: Some("file:///l/b.jpg".to_owned()),
+            dark: None,
+        },
+        picture_options: None,
+        unconfirmed: false,
+    }
+}
+
+/// A uri-mode daemon whose write of `/l/b.jpg` to the light key, planned at
+/// second 901 after `rotate` at second 900, was refused at second 902. The
+/// key still holds `/l/a.jpg`.
+fn light_b_write_refused(mut world: World, rotate: Event) -> World {
+    step(&mut world.model, at(900), rotate);
+    let planned = step(
+        &mut world.model,
+        at(901),
+        probe_passed(Style::Light, "/l/b.jpg"),
+    );
+    assert!(planned.iter().any(is_set_keys));
+    step(&mut world.model, at(902), light_b_refused());
+    world
+}
+
+#[test]
+fn a_user_change_while_a_refused_uri_write_waits_is_an_external_change() {
+    let mut world = light_b_write_refused(running_in_uri_mode(), DEADLINE);
+
+    world.set_key(at(910), Style::Light, PICKED);
+    let at_retry = world.run(at(962), DEADLINE);
+
+    assert!(world.model.persisted().styles[Style::Light].paused);
+    assert!(keys_written(&at_retry).is_empty());
+    assert_eq!(world.keys.picture_uri, PICKED);
+}
+
+#[test]
+fn a_report_of_the_unchanged_key_does_not_pull_a_refused_write_forward() {
+    let mut world = light_b_write_refused(running_in_uri_mode(), DEADLINE);
+
+    let report = world.run(at(910), keys_changed(world.keys.clone()));
+    let at_retry = world.run(at(962), DEADLINE);
+
+    assert!(keys_written(&report).is_empty());
+    assert_eq!(
+        keys_written(&at_retry),
+        one_write(Some("file:///l/b.jpg"), None)
+    );
+}
+
+#[test]
+fn a_refused_write_of_a_user_paused_style_is_still_tried_again() {
+    let mut world = running_in_uri_mode();
+    world.ask(at(100), 1, Command::Pause(StyleTarget::Light));
+    let next = control(2, Command::Next(StyleTarget::Light));
+    let mut world = light_b_write_refused(world, next);
+
+    let saved = world.model.persisted().styles.light;
+    let at_retry = world.run(at(962), DEADLINE);
+
+    assert_eq!(saved.key_uri.as_deref(), Some("file:///l/a.jpg"));
+    assert_eq!(
+        keys_written(&at_retry),
+        one_write(Some("file:///l/b.jpg"), None)
+    );
 }

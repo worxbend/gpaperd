@@ -228,7 +228,7 @@ pub struct CatalogDelta {
 /// Invariant: no two items share a [`FileId`], so symlinks, hardlinks and
 /// overlapping folders count once. Of the paths to one file, the smallest id
 /// is the item, whatever order the files were found in. Its stamp is the
-/// greatest [`FileStamp`] those paths showed (id, then size, then mtime),
+/// newest one those paths showed: a later mtime wins and size breaks ties,
 /// so a newer hard link is not dropped while a stale path stays the item.
 /// A catalog that followed changes equals one built from a scan of the same
 /// files.
@@ -257,7 +257,7 @@ impl Catalog {
     ///
     /// The id is the path text when the path is UTF-8. A non-UTF-8 path is
     /// skipped. When several paths share a [`FileId`], the smallest id is
-    /// the item and it keeps the greatest stamp seen for that file. A path
+    /// the item and it keeps the newest stamp seen for that file. A path
     /// listed twice keeps the greatest stamp.
     pub fn from_local_files(files: Vec<LocalFile>) -> Catalog {
         let mut catalog = Catalog::default();
@@ -448,9 +448,9 @@ fn forget_local(files: &mut BTreeMap<ItemId, LocalFile>, path: &Path) {
 
 /// The smallest id of each inode, and every other path.
 ///
-/// The item keeps the greatest stamp among those paths. [`FileStamp`] order
-/// is id, then size, then mtime: a later mtime on a hard link replaces a
-/// stale item, and a smaller size does not.
+/// The item keeps the newest stamp among those paths. The [`FileId`] is the
+/// same for all of them, so a later mtime wins and size breaks ties: an edit
+/// that shrank the file outranks a stale, larger path to it.
 fn winners_and_aliases(
     files: BTreeMap<ItemId, LocalFile>,
 ) -> (BTreeMap<ItemId, LocalFile>, BTreeMap<ItemId, LocalFile>) {
@@ -459,7 +459,7 @@ fn winners_and_aliases(
     for (id, file) in files {
         match by_file.get_mut(&file.stamp.id) {
             Some((_, kept)) => {
-                if file.stamp > kept.stamp {
+                if (file.stamp.mtime, file.stamp.size) > (kept.stamp.mtime, kept.stamp.size) {
                     kept.stamp = file.stamp;
                 }
                 aliases.insert(id, file);
@@ -469,6 +469,6 @@ fn winners_and_aliases(
             }
         }
     }
-    let winners = by_file.into_iter().map(|(_, winner)| winner).collect();
+    let winners = by_file.into_values().collect();
     (winners, aliases)
 }

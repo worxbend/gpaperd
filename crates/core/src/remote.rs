@@ -44,7 +44,8 @@ struct UrlState {
     revalidated_at: Option<SystemTime>,
     /// The backoff after a failed fetch, until the next answer.
     retry: Option<Retry>,
-    /// The last answer was `404` or `410`.
+    /// The last answer cannot bring a blob: `404`, `410`, or a refusal of a
+    /// URL with no blob.
     is_gone: bool,
     /// The blob was lost while a fetch was in flight. That fetch may have
     /// asked for a `304` against the lost blob, so it does not bring the
@@ -181,7 +182,10 @@ impl Remotes {
         }
         state.retry = None;
         state.revalidated_at = Some(now);
-        state.is_gone = outcome == FetchOutcome::Gone;
+        // A `NotModified` with no blob to keep is a refusal (`401`, `403`,
+        // not an image, too large): no fetch brings an image without a retry.
+        state.is_gone = outcome == FetchOutcome::Gone
+            || (outcome == FetchOutcome::NotModified && !refetch && !self.blobs.contains_key(url));
         match outcome {
             FetchOutcome::Stored { blob } => {
                 self.blobs.insert(url.clone(), blob.clone()) != Some(blob)

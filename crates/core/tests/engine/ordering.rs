@@ -277,7 +277,7 @@ fn a_cache_load_before_the_scan_does_not_queue_what_the_round_showed() {
     bag.insert([cached.clone()], &mut rng(1));
 
     assert!(!bag.knows_shown());
-    bag.insert(
+    bag.scanned(
         [
             id("/l/1.jpg"),
             id("/l/2.jpg"),
@@ -304,7 +304,10 @@ fn the_on_screen_id_omitted_from_the_scan_is_not_queued_again() {
     let current = id("/l/3.jpg");
     let mut bag = ShuffleBag::restore_queue_only(vec![id("/l/1.jpg"), id("/l/2.jpg")]);
     bag.insert([id("https://cdn.example/a.jpg")], &mut rng(1));
-    bag.insert([id("/l/1.jpg"), id("/l/2.jpg"), id("/l/4.jpg")], &mut rng(1));
+    bag.scanned(
+        [id("/l/1.jpg"), id("/l/2.jpg"), id("/l/4.jpg")],
+        &mut rng(1),
+    );
     let images = catalog(&["/l/1.jpg", "/l/2.jpg", "/l/3.jpg", "/l/4.jpg"]);
 
     bag.draw(&images, Some(&current), &[], &mut rng(1));
@@ -318,11 +321,43 @@ fn the_on_screen_id_omitted_from_the_scan_is_not_queued_again() {
 fn a_scan_of_queued_files_still_ends_the_unknown_shown_state() {
     let mut bag = ShuffleBag::restore_queue_only(vec![id("/l/1.jpg"), id("/l/2.jpg")]);
 
-    bag.insert([id("/l/1.jpg"), id("/l/2.jpg")], &mut rng(1));
+    bag.scanned([id("/l/1.jpg"), id("/l/2.jpg")], &mut rng(1));
 
     assert!(bag.knows_shown());
     bag.insert([id("/l/new.jpg")], &mut rng(1));
     assert_eq!(bag.queue().count(), 3);
+}
+
+#[test]
+fn a_scan_with_no_new_file_ends_the_unknown_shown_state() {
+    let mut bag = ShuffleBag::restore_queue_only(vec![id("https://cdn.example/a.jpg")]);
+
+    bag.scanned([], &mut rng(1));
+
+    assert!(bag.knows_shown());
+    bag.insert([id("/l/new.jpg")], &mut rng(1));
+    assert!(bag.queue().any(|queued| queued == &id("/l/new.jpg")));
+    assert_eq!(bag.shown().count(), 0);
+}
+
+#[test]
+fn a_local_file_before_the_scan_is_not_taken_for_the_scan() {
+    let mut bag = ShuffleBag::restore_queue_only(vec![id("https://cdn.example/a.jpg")]);
+
+    bag.insert([id("/l/new.jpg")], &mut rng(1));
+
+    assert!(!bag.knows_shown());
+    assert!(bag.queue().any(|queued| queued == &id("/l/new.jpg")));
+}
+
+#[test]
+fn a_scan_of_a_known_round_adds_its_new_files() {
+    let mut bag = ShuffleBag::from_queue(vec![id("/l/1.jpg")]);
+
+    bag.scanned([id("/l/1.jpg"), id("/l/2.jpg")], &mut rng(1));
+
+    assert_eq!(bag.queue().count(), 2);
+    assert_eq!(bag.shown().count(), 0);
 }
 
 #[test]
@@ -432,6 +467,33 @@ fn a_url_sorts_by_its_last_path_segment() {
     assert_eq!(
         compare_ids(&id("/pics/#trip/img10.png"), &id("/pics/#trip/img2.png")),
         Ordering::Greater
+    );
+}
+
+#[test]
+fn a_local_name_keeps_its_question_mark_and_hash() {
+    assert_eq!(
+        compare_ids(&id("/w/wall#2.jpg"), &id("/w/wall#10.jpg")),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_ids(&id("/w/a.png"), &id("/w/#1.png")),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare_ids(&id("/w/shot?2.png"), &id("/w/shot?10.png")),
+        Ordering::Less
+    );
+}
+
+#[test]
+fn a_slash_in_a_url_query_is_not_the_name() {
+    assert_eq!(
+        compare_ids(
+            &id("https://h/img/apple.jpg?src=/z"),
+            &id("https://h/img/banana.jpg?src=/a"),
+        ),
+        Ordering::Less
     );
 }
 

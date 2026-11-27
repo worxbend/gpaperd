@@ -13,9 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpaperd_core::catalog::{BadReason, FileId, FsChange, ItemId, LocalFile};
-use gpaperd_core::config::{
-    ApplyMode, Config, ConfigError, PictureOptions, RemoteRefresh, Source,
-};
+use gpaperd_core::config::{ApplyMode, Config, ConfigError, PictureOptions, RemoteRefresh, Source};
 use gpaperd_core::control::ReplyId;
 use gpaperd_core::event::{
     BackgroundKeys, Connectivity, Effect, Event, FetchOutcome, Fired, GnomeEvent, Method,
@@ -277,12 +275,13 @@ fn any_event() -> impl Strategy<Value = Event> {
                 Err("the key is locked".to_owned())
             },
         }),
-        1 => (any_failed_uris(), any_picture_options()).prop_map(|(uris, picture_options)| {
-            Event::KeyWriteFailed {
+        1 => (any_failed_uris(), any_picture_options(), any::<bool>()).prop_map(
+            |(uris, picture_options, unconfirmed)| Event::KeyWriteFailed {
                 uris,
                 picture_options,
+                unconfirmed,
             }
-        }),
+        ),
         1 => Just(Event::Shutdown),
     ]
 }
@@ -395,7 +394,8 @@ proptest! {
 
     /// What the daemon saves is enough to restore it over the same files:
     /// each slot's image and clock, and the shuffle round in its order.
-    /// Only an image that the round neither holds nor showed joins it.
+    /// Only an image that the round neither holds nor showed joins it. A
+    /// local image that no catalog holds any more leaves the round.
     #[test]
     fn saved_state_survives_a_round_trip(scenario in scenario()) {
         let mut daemon = Daemon::boot(&scenario)?;
@@ -404,6 +404,17 @@ proptest! {
         }
         let saved = daemon.model.persisted();
         let files = PerStyle::from_fn(|style| Some(local_files(&daemon.scan(style))));
+        let on_disk: Vec<PathBuf> = Style::ALL
+            .into_iter()
+            .flat_map(|style| files[style].iter().flatten())
+            .map(|file| file.path.clone())
+            .collect();
+        let is_known = |item: &ItemId| {
+            let id = item.as_str();
+            id.starts_with("https://")
+                || id.starts_with("http://")
+                || on_disk.iter().any(|path| path.as_os_str() == id)
+        };
 
         let restored = new_model(&daemon.config, files, 0, Some(saved.clone())).persisted();
 
@@ -415,7 +426,8 @@ proptest! {
                 ..state.clone()
             };
             prop_assert_eq!(without_bag(is), without_bag(was));
-            prop_assert!(is_subsequence(&was.bag, &is.bag), "the {style} round changed");
+            let kept: Vec<ItemId> = was.bag.iter().filter(|item| is_known(item)).cloned().collect();
+            prop_assert!(is_subsequence(&kept, &is.bag), "the {style} round changed");
             let joined = is.bag.iter().filter(|item| !was.bag.contains(item));
             for item in joined {
                 let was_shown = was.shown.as_ref().is_some_and(|shown| shown.contains(item));

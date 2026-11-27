@@ -1,4 +1,4 @@
-.TH GPAPERD.TOML 5 2026-11-14 "gpaperd 0.1.0" "File Formats"
+.TH GPAPERD.TOML 5 2026-11-27 "gpaperd 0.1.1" "File Formats"
 .SH NAME
 gpaperd.toml \- gpaperd configuration file
 .SH SYNOPSIS
@@ -150,6 +150,15 @@ A remote image, downloaded into
 .IR $XDG_CACHE_HOME/gpaperd/remote .
 A cached copy is shown at once, even offline, and revalidated in the
 background.
+A URL whose host is a loopback, unspecified
+.RB ( 0.0.0.0 ", " [::] ),
+private or link-local IP address is not fetched and not retried; use a
+host name.
+A redirect to such an address, or from https to http, is not followed.
+A URL refused that way, or answered with 401, 403, a non-image or an
+oversized body, keeps its cached copy; with nothing cached it counts as
+gone for
+.BR empty_style .
 .TP
 .B file://\fR...\fP
 A percent-decoded absolute path on this machine.
@@ -201,6 +210,8 @@ in any case.
 Each image is still checked before use, by its magic bytes and a decode in
 glycin's sandbox.
 A file reached through two sources, a symlink or a hardlink counts once.
+A file whose name is not valid UTF-8 is skipped with the scan warning
+.IR "file name is not UTF-8" .
 .SH PATHS
 A leading
 .B \(ti

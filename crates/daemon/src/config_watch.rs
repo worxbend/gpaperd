@@ -12,13 +12,13 @@ use std::future;
 use std::io;
 use std::panic;
 use std::path::{self, Path, PathBuf};
-use std::thread;
 use std::time::Duration;
 
 use gpaperd_core::config::{Config, ConfigError, ParseContext};
 use notify::event::AccessKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::sleep;
 
 /// How long the config file must be quiet before a change is loaded. One save
@@ -117,10 +117,19 @@ pub struct ConfigWatch {
     /// A change was seen, and what loading gave after it was not returned
     /// yet. It outlives a cancelled [`ConfigWatch::reloaded`].
     change_seen: bool,
-    /// Thread that last walked the config path. The walk has to leave the
-    /// runtime thread; tests check this is not that thread.
-    #[cfg(test)]
-    walked_on: Option<thread::ThreadId>,
+    /// The blocking task that a reload started and that has not finished.
+    /// It outlives a cancelled [`ConfigWatch::reloaded`], so the next call
+    /// waits for it instead of starting another one.
+    pending: Option<Stage>,
+}
+
+/// A reload's blocking task, in the order a reload runs them.
+#[derive(Debug)]
+enum Stage {
+    /// Works out the names to watch: [`names_to_watch`].
+    Walk(JoinHandle<io::Result<Vec<PathBuf>>>),
+    /// Loads the file: [`ConfigFile::load`].
+    Load(JoinHandle<Result<Option<Config>, LoadError>>),
 }
 
 impl ConfigWatch {
@@ -148,8 +157,7 @@ impl ConfigWatch {
             events,
             watched_names: Vec::new(),
             change_seen: false,
-            #[cfg(test)]
-            walked_on: None,
+            pending: None,
         };
         watch.watch_names();
         watch
@@ -172,8 +180,41 @@ impl ConfigWatch {
     /// change like any other.
     ///
     /// Waits forever when nothing changes. Cancel-safe: a change that is seen
-    /// while nobody waits is returned by the next call.
+    /// while nobody waits is returned by the next call, and a walk or load
+    /// that was started is waited for by the next call, not started again.
     pub async fn reloaded(&mut self) -> Result<Option<Config>, LoadError> {
+        loop {
+            match &mut self.pending {
+                None => {
+                    self.settle().await;
+                    // Before the load: a change that comes after it must find
+                    // the watch. The walk is blocking work, like the load.
+                    let path = self.file.path.clone();
+                    let walk = tokio::task::spawn_blocking(move || names_to_watch(&path));
+                    self.pending = Some(Stage::Walk(walk));
+                }
+                Some(Stage::Walk(walk)) => {
+                    let names = finished(walk.await);
+                    if let Some(names) = self.kept_names(names) {
+                        self.apply_names(names);
+                    }
+                    let file = self.file.clone();
+                    let load = tokio::task::spawn_blocking(move || file.load());
+                    self.pending = Some(Stage::Load(load));
+                }
+                Some(Stage::Load(load)) => {
+                    let loaded = finished(load.await);
+                    self.pending = None;
+                    self.change_seen = false;
+                    return loaded;
+                }
+            }
+        }
+    }
+
+    /// Waits for a change, then until the file was quiet for
+    /// [`RELOAD_DEBOUNCE`].
+    async fn settle(&mut self) {
         if !self.change_seen {
             self.next_change().await;
             self.change_seen = true;
@@ -190,35 +231,6 @@ impl ConfigWatch {
             }
             tokio::task::yield_now().await;
         }
-        // Before the load: a change that comes after it must find the watch.
-        // The walk is the blocking work this function already moves off the
-        // runtime for the load.
-        let path = self.file.path.clone();
-        let (names, walked_on) = tokio::task::spawn_blocking(move || {
-            let walked_on = thread::current().id();
-            (names_to_watch(&path), walked_on)
-        })
-        .await
-        .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()));
-        #[cfg(test)]
-        {
-            self.walked_on = Some(walked_on);
-        }
-        #[cfg(not(test))]
-        {
-            let _ = walked_on;
-        }
-        if let Some(names) = self.kept_names(names) {
-            self.apply_names(names);
-        }
-        let file = self.file.clone();
-        let loaded = tokio::task::spawn_blocking(move || file.load())
-            .await
-            // Only a panic ends that task early. A panic is a defect: pass
-            // it on.
-            .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()));
-        self.change_seen = false;
-        loaded
     }
 
     /// Waits for the next event that can mean another config. Waits forever
@@ -252,8 +264,9 @@ impl ConfigWatch {
 
     /// Works out again which names to watch, and watches their directories.
     /// Blocking I/O, a few calls on the config file's path. [`ConfigWatch::start`]
-    /// calls this on its own thread. [`ConfigWatch::reloaded`] walks on the
-    /// blocking pool and then applies the names here.
+    /// calls this on the caller's thread, which is the runtime thread at
+    /// startup. Only [`ConfigWatch::reloaded`] walks on the blocking pool and
+    /// then applies the names here.
     fn watch_names(&mut self) {
         if self.watcher.is_none() {
             return;
@@ -347,6 +360,12 @@ fn names_to_watch(file: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(names)
 }
 
+/// What a blocking task gave. Only a panic ends one early. A panic is a
+/// defect: pass it on.
+fn finished<T>(joined: Result<T, JoinError>) -> T {
+    joined.unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()))
+}
+
 /// The components of `path`, the last one first: `pop` gives the next step
 /// on the way.
 fn steps_reversed(path: &Path) -> Vec<OsString> {
@@ -362,6 +381,7 @@ mod tests {
 
     use std::future::Future;
     use std::task::{Context, Waker};
+    use std::thread;
 
     use notify::event::CreateKind;
 
@@ -498,7 +518,6 @@ mod tests {
         fs::write(&path, "[light]\ninterval = \"1m\"\n").expect("write config");
         let mut watch = ConfigWatch::start(config_at(&root, path));
         watch.change_seen = true;
-        let runtime = thread::current().id();
 
         let loaded = tokio::time::timeout(Duration::from_secs(5), watch.reloaded())
             .await
@@ -506,7 +525,38 @@ mod tests {
             .expect("load");
 
         assert!(loaded.is_some());
-        assert_ne!(watch.walked_on.expect("the walk was recorded"), runtime);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_reload_resumes_the_task_it_started() {
+        let (_dir, root) = real_temp_dir();
+        let path = root.join("config.toml");
+        // Reading a FIFO blocks until a writer comes: a load that hangs.
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("create fifo");
+        let mut watch = ConfigWatch::start(config_at(&root, path.clone()));
+        watch.change_seen = true;
+
+        let cancelled = tokio::time::timeout(RELOAD_DEBOUNCE * 3, watch.reloaded()).await;
+        let kept = watch.pending.is_some();
+        // Ends the hung read, so that the runtime can shut down. Opening the
+        // FIFO waits for a reader, so it waits for the load if need be.
+        thread::spawn(move || fs::write(path, "[light]\ninterval = \"1m\"\n"));
+        let loaded = tokio::time::timeout(Duration::from_secs(5), watch.reloaded())
+            .await
+            .expect("reload finished")
+            .expect("load");
+
+        assert!(cancelled.is_err(), "the load did not hang");
+        assert!(kept, "the started task was dropped with the future");
+        assert!(loaded.is_some());
+        assert!(watch.pending.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -519,7 +569,7 @@ mod tests {
             events,
             watched_names: vec![path.clone()],
             change_seen: false,
-            walked_on: None,
+            pending: None,
         };
         for _ in 0..1_000 {
             let event = Event::new(EventKind::Create(CreateKind::Any)).add_path(path.clone());

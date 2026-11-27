@@ -4,20 +4,20 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpaperd_core::catalog::BadReason;
+use gpaperd_core::catalog::{BadReason, FileId};
 use gpaperd_core::config::{
     ApplyMode, Config, ConfigError, EmptyStylePolicy, ExternalChangePolicy, LinkPolicy, Order,
     PictureOptions, Source, StyleConfig,
 };
-use gpaperd_core::event::{Effect, Event};
+use gpaperd_core::event::{BackgroundKeys, Effect, Event, Method, SlotWrite};
 use gpaperd_core::model::ModelInit;
 use gpaperd_core::step::step;
 use gpaperd_core::style::{PerStyle, Style};
 
 use crate::support::{
     DEADLINE, World, alphabetical, armed, at, count, id, init, is_set_keys, is_watch, keys_pointed,
-    keys_written, probed, published, reported, running_world, scanned, six_shuffled, slot_uris,
-    started, two_folders_with, unscanned, user_keys,
+    keys_written, probed, published, reported, republished, running_world, scanned, six_shuffled,
+    slot_uris, started, switch_to, two_folders, two_folders_with, unscanned, user_keys,
 };
 
 fn reloaded(config: Config) -> Event {
@@ -197,6 +197,29 @@ fn picture_options_that_left_the_config_leave_the_key_alone() {
 
     assert_eq!(count(&trace, is_set_keys), 0);
     assert_eq!(world.keys.picture_options, "spanned");
+}
+
+#[test]
+fn a_refused_write_after_a_reload_does_not_bring_back_options_that_left() {
+    let spanned = changed(|config| config.general.picture_options = Some(PictureOptions::Spanned));
+    let mut world = World::new(init(spanned, &["/l/a.jpg"], &["/d/a.jpg"]));
+    world.start(at(0), Style::Light);
+    world.run(at(100), reloaded(alphabetical()));
+    let slots = slot_uris();
+    let refused = Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: Some(slots.light),
+            dark: Some(slots.dark),
+        },
+        picture_options: Some(PictureOptions::Spanned),
+        unconfirmed: false,
+    };
+
+    world.run(at(110), refused);
+    let retried = world.run(at(170), DEADLINE);
+
+    let options = keys_written(&retried).last().map(|(_, options)| *options);
+    assert_eq!(options, Some(None));
 }
 
 #[test]
@@ -436,6 +459,131 @@ fn a_lower_max_pixels_probes_the_image_on_screen() {
     assert_eq!(world.current(Style::Light), Some(id("/l/b.jpg")));
 }
 
+/// The probe of `path` that a light rotation sends under `max_pixels`.
+fn light_probe(path: &str, max_pixels: u64) -> Effect {
+    Effect::Probe {
+        style: Style::Light,
+        item: id(path),
+        path: PathBuf::from(path),
+        max_pixels,
+    }
+}
+
+#[test]
+fn a_probe_that_passed_under_a_higher_max_pixels_is_probed_again() {
+    let mut world = running_world();
+    let rotating = step(&mut world.model, at(900), DEADLINE);
+    assert!(rotating.contains(&light_probe("/l/b.jpg", 100_000_000)));
+    world.rejected.insert(
+        id("/l/b.jpg"),
+        BadReason::TooLarge {
+            width: 20_000,
+            height: 10_000,
+        },
+    );
+    let tighter = changed(|config| config.general.max_pixels = 1_000_000);
+    step(&mut world.model, at(901), reloaded(tighter));
+    let passed_under_the_old_cap = Event::Probed {
+        style: Style::Light,
+        item: id("/l/b.jpg"),
+        verdict: Ok(()),
+    };
+
+    let trace = world.run(at(902), passed_under_the_old_cap);
+
+    assert!(trace.contains(&light_probe("/l/b.jpg", 1_000_000)));
+    assert!(!published(&trace).contains(&(Style::Light, "/l/b.jpg")));
+    assert_ne!(world.current(Style::Light), Some(id("/l/b.jpg")));
+}
+
+#[test]
+fn a_probe_that_failed_under_a_lower_max_pixels_is_probed_again() {
+    let mut world = running_world();
+    step(&mut world.model, at(900), DEADLINE);
+    let roomier = changed(|config| config.general.max_pixels = 300_000_000);
+    step(&mut world.model, at(901), reloaded(roomier));
+    let too_large_under_the_old_cap = Event::Probed {
+        style: Style::Light,
+        item: id("/l/b.jpg"),
+        verdict: Err(BadReason::TooLarge {
+            width: 20_000,
+            height: 10_000,
+        }),
+    };
+
+    let trace = world.run(at(902), too_large_under_the_old_cap);
+
+    assert!(trace.contains(&light_probe("/l/b.jpg", 300_000_000)));
+    assert_eq!(world.current(Style::Light), Some(id("/l/b.jpg")));
+}
+
+#[test]
+fn a_lower_max_pixels_probes_the_image_on_screen_after_its_refresh() {
+    let mut world = running_world();
+    world.run(at(300), switch_to(Style::Dark));
+    let refreshing = step(&mut world.model, at(301), DEADLINE);
+    assert_eq!(republished(&refreshing), [Style::Dark]);
+    world.rejected.insert(
+        id("/d/a.jpg"),
+        BadReason::TooLarge {
+            width: 20_000,
+            height: 10_000,
+        },
+    );
+    let tighter = changed(|config| config.general.max_pixels = 1_000_000);
+    world.run(at(302), reloaded(tighter));
+    let refreshed = Event::Republished {
+        style: Style::Dark,
+        result: Ok(SlotWrite {
+            method: Method::Copy,
+            slot: FileId { dev: 2, ino: 77 },
+        }),
+    };
+
+    let trace = world.run(at(303), refreshed);
+
+    assert!(probed(&trace).contains(&(Style::Dark, "/d/a.jpg")));
+    assert_ne!(world.current(Style::Dark), Some(id("/d/a.jpg")));
+}
+
+#[test]
+fn an_unrelated_reload_keeps_the_zoom_that_replaces_none() {
+    let mut world = World::new(two_folders());
+    let loads_no_file = BackgroundKeys {
+        picture_options: "none".to_owned(),
+        ..user_keys()
+    };
+    step(
+        &mut world.model,
+        at(0),
+        started(Style::Light, loads_no_file, PerStyle::default()),
+    );
+    let longer = changed(|config| config.styles.light.interval = Duration::from_secs(1800));
+    step(&mut world.model, at(1), reloaded(longer));
+
+    let trace = world.run_all(
+        at(2),
+        [
+            Event::Probed {
+                style: Style::Light,
+                item: id("/l/a.jpg"),
+                verdict: Ok(()),
+            },
+            Event::Probed {
+                style: Style::Dark,
+                item: id("/d/a.jpg"),
+                verdict: Ok(()),
+            },
+        ],
+    );
+
+    let options: Vec<_> = keys_written(&trace)
+        .into_iter()
+        .map(|(_, options)| options)
+        .collect();
+    assert_eq!(options, [Some(PictureOptions::Zoom)]);
+}
+
 #[test]
 fn picture_options_dropped_before_the_first_write_are_not_sent() {
     let mut config = alphabetical();
@@ -464,7 +612,11 @@ fn picture_options_dropped_before_the_first_write_are_not_sent() {
         ],
     );
 
-    assert!(keys_written(&trace).iter().all(|(_, options)| options.is_none()));
+    assert!(
+        keys_written(&trace)
+            .iter()
+            .all(|(_, options)| options.is_none())
+    );
     assert!(!keys_written(&trace).is_empty());
 }
 
@@ -479,7 +631,11 @@ fn an_apply_mode_change_does_not_borrow_before_the_rescan() {
     let trace = world.run(at(100), reloaded(next));
 
     assert!(trace.iter().any(is_watch));
-    assert!(!published(&trace).iter().any(|(style, _)| *style == Style::Dark));
+    assert!(
+        !probed(&trace)
+            .iter()
+            .any(|(style, _)| *style == Style::Dark)
+    );
 }
 
 #[test]
@@ -491,5 +647,9 @@ fn an_apply_mode_change_still_borrows_when_sources_stay() {
 
     let trace = world.run(at(100), reloaded(next));
 
-    assert!(published(&trace).iter().any(|(style, _)| *style == Style::Dark));
+    assert!(
+        probed(&trace)
+            .iter()
+            .any(|(style, _)| *style == Style::Dark)
+    );
 }

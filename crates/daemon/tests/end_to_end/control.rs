@@ -114,9 +114,7 @@ fn a_paused_style_skips_its_deadline_and_rotates_on_resume() {
 
         client.pause("light").await.expect("Pause(light)");
         let armed = world.clock.times_armed();
-        world
-            .clock
-            .step_to(start_time() + LIGHT_INTERVAL + MINUTE);
+        world.clock.step_to(start_time() + LIGHT_INTERVAL + MINUTE);
         eventually("the paused style's deadline is observed", || {
             world.clock.times_armed() > armed
         })
@@ -183,9 +181,7 @@ fn restore_writes_the_users_keys_back_and_pauses_both_styles() {
         // The keys stay the user's until a resume.
         let writes_before = world.gnome.key_writes().len();
         let armed = world.clock.times_armed();
-        world
-            .clock
-            .step_to(start_time() + LIGHT_INTERVAL + MINUTE);
+        world.clock.step_to(start_time() + LIGHT_INTERVAL + MINUTE);
         eventually("the deadline after restore is observed", || {
             world.clock.times_armed() > armed
         })

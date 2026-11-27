@@ -204,15 +204,14 @@ inner() {
   final_rss="$(rss_kb)"
 
   kill -TERM "$DAEMON_PID"
-  local code
-  if ! code="$(wait_daemon)"; then
+  if ! wait_daemon; then
     kill -KILL "$DAEMON_PID" 2>/dev/null || true
-    wait_daemon >/dev/null || true
+    wait_daemon || true
     trap - EXIT
     die "daemon ignored SIGTERM for 20 s; see $DAEMON_LOG"
   fi
   trap - EXIT
-  (( code == 0 )) || die "daemon exited $code on SIGTERM; see $DAEMON_LOG"
+  (( DAEMON_CODE == 0 )) || die "daemon exited $DAEMON_CODE on SIGTERM; see $DAEMON_LOG"
 
   check_slots
   jq -e . "$STATE_FILE" >/dev/null || die "state.json is not valid JSON"
@@ -241,15 +240,15 @@ EOF
 }
 
 # Warnings the churn causes on purpose.
-readonly EXPECTED_WARNINGS='config file is invalid|slot file is gone'
+readonly EXPECTED_WARNINGS='config file is invalid|config file not reloaded|slot file is gone'
 
 alive() { kill -0 "$DAEMON_PID" 2>/dev/null; }
 
 stop_daemon() {
   kill -TERM "$DAEMON_PID" 2>/dev/null || return 0
-  if ! wait_daemon >/dev/null; then
+  if ! wait_daemon; then
     kill -KILL "$DAEMON_PID" 2>/dev/null || true
-    wait_daemon >/dev/null || true
+    wait_daemon || true
   fi
 }
 
@@ -262,17 +261,17 @@ proc_state() {
   printf '%s\n' "${stat%% *}"
 }
 
-# Reaps DAEMON_PID and prints its exit code. Returns 1 if it is still
-# running after the ready wait's 20s. A zombie still answers kill -0,
-# so this reads the proc state and only then waits.
+# Reaps DAEMON_PID and sets DAEMON_CODE to its exit code. Returns 1 if it
+# is still running after the ready wait's 20s. A zombie still answers
+# kill -0, so this reads the proc state and only then waits. Not through
+# stdout: in a $(...) subshell, wait on the parent's child returns 127.
 wait_daemon() {
-  local tries state code
+  local tries state
   for tries in $(seq 0 "$DAEMON_WAIT_TRIES"); do
     state="$(proc_state)"
     if [[ -z "$state" || "$state" == Z ]]; then
-      code=0
-      wait "$DAEMON_PID" 2>/dev/null || code=$?
-      printf '%s\n' "$code"
+      DAEMON_CODE=0
+      wait "$DAEMON_PID" 2>/dev/null || DAEMON_CODE=$?
       return 0
     fi
     if (( tries == DAEMON_WAIT_TRIES )); then

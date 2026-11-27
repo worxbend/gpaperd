@@ -72,7 +72,8 @@ pub trait Gpaperd1 {
     #[zbus(property)]
     fn next_change(&self) -> zbus::Result<u64>;
 
-    /// After every successful publish.
+    /// A new image is on screen in `style`: after every successful publish,
+    /// and in uri mode after the key write that shows it.
     #[zbus(signal)]
     fn changed(&self, style: &str, id: &str) -> zbus::Result<()>;
 }

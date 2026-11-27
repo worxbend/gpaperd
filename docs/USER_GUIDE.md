@@ -15,9 +15,13 @@ The full reference is in the man pages: `man gpaperd`, `man gpaperctl` and
 - systemd as the user session manager. GNOME on almost every distribution
   uses it.
 - GLib, libseccomp and fontconfig. A GNOME desktop already has them.
-- Recommended: `glycin-loaders` and `bubblewrap` (`bwrap`). With them,
+- Required: `glycin-loaders` and `bubblewrap` (`bwrap`). With them,
   gpaperd checks each image with the same sandboxed decoders gnome-shell
-  uses. Without them it checks only the file's magic bytes.
+  uses. Without them no image passes its check: the log warns
+  `glycin cannot decode in its sandbox` and status shows
+  `file is incomplete`. Later checks try the sandbox again, but an image
+  already checked 4 times waits for its file to change. After installing
+  them, `systemctl --user restart gpaperd` checks every image again.
 
 The release binaries are built on Ubuntu 24.04 and need glibc 2.39 or newer.
 On an older system, build from source (section 2.3).
@@ -152,6 +156,8 @@ sources = ["~/Pictures/Wallpapers/dark"]
 Drop images into those folders. New, removed and renamed files are picked up
 at once. Supported formats: JPEG, PNG, WebP, JPEG XL, AVIF, HEIC/HEIF, TIFF,
 BMP, GIF and QOI (JPEG XL and HEIC need the matching glycin loader).
+A file whose name is not valid UTF-8 is skipped with the scan warning
+`file name is not UTF-8`.
 
 ### 4.2 Sources
 
@@ -174,6 +180,14 @@ sources = [
   `{ dir = "...", poll = "1m" }` for another period.
 - Downloaded images are kept in `~/.cache/gpaperd/remote` and shown even when
   you are offline.
+- A URL whose host is a loopback, unspecified (`0.0.0.0`, `[::]`),
+  private or link-local IP address is not fetched and not retried; use a
+  host name.
+  A redirect to such an address, or from https to http, is not followed.
+- A URL refused that way, or answered with 401, 403, a non-image or an
+  oversized body, keeps its cached copy. With nothing cached it counts as
+  gone, so with `empty_style = "use-other-style"` the style shows the other
+  style's image.
 - The same folder can appear in both styles.
 
 ### 4.3 Common settings
@@ -253,9 +267,9 @@ key points at gpaperd again.
 
 ## 6. Update
 
-Run the same script again. Save and read it first, as in section 2.1, if
-it is not already in this directory. It replaces the binaries, keeps your
-config, and restarts gpaperd if it was running:
+Save and read the current script again, as in section 2.1, then run it.
+It replaces the binaries, keeps your config, and restarts gpaperd if it was
+running:
 
 ```sh
 sh install.sh
@@ -275,7 +289,11 @@ sh install.sh --uninstall
 This puts your original wallpaper back (`gpaperctl restore`), stops and
 disables the unit, and removes the binaries, man pages and unit. Your config
 and state stay; add `--purge` to remove them too, along with the slot files
-and the download cache.
+and the download cache. When gpaperd is running, `--purge` stops with an
+error if `gpaperctl restore` fails: the slot files it would delete are what
+GNOME shows, and the state file holds your original wallpaper keys. Stop
+gpaperd first to purge without restoring. When gpaperd is not running,
+`--purge` warns and goes on.
 
 By hand:
 
@@ -296,7 +314,7 @@ systemctl --user daemon-reload
 | --- | --- |
 | `gpaperctl` says gpaperd is not running | `systemctl --user status gpaperd`, then `journalctl --user -u gpaperd` |
 | The unit is skipped ("condition failed") | Not a GNOME session: `XDG_CURRENT_DESKTOP` does not contain `GNOME` |
-| The unit failed with status 78 | The config has an error: `gpaperd check-config` shows line and column. Fix it, then `systemctl --user restart gpaperd` |
+| The unit failed with status 78 | The config has an error or is not valid UTF-8: `gpaperd check-config` shows the error. Fix it, then `systemctl --user restart gpaperd` |
 | The unit failed with status 69 | GNOME's background settings are missing: not a GNOME session |
 | Status says `paused: external change` | Something else set the wallpaper. `gpaperctl resume` or a config reload |
 | Status shows changes but the screen does not change | Your GNOME release does not reload slot files. Set `apply_mode = "uri"` |

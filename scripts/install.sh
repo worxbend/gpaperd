@@ -1,8 +1,8 @@
 #!/bin/sh
 # Installs gpaperd and gpaperctl from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- --version v0.1.1 --no-start
+#   curl -fsSLO https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh
+#   less install.sh && sh install.sh [--version v0.1.1 --no-start]
 #
 # Everything goes into your home directory; no root is needed:
 #   ~/.local/bin/{gpaperd,gpaperctl}           (--prefix changes ~/.local)
@@ -100,8 +100,11 @@ systemd_exec_word() {
     path=$1
     escaped=
     while [ -n "$path" ]; do
-        char=$(printf '%.1s' "$path")
-        path=${path#?}
+        rest=${path#?}
+        char=${path%"$rest"}
+        path=$rest
+        # The single-quoted backslashes are printf escapes, not quote escapes.
+        # shellcheck disable=SC1003
         case "$char" in
         \\) escaped=$(printf '%s\\\\' "$escaped") ;;
         '"') escaped=$(printf '%s\\"' "$escaped") ;;
@@ -136,13 +139,12 @@ write_user_unit() {
 install_starter_config() {
     config_dir=$1
     example=$2
-    if [ ! -d "$config_dir" ]; then
-        mkdir -p "$config_dir"
-        chmod 700 "$config_dir"
-    fi
+    mkdir -p "$config_dir"
+    chmod 700 "$config_dir"
     cp "$example" "$config_dir/config.example.toml"
     config_file=$config_dir/config.toml
     if [ -e "$config_file" ]; then
+        chmod go-rwx "$config_file"
         say "kept your config: $config_file"
         return
     fi
@@ -190,6 +192,10 @@ while [ $# -gt 0 ]; do
     *) die "unknown option: $1 (see --help)" ;;
     esac
 done
+case "$prefix" in
+/*) ;;
+*) die "--prefix must be an absolute path: $prefix" ;;
+esac
 
 [ "$(id -u)" -ne 0 ] || die "run this as your own user, not as root: gpaperd is a per-user service"
 
@@ -213,9 +219,16 @@ in_gnome() {
 }
 
 uninstall() {
+    # Purge deletes the slots GNOME points at and the saved original keys.
     if [ -x "$bin_dir/gpaperctl" ] && "$bin_dir/gpaperctl" status >/dev/null 2>&1; then
         say "putting your original wallpaper back (gpaperctl restore)"
-        "$bin_dir/gpaperctl" restore || warn "gpaperctl restore failed"
+        if ! "$bin_dir/gpaperctl" restore; then
+            [ "$purge" -eq 0 ] ||
+                die "gpaperctl restore failed: fix that, or stop gpaperd (systemctl --user stop gpaperd) to purge without restoring"
+            warn "gpaperctl restore failed"
+        fi
+    elif [ "$purge" -eq 1 ]; then
+        warn "gpaperd is not running: wallpaper not restored; if GNOME shows no wallpaper after this, pick one in Settings"
     fi
     if have_systemd; then
         systemctl --user disable --now gpaperd.service >/dev/null 2>&1 || true
@@ -249,8 +262,9 @@ esac
 # Same seconds as gpaperd_ctl::CALL_TIMEOUT. This file states no other bound.
 call_timeout=35
 if has curl; then
-    fetch() { curl --proto '=https' --tlsv1.2 --max-time "$call_timeout" -fsSL "$1" -o "$2"; }
-    fetch_text() { curl --proto '=https' --tlsv1.2 --max-time "$call_timeout" -fsSL "$1"; }
+    # Bounds a stall, not the transfer, like wget --timeout.
+    fetch() { curl --proto '=https' --tlsv1.2 --connect-timeout "$call_timeout" --speed-limit 1 --speed-time "$call_timeout" -fsSL "$1" -o "$2"; }
+    fetch_text() { curl --proto '=https' --tlsv1.2 --connect-timeout "$call_timeout" --speed-limit 1 --speed-time "$call_timeout" -fsSL "$1"; }
 elif has wget; then
     fetch() { wget -q --https-only --timeout="$call_timeout" -O "$2" "$1"; }
     fetch_text() { wget -q --https-only --timeout="$call_timeout" -O - "$1"; }
@@ -276,7 +290,7 @@ trap 'rm -rf "$work"' EXIT INT TERM
 
 say "downloading $name"
 fetch "$base/$name.tar.gz" "$work/$name.tar.gz" ||
-    die "no $arch build in release $version (see https://github.com/$repo/releases)"
+    die "cannot download $name.tar.gz from release $version (see https://github.com/$repo/releases)"
 fetch "$base/SHA256SUMS" "$work/SHA256SUMS" || die "release $version has no SHA256SUMS"
 checksum_archive "$name.tar.gz" "$work/SHA256SUMS"
 tar -C "$work" -xzf "$work/$name.tar.gz"
@@ -307,13 +321,13 @@ install_starter_config "$config_home/gpaperd" "$src/dist/config.example.toml"
 
 missing=$(ldd "$bin_dir/gpaperd" 2>/dev/null | sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' | tr '\n' ' ')
 [ -z "$missing" ] || warn "missing shared libraries: $missing(install GLib, libseccomp and fontconfig from your distribution)"
-has bwrap || warn "bwrap (bubblewrap) is not installed: images are checked by their magic bytes only"
+has bwrap || warn "bwrap (bubblewrap) is not installed: images cannot be decoded and every image will be refused; install it, then run systemctl --user restart gpaperd"
 loaders=0
 for dir in /usr/lib/glycin-loaders /usr/lib64/glycin-loaders /usr/libexec/glycin-loaders /usr/lib/*/glycin-loaders; do
     [ -d "$dir" ] && loaders=1
 done
 if [ "$loaders" -eq 0 ]; then
-    warn "no glycin loaders found (package glycin-loaders): images are checked by their magic bytes only"
+    warn "no glycin loaders found (package glycin-loaders): images cannot be decoded and every image will be refused"
 fi
 case ":$PATH:" in
 *":$bin_dir:"*) ;;
@@ -334,7 +348,8 @@ if [ "$start" = "auto" ]; then
     [ "$start" = "yes" ] || say "not a GNOME session (XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-unset}): the unit is installed but not started"
 fi
 if [ "$start" = "yes" ]; then
-    systemctl --user enable gpaperd.service >/dev/null 2>&1
+    systemctl --user enable gpaperd.service >/dev/null 2>&1 ||
+        die "systemctl --user enable gpaperd.service failed"
     if [ "$was_running" -eq 1 ]; then
         systemctl --user restart gpaperd.service
         say "restarted gpaperd"

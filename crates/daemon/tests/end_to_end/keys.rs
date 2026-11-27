@@ -2,7 +2,9 @@
 //! corner-case table, and `apply_mode = "uri"`.
 
 use gpaperd_core::event::{BackgroundKeys, Pause};
-use gpaperd_core::step::{HIDDEN_REFRESH_DELAY, MAX_KEY_FLIPS_PER_MINUTE, REASSERT_DELAY};
+use gpaperd_core::step::{
+    HIDDEN_REFRESH_DELAY, KEY_WRITE_RETRY, MAX_KEY_FLIPS_PER_MINUTE, REASSERT_DELAY,
+};
 use gpaperd_core::style::{PerStyle, Style};
 use gpaperd_daemon::gnome::KeyWrite;
 
@@ -392,5 +394,40 @@ fn uri_mode_takes_a_key_that_differs_from_its_last_write_as_an_external_change()
         let status = daemon.next_status().await;
 
         assert_eq!(status.paused.light, Some(Pause::ExternalChange));
+    });
+}
+
+#[test]
+fn a_write_that_settings_never_answered_still_counts_when_it_lands() {
+    scenario(async {
+        let world = World::new();
+        world.add_images(Style::Light, &["a.png", "b.png"]);
+        world.add_images(Style::Dark, &["x.png"]);
+        world.gnome.leave_the_next_write_unanswered();
+        let mut daemon = world.start_daemon(world.config(URI_MODE), SEED);
+        let landed = world.image_uri(Style::Light, "a.png");
+        eventually("the unanswered write to land", || {
+            world.gnome.key(Style::Light).as_deref() == Some(landed.as_str())
+        })
+        .await;
+        let_the_daemon_run().await;
+
+        world
+            .gnome
+            .set_key_from_outside(Style::Light, PICKED_BY_THE_USER);
+        let paused = daemon
+            .status_where("the light style to pause", |status| {
+                status.paused.light == Some(Pause::ExternalChange)
+            })
+            .await;
+        // The retry of the unanswered write falls due.
+        world.clock.advance(KEY_WRITE_RETRY);
+        let_the_daemon_run().await;
+
+        assert_eq!(paused.paused.light, Some(Pause::ExternalChange));
+        assert_eq!(
+            world.gnome.key(Style::Light).as_deref(),
+            Some(PICKED_BY_THE_USER)
+        );
     });
 }

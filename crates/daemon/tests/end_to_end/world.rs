@@ -673,6 +673,8 @@ struct FakeSession {
     /// The next restore waits here. The sender tells the test it has
     /// entered; the receiver lets it continue. Before any key changes.
     restore_hold: RefCell<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    /// The next key write lands, but its caller hears no answer.
+    unanswered_write: Cell<bool>,
 }
 
 impl FakeGnome {
@@ -687,6 +689,7 @@ impl FakeGnome {
             key_writes: RefCell::new(Vec::new()),
             restores: RefCell::new(Vec::new()),
             restore_hold: RefCell::new(None),
+            unanswered_write: Cell::new(false),
         };
         FakeGnome {
             session: Rc::new(session),
@@ -694,7 +697,7 @@ impl FakeGnome {
     }
 
     /// The event stream for a daemon that starts now.
-    fn connect(&self) -> UnboundedReceiver<GnomeEvent> {
+    pub fn connect(&self) -> UnboundedReceiver<GnomeEvent> {
         let (events, inbox) = mpsc::unbounded_channel();
         self.session.events.replace(Some(events));
         inbox
@@ -726,6 +729,13 @@ impl FakeGnome {
         let (entered_sender, entered) = oneshot::channel();
         *self.session.restore_hold.borrow_mut() = Some((entered_sender, released));
         (release, entered)
+    }
+
+    /// The next `set_keys` stores its keys and reports them, then fails
+    /// with [`GnomeError::NoAnswer`], as a settings thread that answers too
+    /// late does.
+    pub fn leave_the_next_write_unanswered(&self) {
+        self.session.unanswered_write.set(true);
     }
 
     /// Every restore of the keys that a daemon asked for, oldest first.
@@ -833,6 +843,9 @@ impl GnomePort for FakeGnome {
         let after = self.keys();
         if after != before {
             self.report(GnomeEvent::KeysChanged(after));
+        }
+        if self.session.unanswered_write.take() {
+            return Err(GnomeError::NoAnswer);
         }
         Ok(())
     }

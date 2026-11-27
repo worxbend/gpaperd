@@ -25,10 +25,6 @@ use crate::scan;
 /// amount when it is given a path.
 pub const HEADER_LEN: usize = 8192;
 
-/// [`BadReason::Undecodable`] text when the bwrap sandbox cannot start.
-/// Magic bytes are not a successful check.
-pub const SANDBOX_DID_NOT_START: &str = "glycin sandbox did not start";
-
 /// How long glycin may take over each of its two steps, the header and the
 /// first frame. A loader that hangs must not hold up a rotation. A 4K image
 /// decodes in well under a second. The same limit bounds the stat and the
@@ -131,9 +127,9 @@ pub fn probe(path: &Path) -> Result<(), BadReason> {
 pub struct Prober {
     /// What glycin said about each file, by the stamp the file had then.
     decoded: Mutex<HashMap<FileStamp, Decoded>>,
-    /// Started by the first check. `None` when glycin cannot decode in its
-    /// sandbox here.
-    sandbox: OnceCell<Option<Sandbox>>,
+    /// Holds only a sandbox that decoded. While it is empty, each check
+    /// starts and tries a new one.
+    sandbox: OnceCell<Sandbox>,
 }
 
 /// glycin as one [`Prober`] uses it: loader processes and a GLib thread of
@@ -195,7 +191,7 @@ impl Sandbox {
             Err(error) => {
                 tracing::warn!(
                     reason = %first_line(&error),
-                    "glycin cannot decode in its sandbox: image checks fail"
+                    "glycin cannot decode in its sandbox: no image passes until a later check can"
                 );
                 false
             }
@@ -267,11 +263,12 @@ impl Prober {
     /// later call with another `max_pixels` needs no second decode. An image
     /// that is too large is never decoded, so nothing is remembered of it.
     ///
-    /// The sandbox is tried once, with an image that is known to be good.
-    /// When it cannot start (no `bwrap`, or a container that blocks it),
-    /// nothing can be decoded. That is logged once, as a warning, and the
-    /// check is [`BadReason::Undecodable`] with [`SANDBOX_DID_NOT_START`].
-    /// Magic bytes are not a pass.
+    /// The sandbox is tried with an image that is known to be good. When it
+    /// cannot start (no `bwrap`, a container that blocks it, or a decode
+    /// that timed out), nothing can be decoded. That is logged as a warning,
+    /// and the check is [`BadReason::Truncated`]: it says nothing about the
+    /// file, the core probes it again, and a later check tries the sandbox
+    /// again. Magic bytes are not a pass.
     #[expect(
         clippy::manual_async_fn,
         reason = "an `async fn` cannot promise the `Send` future that the interpreter spawns"
@@ -284,7 +281,7 @@ impl Prober {
         async move {
             let stamp = off_thread(path, examine).await?;
             let Some(sandbox) = self.sandbox().await else {
-                return Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()));
+                return Err(BadReason::Truncated);
             };
             match self.remembered(&stamp) {
                 Some(decoded) => decoded.map_err(BadReason::Undecodable)?.within(max_pixels),
@@ -293,14 +290,15 @@ impl Prober {
         }
     }
 
-    /// glycin's sandbox, started and tried by the first call. `None` when it
-    /// cannot decode.
+    /// glycin's sandbox, kept from the first call where it decodes. `None`
+    /// when it cannot decode yet. A failed sandbox is dropped, which ends its
+    /// thread, so one bad start does not disable checks for the whole run.
     async fn sandbox(&self) -> Option<&Sandbox> {
         let start = || async {
             let sandbox = Sandbox::start();
-            sandbox.decodes().await.then_some(sandbox)
+            sandbox.decodes().await.then_some(sandbox).ok_or(())
         };
-        self.sandbox.get_or_init(start).await.as_ref()
+        self.sandbox.get_or_try_init(start).await.ok()
     }
 
     /// Steps 2 and 3 of [`Prober::check`], for content that glycin has not
@@ -401,21 +399,34 @@ async fn off_thread(
 /// [`BadReason::Truncated`]: the core probes that again, and the stat is
 /// not [`BadReason::Undecodable`].
 ///
-/// Dropping the join does not cancel the read. The pool thread stays in
-/// the syscall. The rotation must not wait with it.
+/// Nothing cancels the read: a thread stuck on a dead mount stays in the
+/// syscall. The rotation must not wait with it. The read runs on a thread
+/// of its own, not in tokio's blocking pool, so stuck reads cannot fill
+/// that pool and starve the state writes that also use it.
 async fn inspect_within(
     path: &Path,
     inspect: fn(&Path) -> Result<FileStamp, BadReason>,
     limit: Duration,
 ) -> Result<FileStamp, BadReason> {
     let path = path.to_owned();
-    let read = tokio::task::spawn_blocking(move || inspect(&path));
-    let joined = match tokio::time::timeout(limit, read).await {
-        Ok(joined) => joined,
+    let (send, read) = oneshot::channel();
+    let started = thread::Builder::new()
+        .name("gpaperd-stat".to_owned())
+        .spawn(move || {
+            // The receiver is gone when the check gave up: nobody waits.
+            let _ = send.send(panic::catch_unwind(move || inspect(&path)));
+        });
+    if let Err(error) = started {
+        // Not the file's fault: `Truncated` is probed again.
+        tracing::warn!(reason = %error, "cannot start a thread to read a file");
+        return Err(BadReason::Truncated);
+    }
+    let finished = match tokio::time::timeout(limit, read).await {
+        Ok(finished) => finished.expect("the read thread catches panics and always sends"),
         Err(_elapsed) => return Err(BadReason::Truncated),
     };
-    // Only a panic ends that task early. A panic is a defect: pass it on.
-    joined.unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()))
+    // A panic is a defect: pass it on.
+    finished.unwrap_or_else(|failure| panic::resume_unwind(failure))
 }
 
 /// Step 1 of [`Prober::check`]. Returns the stamp that the file had before
@@ -770,11 +781,17 @@ mod tests {
     async fn failed_decode_of_a_file_an_hour_ahead_is_truncated_and_not_remembered() {
         let dir = TempDir::new().expect("temp dir");
         let png = file_with(&dir, "wall.png", PNG_HEADER);
-        let file = File::options().write(true).open(&png).expect("open fixture");
+        let file = File::options()
+            .write(true)
+            .open(&png)
+            .expect("open fixture");
         file.set_modified(SystemTime::now() + AN_HOUR)
             .expect("set mtime");
         let stamp = current_stamp(&png).expect("stat fixture");
-        assert!(stamp.mtime > SystemTime::now(), "mtime stayed in the future");
+        assert!(
+            stamp.mtime > SystemTime::now(),
+            "mtime stayed in the future"
+        );
         let prober = Prober::new();
 
         let reason = prober
@@ -815,12 +832,23 @@ mod tests {
 
     static RELEASE_STUCK_READ: AtomicBool = AtomicBool::new(false);
 
-    struct ReleaseStuckRead;
+    /// Held by each test that stages a stuck read. One test's release must
+    /// not free the read of another.
+    static STUCK_READ_TEST: Mutex<()> = Mutex::new(());
+
+    struct ReleaseStuckRead {
+        _one_test_at_a_time: MutexGuard<'static, ()>,
+    }
 
     impl ReleaseStuckRead {
         fn arm() -> ReleaseStuckRead {
+            let guard = STUCK_READ_TEST
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             RELEASE_STUCK_READ.store(false, Ordering::Relaxed);
-            ReleaseStuckRead
+            ReleaseStuckRead {
+                _one_test_at_a_time: guard,
+            }
         }
     }
 
@@ -847,6 +875,30 @@ mod tests {
         let verdict = tokio::time::timeout(DECODE_TIMEOUT, read).await;
 
         assert_eq!(verdict, Ok(Err(BadReason::Truncated)));
+    }
+
+    #[test]
+    fn stuck_read_leaves_the_blocking_pool_free() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("build a tokio runtime");
+        // Declared after the runtime, so it is dropped first: a runtime that
+        // waits for a stuck pool thread on its drop is released.
+        let _release = ReleaseStuckRead::arm();
+
+        let freed = runtime.block_on(async {
+            let read = inspect_within(Path::new("unused"), block_until_released, Duration::ZERO);
+            assert_eq!(read.await, Err(BadReason::Truncated));
+            let other_work = tokio::task::spawn_blocking(|| ());
+            tokio::time::timeout(DECODE_TIMEOUT, other_work).await
+        });
+
+        assert!(
+            freed.is_ok(),
+            "other blocking work waited behind the stuck read"
+        );
     }
 
     #[test]

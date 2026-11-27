@@ -16,11 +16,12 @@ use crate::catalog::{
 };
 use crate::config::{ApplyMode, Config, EmptyStylePolicy, Order, PictureOptions, Source};
 use crate::control::{
-    BadItem, Direction, History, ReplyId, Request, STATUS_VERSION, StatusReport, StyleReport,
+    BadItem, Direction, History, PartialMove, ReplyId, Request, STATUS_VERSION, StatusReport,
+    StyleReport,
 };
 use crate::event::{BackgroundKeys, Pause, ScreenLock, Status};
 use crate::key::{KeyState, Reassert};
-use crate::ordering::{ShuffleBag, next_alphabetical};
+use crate::ordering::{ShuffleBag, is_remote_id, next_alphabetical};
 use crate::remote::Remotes;
 use crate::schedule::StyleClock;
 use crate::style::{PerStyle, Style};
@@ -149,6 +150,9 @@ pub struct Model {
     /// The `Next` and `Previous` requests that wait for their rotations,
     /// oldest first.
     pub(crate) requests: Vec<Request>,
+    /// What the last both-style request moved before its other style
+    /// failed. The next request takes it.
+    pub(crate) partial_move: Option<PartialMove>,
     /// The `Reload` requests whose `ConfigRead` is still to come.
     pub(crate) reloads: Vec<ReplyId>,
     /// The `Restore` requests whose `KeysRestored` is still to come.
@@ -203,6 +207,9 @@ pub(crate) struct StyleState {
     pub(crate) refresh_due: Option<SystemTime>,
     /// An `Effect::Republish` of the slot is in flight.
     pub(crate) is_refreshing: bool,
+    /// `max_pixels` went down: the image on screen is to be probed again
+    /// once nothing is in flight for the style.
+    pub(crate) reprobe_owed: bool,
     /// A user pause ([`Pause::User`]) holds, next to any pause in `key`.
     pub(crate) user_paused: bool,
     /// The images shown before `current`, newest last.
@@ -242,6 +249,8 @@ pub(crate) struct Rotation {
     /// Candidates this rotation gave up on, oldest first. None of them is
     /// tried again before the rotation ends.
     pub(crate) failed: Vec<ItemId>,
+    /// The `max_pixels` the probe was sent with.
+    pub(crate) max_pixels: u64,
 }
 
 /// The effect a rotation waits for.
@@ -423,6 +432,7 @@ impl Model {
             probe_retries: BTreeMap::new(),
             remote: Remotes::default(),
             requests: Vec::new(),
+            partial_move: None,
             reloads: Vec::new(),
             restores: Vec::new(),
             screen_lock: ScreenLock::default(),
@@ -432,7 +442,7 @@ impl Model {
         for style in Style::ALL {
             if let Some(files) = local_files[style].take() {
                 let delta = model.replace_catalog(style, files);
-                model.join_rounds(style, &delta);
+                model.join_rounds_after_scan(style, &delta);
             }
         }
         model
@@ -536,6 +546,14 @@ impl Model {
             let key = &self.styles[style].key;
             key.written.is_some() && key.pause.is_none()
         })
+    }
+
+    /// Whether some key in `keys` names its style's slot file. Such keys
+    /// were written by an earlier run, so they are not the user's.
+    pub(crate) fn names_a_slot(&self, keys: &BackgroundKeys) -> bool {
+        Style::ALL
+            .into_iter()
+            .any(|style| keys.uri(style) == Some(self.slot_uris[style].as_str()))
     }
 
     /// The value that `style`'s key may be locked on while the style still
@@ -662,7 +680,7 @@ impl Model {
         let next_probe_retry = self.probe_retries.values().filter_map(|retry| retry.due);
         let short_waits = Style::ALL.into_iter().flat_map(|style| {
             let reassert = match self.styles[style].key.reassert {
-                Some(Reassert::At(due)) => Some(due),
+                Some(Reassert::At(due) | Reassert::Retry(due)) => Some(due),
                 Some(Reassert::Now | Reassert::AtNextTick) | None => None,
             };
             [self.refresh_deadline(style), reassert]
@@ -809,7 +827,7 @@ impl Model {
     }
 
     /// Drops local bag ids neither catalog knows. Known ids stay, in order.
-    /// A URL stays: its blob may still be on its way into the catalog.
+    /// An http(s) URL stays: its blob may still be on its way into the catalog.
     fn drop_unknown_bag(&mut self, style: Style) {
         if self.config.styles[style].order != Order::Random {
             return;
@@ -829,7 +847,7 @@ impl Model {
     }
 
     fn bag_id_is_known(&self, id: &ItemId) -> bool {
-        Url::parse(id.as_str()).is_ok()
+        is_remote_id(id)
             || Style::ALL
                 .into_iter()
                 .any(|style| self.catalogs[style].get(id).is_some())
@@ -849,6 +867,21 @@ impl Model {
     /// content, a place in the shuffle round of every style that picks from
     /// that catalog. The item on screen has its place already.
     pub(crate) fn join_rounds(&mut self, changed: Style, delta: &CatalogDelta) {
+        self.join_rounds_by(changed, delta, ShuffleBag::insert);
+    }
+
+    /// [`Model::join_rounds`] for the delta of `changed`'s scan, which also
+    /// tells a round from before M2 what it showed.
+    pub(crate) fn join_rounds_after_scan(&mut self, changed: Style, delta: &CatalogDelta) {
+        self.join_rounds_by(changed, delta, ShuffleBag::scanned);
+    }
+
+    fn join_rounds_by(
+        &mut self,
+        changed: Style,
+        delta: &CatalogDelta,
+        join: fn(&mut ShuffleBag, Vec<ItemId>, &mut SmallRng),
+    ) {
         for style in Style::ALL {
             let is_shuffled = self.config.styles[style].order == Order::Random;
             if !is_shuffled || self.pool(style) != Some(changed) {
@@ -861,8 +894,9 @@ impl Model {
                 .iter()
                 .chain(&delta.modified)
                 .filter(|&id| Some(id) != on_screen)
-                .cloned();
-            state.bag.insert(newcomers, &mut self.rng);
+                .cloned()
+                .collect();
+            join(&mut state.bag, newcomers, &mut self.rng);
         }
     }
 

@@ -508,8 +508,7 @@ fn a_child_past_the_limit_is_reaped() {
     command.arg(RUN_LIMIT.as_secs().to_string());
 
     // One look crosses the same branch `check_config` uses with `RUN_LIMIT`.
-    let timed_out =
-        run_bounded(command, LOOK_PERIOD).expect_err("sleep returned before the limit");
+    let timed_out = run_bounded(command, LOOK_PERIOD).expect_err("sleep returned before the limit");
 
     assert_eq!(
         timed_out.status.code(),
@@ -527,11 +526,7 @@ fn a_child_past_the_limit_is_reaped() {
 fn a_file_and_a_symlink_to_it_count_once() {
     let sandbox = Sandbox::new();
     let image = sandbox.picture("walls/a.png");
-    symlink(
-        &image,
-        image.parent().expect("a parent").join("link.png"),
-    )
-    .expect("symlink");
+    symlink(&image, image.parent().expect("a parent").join("link.png")).expect("symlink");
     sandbox.write_default_config(
         r#"
 [light]

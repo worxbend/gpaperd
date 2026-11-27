@@ -76,7 +76,9 @@ and fontconfig. On Debian or Ubuntu:
 `apt install pkg-config libglib2.0-dev libseccomp-dev libfontconfig-dev`.
 
 At run time gpaperd needs a GNOME session. To decode images in their sandbox
-it needs the glycin loaders and `bwrap`, which gnome-shell 51 itself uses. Without them, images are checked by their magic bytes only.
+it needs the glycin loaders and `bwrap`, which gnome-shell 51 itself uses.
+Both are required: without them every image is refused as
+`file is incomplete`, and the log warns `glycin cannot decode in its sandbox`.
 
 From the workspace root:
 

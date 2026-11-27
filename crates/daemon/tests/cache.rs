@@ -69,7 +69,7 @@ fn at(secs: u64) -> SystemTime {
 fn missing_root_loads_empty_and_collects_nothing() {
     let harness = Harness::new();
 
-    assert_eq!(harness.cache.load(), Vec::new());
+    assert_eq!(harness.cache.load().unwrap(), Vec::new());
     assert_eq!(
         harness.cache.collect_garbage(&[], at(1)).unwrap(),
         GcReport::default()
@@ -212,7 +212,7 @@ async fn load_returns_every_entry_with_a_blob_and_skips_the_rest() {
     fs::write(harness.root.join("stray-file"), "x").unwrap();
 
     assert_eq!(
-        harness.cache.load(),
+        harness.cache.load().unwrap(),
         [RemoteBlob {
             url: good,
             blob: good_blob
@@ -231,7 +231,7 @@ async fn load_skips_a_meta_in_the_wrong_directory() {
     )
     .unwrap();
 
-    assert_eq!(harness.cache.load(), Vec::new());
+    assert_eq!(harness.cache.load().unwrap(), Vec::new());
 }
 
 #[tokio::test]
@@ -243,7 +243,7 @@ async fn load_does_not_follow_a_symlinked_blob() {
     fs::rename(&blob, &target).unwrap();
     std::os::unix::fs::symlink(&target, &blob).unwrap();
 
-    assert_eq!(harness.cache.load(), Vec::new());
+    assert_eq!(harness.cache.load().unwrap(), Vec::new());
 }
 
 #[tokio::test]
@@ -306,10 +306,7 @@ async fn gc_leaves_an_entry_whose_meta_cannot_be_read_for_now() {
     let readable = fs::read(&meta);
     let report = harness.cache.collect_garbage(&[], at(1));
     fs::set_permissions(&meta, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(
-        readable.is_err(),
-        "mode 000 left meta.toml readable"
-    );
+    assert!(readable.is_err(), "mode 000 left meta.toml readable");
 
     let report = report.unwrap();
     assert_eq!(report, GcReport::default());
@@ -344,7 +341,10 @@ async fn republishing_the_same_bytes_keeps_the_blob_mode() {
     let again = harness.publish(&url, PNG_START).await;
 
     assert_eq!(again, blob);
-    assert_eq!(fs::metadata(&again).unwrap().permissions().mode() & 0o777, 0o640);
+    assert_eq!(
+        fs::metadata(&again).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
 }
 
 #[tokio::test]
@@ -541,12 +541,42 @@ async fn a_failed_orphan_clear_does_not_expire_on_the_old_departure() {
     assert!(harness.cache.entry_dir(&url).exists());
 }
 
+/// A fetch read the meta before a collection cleared its departure; its
+/// write must not bring the old departure back.
+#[tokio::test]
+async fn a_fetch_write_keeps_the_orphan_date_that_gc_cleared() {
+    let harness = Harness::new();
+    let url = url("https://example.com/a.png");
+    harness.publish(&url, PNG_START).await;
+    let left = at(1_800_000_000);
+    harness.cache.collect_garbage(&[], left).unwrap();
+    let read_by_fetch = harness.cache.meta(&url).await.unwrap().unwrap();
+    assert_eq!(read_by_fetch.orphaned_at, Some(left));
+    harness
+        .cache
+        .collect_garbage(std::slice::from_ref(&url), left + Duration::from_secs(10))
+        .unwrap();
+
+    harness.cache.record(&url, &read_by_fetch).await.unwrap();
+    let recorded = harness.cache.meta(&url).await.unwrap().unwrap();
+    let mut draft = harness.cache.draft(&url).await.unwrap();
+    draft.append(b"newer").await.unwrap();
+    harness
+        .cache
+        .publish(&url, draft, "png", read_by_fetch)
+        .await
+        .unwrap();
+    let published = harness.cache.meta(&url).await.unwrap().unwrap();
+
+    assert_eq!(recorded.orphaned_at, None);
+    assert_eq!(published.orphaned_at, None);
+}
+
 #[test]
-#[should_panic(expected = "remote cache not read")]
 fn an_unlistable_root_is_not_an_empty_cache() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("remote");
     fs::write(&root, b"not-a-directory").unwrap();
 
-    let _loaded = Cache::new(root).load();
+    assert!(Cache::new(root).load().is_err());
 }

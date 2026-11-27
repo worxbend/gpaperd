@@ -9,13 +9,13 @@
 //! asks for it, so the watch runs whatever the config says.
 //!
 //! A session without the service (not GNOME, or a shell that has not
-//! started it yet) is no error: the failed `GetActive` is logged once and
-//! the watch keeps listening, so a service that appears later is still
-//! heard.
+//! started it yet) is no error: the failed `GetActive` is logged and the
+//! watch keeps listening, so a service that appears later is still heard.
+//! A shield that gives no answer counts as unlocked and is asked again
+//! after each D-Bus reply timeout. Those retries log only at debug.
 
+use std::mem;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::{Stream, StreamExt};
@@ -52,21 +52,19 @@ pub fn watch(connection: Connection) -> mpsc::UnboundedReceiver<ScreenLock> {
 }
 
 /// A receiver that never yields: no session bus, so nothing to watch.
+///
+/// Its sender is leaked, not dropped: a closed channel would read as a
+/// watch that stopped, and the loop would log it and feed an unlock.
 pub fn detached() -> mpsc::UnboundedReceiver<ScreenLock> {
-    mpsc::unbounded_channel().1
-}
-
-/// Keeps an `ActiveChanged` only when it was sampled for the owner
-/// generation the watch is still on. A signal polled under the previous
-/// owner is dropped.
-pub(crate) fn keep_signal(stamp: u64, generation: u64) -> bool {
-    stamp == generation
+    let (sender, receiver) = mpsc::unbounded_channel();
+    mem::forget(sender);
+    receiver
 }
 
 /// What the watch hears on the bus.
 enum Heard {
-    /// `ActiveChanged`, stamped with the owner generation at the poll.
-    Active { active: bool, stamp: u64 },
+    /// `ActiveChanged`: the shield went up (`true`) or down.
+    Active(bool),
     /// `org.gnome.ScreenSaver` got a new owner (`true`) or lost it.
     Owner(bool),
 }
@@ -81,6 +79,17 @@ enum OwnerReport {
     Stop,
     Known,
     Unknown,
+}
+
+/// Why `GetActive` gave no answer.
+#[derive(Debug, thiserror::Error)]
+enum Unanswered {
+    /// A busy shell may still answer a later ask.
+    #[error("no reply within the D-Bus reply timeout")]
+    TimedOut,
+    /// An error reply, such as a name without an owner.
+    #[error(transparent)]
+    Failed(zbus::Error),
 }
 
 async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock>) {
@@ -106,34 +115,34 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
             return;
         }
     };
-    let generation = Arc::new(AtomicU64::new(0));
-    let stamped = Arc::clone(&generation);
-    let changes = changes.filter_map(move |signal| {
-        let stamp = stamped.load(Ordering::Acquire);
-        async move {
-            match signal.args() {
-                Ok(args) => Some(Heard::Active {
-                    active: args.active,
-                    stamp,
-                }),
-                Err(error) => {
-                    tracing::warn!(reason = %error, "malformed ActiveChanged signal ignored");
-                    None
-                }
+    let changes = changes.filter_map(|signal| async move {
+        match signal.args() {
+            Ok(args) => Some(Heard::Active(args.active)),
+            Err(error) => {
+                tracing::warn!(reason = %error, "malformed ActiveChanged signal ignored");
+                None
             }
         }
     });
     let owners = owners.map(|owner| Heard::Owner(owner.is_some()));
     let mut changes = std::pin::pin!(changes);
     let mut owners = std::pin::pin!(owners);
-    // The first ask is not a new owner. A failure stays quiet: the watch
-    // keeps listening, and the streams above were subscribed first.
-    if let Some(active) = ask_active(&proxy).await
-        && sender.send(lock_state(active)).is_err()
-    {
-        return;
-    }
-    let mut retry = false;
+    // The first ask is not a new owner, and the core starts unlocked, so a
+    // failure sends nothing. The streams above were subscribed first. Only
+    // a timeout is asked again: an error reply here means no shield yet,
+    // and the owner change that brings one asks it.
+    let mut retry = match ask_active(&proxy).await {
+        Ok(active) => {
+            if sender.send(lock_state(active)).is_err() {
+                return;
+            }
+            false
+        }
+        Err(unanswered) => {
+            log_unavailable(&unanswered);
+            matches!(unanswered, Unanswered::TimedOut)
+        }
+    };
     loop {
         let woke = tokio::select! {
             biased;
@@ -143,20 +152,25 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
             else => return,
         };
         match woke {
-            Woke::Retry => {
-                match report_owner_lock(&proxy, &sender).await {
-                    OwnerReport::Stop => return,
-                    OwnerReport::Known => retry = false,
-                    OwnerReport::Unknown => retry = true,
+            Woke::Retry => match ask_active(&proxy).await {
+                Ok(active) => {
+                    retry = false;
+                    if sender.send(lock_state(active)).is_err() {
+                        return;
+                    }
+                    // Queued before or during this ask: the answer is newer.
+                    discard_queued(changes.as_mut());
                 }
-                // The timer won the select, so a signal queued during the
-                // wait is still here. It must not replace the ask.
-                discard_queued(changes.as_mut());
-            }
-            Woke::Heard(Heard::Active { active, stamp }) => {
-                if !keep_signal(stamp, generation.load(Ordering::Acquire)) {
-                    continue;
+                // Unlocked already stands for this owner. A signal queued
+                // meanwhile is this owner's and still applies.
+                Err(unanswered) => {
+                    tracing::debug!(
+                        reason = %unanswered,
+                        "org.gnome.ScreenSaver still not answering"
+                    );
                 }
+            },
+            Woke::Heard(Heard::Active(active)) => {
                 retry = false;
                 if sender.send(lock_state(active)).is_err() {
                     return;
@@ -164,25 +178,27 @@ async fn follow(connection: Connection, sender: mpsc::UnboundedSender<ScreenLock
             }
             Woke::Heard(Heard::Owner(false)) => {
                 retry = false;
-                generation.fetch_add(1, Ordering::Release);
                 if sender.send(ScreenLock::Unlocked).is_err() {
                     return;
                 }
-                // A signal still queued under the owner that left would be
-                // stamped with this generation on the next poll and could
-                // lock a screen that no shield is hiding.
+                // Queued under the owner that left. Delivered later, it
+                // could lock a screen that no shield is hiding.
                 discard_queued(changes.as_mut());
             }
             Woke::Heard(Heard::Owner(true)) => {
-                generation.fetch_add(1, Ordering::Release);
+                // Queued under the previous owner: not this shield's state.
+                discard_queued(changes.as_mut());
                 match report_owner_lock(&proxy, &sender).await {
                     OwnerReport::Stop => return,
-                    OwnerReport::Known => retry = false,
+                    OwnerReport::Known => {
+                        retry = false;
+                        // Queued while this ask ran: the answer is newer.
+                        discard_queued(changes.as_mut());
+                    }
+                    // This owner's signals queued during the ask still
+                    // apply after the Unlocked.
                     OwnerReport::Unknown => retry = true,
                 }
-                // Queued under the previous owner, or while this ask ran.
-                // Delivered on the next poll, it replaces `GetActive`.
-                discard_queued(changes.as_mut());
             }
         }
     }
@@ -198,8 +214,11 @@ async fn report_owner_lock(
     sender: &mpsc::UnboundedSender<ScreenLock>,
 ) -> OwnerReport {
     let (state, known) = match ask_active(proxy).await {
-        Some(active) => (lock_state(active), true),
-        None => (ScreenLock::Unlocked, false),
+        Ok(active) => (lock_state(active), true),
+        Err(unanswered) => {
+            log_unavailable(&unanswered);
+            (ScreenLock::Unlocked, false)
+        }
     };
     if sender.send(state).is_err() {
         return OwnerReport::Stop;
@@ -213,42 +232,26 @@ async fn report_owner_lock(
 
 /// `GetActive`, bounded by the D-Bus reply timeout. `gio` has no
 /// cancellable on this call; dropping the future is what ends the wait.
-/// `None` is logged. The first failure stays quiet at the caller.
-async fn ask_active(proxy: &ScreenSaverProxy<'_>) -> Option<bool> {
+async fn ask_active(proxy: &ScreenSaverProxy<'_>) -> Result<bool, Unanswered> {
     match tokio::time::timeout(crate::dbus::REPLY_TIMEOUT, proxy.get_active()).await {
-        Ok(Ok(active)) => Some(active),
-        Ok(Err(error)) => {
-            tracing::info!(
-                reason = %error,
-                "org.gnome.ScreenSaver not available: pause_when_locked waits for it"
-            );
-            None
-        }
-        Err(_elapsed) => {
-            tracing::info!(
-                "org.gnome.ScreenSaver not available: pause_when_locked waits for it"
-            );
-            None
-        }
+        Ok(answer) => answer.map_err(Unanswered::Failed),
+        Err(_elapsed) => Err(Unanswered::TimedOut),
     }
 }
 
-/// Drops `ActiveChanged` values already queued. A later poll is a later
-/// signal. The stamp is taken at poll time, so leaving them for the next
-/// `select` would treat a previous owner's bool as current.
-fn discard_queued<S: Stream + ?Sized>(stream: Pin<&mut S>) {
-    let _ = take_ready(stream);
+fn log_unavailable(unanswered: &Unanswered) {
+    tracing::info!(
+        reason = %unanswered,
+        "org.gnome.ScreenSaver not available: pause_when_locked waits for it"
+    );
 }
 
-/// Signals already queued on `stream`. A pending poll leaves them there.
-fn take_ready<S: Stream + ?Sized>(mut stream: Pin<&mut S>) -> Vec<S::Item> {
-    let waker = std::task::Waker::noop();
-    let mut context = Context::from_waker(&waker);
-    let mut ready = Vec::new();
-    while let Poll::Ready(Some(item)) = stream.as_mut().poll_next(&mut context) {
-        ready.push(item);
-    }
-    ready
+/// Drops the `ActiveChanged` signals already queued on `stream`, so the
+/// next `select` does not apply them. A pending poll leaves the stream as
+/// it was.
+fn discard_queued<S: Stream + ?Sized>(mut stream: Pin<&mut S>) {
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    while let Poll::Ready(Some(_)) = stream.as_mut().poll_next(&mut context) {}
 }
 
 fn lock_state(active: bool) -> ScreenLock {
@@ -261,11 +264,13 @@ fn lock_state(active: bool) -> ScreenLock {
 
 #[cfg(test)]
 mod tests {
-    use super::keep_signal;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    use super::detached;
 
     #[test]
-    fn a_signal_from_the_previous_owner_generation_is_dropped() {
-        assert!(keep_signal(0, 0));
-        assert!(!keep_signal(0, 1));
+    fn a_detached_watch_stays_open() {
+        let mut lock = detached();
+        assert_eq!(lock.try_recv(), Err(TryRecvError::Empty));
     }
 }

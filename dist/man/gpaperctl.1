@@ -1,4 +1,4 @@
-.TH GPAPERCTL 1 2026-11-14 "gpaperd 0.1.0" "User Commands"
+.TH GPAPERCTL 1 2026-11-27 "gpaperd 0.1.1" "User Commands"
 .SH NAME
 gpaperctl \- control a running gpaperd
 .SH SYNOPSIS
@@ -56,7 +56,8 @@ first wrote them, and pause both styles.
 .B resume
 hands the keys back to
 .BR gpaperd .
-Fails when no original keys are saved.
+Fails when no original keys are saved, for example when the state file
+was lost while the keys pointed at the slots.
 .TP
 .B status
 Print the style on screen, the next change in local time, and for each
@@ -87,6 +88,8 @@ Print the daemon's JSON document as it is sent:
 .B usable
 and
 .BR bad .
+Remote ids are printed in full, credentials and query string included;
+do not share this output as it is.
 .TP
 .BR \-h ", " \-\-help
 Print help and exit.
@@ -101,6 +104,13 @@ The daemon carried out the command.
 .B 1
 The daemon is not running or did not answer, the session bus cannot be
 reached, the reload was refused, or the daemon reported an error.
+With
+.BR "apply_mode = \(dquri\(dq" ,
+.B next
+and
+.B previous
+also exit 1 when the image changed but the key write waits for a retry or
+the next change.
 The reason goes to stderr.
 .TP
 .B 2

@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use gpaperd_core::catalog::{BadReason, ItemId};
-use gpaperd_core::config::{ApplyMode, Config, ConfigError, EmptyStylePolicy};
+use gpaperd_core::config::{
+    ApplyMode, Config, ConfigError, EmptyStylePolicy, ExternalChangePolicy,
+};
 use gpaperd_core::control::{
     BadItem, Command, HISTORY_LEN, Reply, ReplyId, STATUS_VERSION, StyleTarget,
 };
@@ -166,11 +168,7 @@ fn next_for_both_fails_when_one_style_cannot_rotate() {
 fn a_retry_of_both_does_not_advance_the_style_that_moved() {
     let mut config = alphabetical();
     config.general.empty_style = EmptyStylePolicy::KeepCurrent;
-    let mut world = World::new(init(
-        config,
-        &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"],
-        &[],
-    ));
+    let mut world = World::new(init(config, &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"], &[]));
     world.start(at(0), Style::Light);
     world.ask(at(10), 1, Command::Next(StyleTarget::Both));
 
@@ -188,11 +186,7 @@ fn a_retry_of_both_does_not_advance_the_style_that_moved() {
 fn a_single_style_next_after_a_partial_both_still_advances() {
     let mut config = alphabetical();
     config.general.empty_style = EmptyStylePolicy::KeepCurrent;
-    let mut world = World::new(init(
-        config,
-        &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"],
-        &[],
-    ));
+    let mut world = World::new(init(config, &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"], &[]));
     world.start(at(0), Style::Light);
     world.ask(at(10), 1, Command::Next(StyleTarget::Both));
 
@@ -200,6 +194,39 @@ fn a_single_style_next_after_a_partial_both_still_advances() {
 
     assert_eq!(published(&alone), [(Style::Light, "/l/c.jpg")]);
     assert_eq!(the_reply(&alone), &Reply::Done);
+}
+
+#[test]
+fn a_second_retry_of_both_advances_the_style_that_moved() {
+    let mut config = alphabetical();
+    config.general.empty_style = EmptyStylePolicy::KeepCurrent;
+    let mut world = World::new(init(config, &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"], &[]));
+    world.start(at(0), Style::Light);
+    world.ask(at(10), 1, Command::Next(StyleTarget::Both));
+    world.ask(at(20), 2, Command::Next(StyleTarget::Both));
+
+    let again = world.ask(at(30), 3, Command::Next(StyleTarget::Both));
+
+    assert_eq!(published(&again), [(Style::Light, "/l/c.jpg")]);
+}
+
+#[test]
+fn a_retry_of_both_advances_a_style_that_rotated_since() {
+    let mut config = alphabetical();
+    config.general.empty_style = EmptyStylePolicy::KeepCurrent;
+    let mut world = World::new(init(
+        config,
+        &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg", "/l/d.jpg"],
+        &[],
+    ));
+    world.start(at(0), Style::Light);
+    world.ask(at(10), 1, Command::Next(StyleTarget::Both));
+    world.run(at(1000), DEADLINE);
+    assert_eq!(world.current(Style::Light), Some(id("/l/c.jpg")));
+
+    let retried = world.ask(at(1010), 2, Command::Next(StyleTarget::Both));
+
+    assert_eq!(published(&retried), [(Style::Light, "/l/d.jpg")]);
 }
 
 #[test]
@@ -609,11 +636,51 @@ fn an_older_config_read_does_not_replace_a_newer_one() {
     );
 
     assert!(matches!(the_reply(&early), Reply::Reloaded(Err(_))));
-    assert!(published(&early).is_empty());
-    assert_eq!(published(&applied), [(Style::Light, "/l/b.jpg")]);
-    assert!(replies(&applied).iter().any(|(id, reply)| {
-        *id == 2 && *reply == &Reply::Reloaded(Ok(()))
-    }));
+    assert!(probed(&early).is_empty());
+    assert_eq!(probed(&applied), [(Style::Light, "/l/b.jpg")]);
+    assert!(
+        replies(&applied)
+            .iter()
+            .any(|(id, reply)| { *id == 2 && *reply == &Reply::Reloaded(Ok(())) })
+    );
+}
+
+#[test]
+fn a_failed_newest_config_read_replaces_the_older_ones() {
+    let mut world = running_world();
+    step(&mut world.model, at(100), control(1, Command::Reload));
+    step(&mut world.model, at(101), control(2, Command::Reload));
+    let mut short = alphabetical();
+    short.styles.light.interval = Duration::from_secs(60);
+
+    let broken = step(
+        &mut world.model,
+        at(102),
+        Event::ConfigRead {
+            id: ReplyId(2),
+            result: Err(ConfigError {
+                line: 1,
+                column: 1,
+                message: "broken".to_owned(),
+            }),
+        },
+    );
+    let late = step(
+        &mut world.model,
+        at(103),
+        Event::ConfigRead {
+            id: ReplyId(1),
+            result: Ok(short),
+        },
+    );
+
+    assert!(
+        replies(&broken)
+            .iter()
+            .any(|(id, reply)| { *id == 1 && matches!(reply, Reply::Reloaded(Err(_))) })
+    );
+    assert!(replies(&late).is_empty());
+    assert!(probed(&late).is_empty());
 }
 
 #[test]
@@ -835,4 +902,21 @@ fn uri_mode_announces_the_image_with_its_key_write() {
     let announced_at = position(&trace, |effect| *effect == announced);
     assert!(position(&trace, is_set_keys) < announced_at);
     assert_eq!(the_reply(&trace), &Reply::Done);
+}
+
+#[test]
+fn next_in_uri_mode_does_not_wait_for_a_key_written_later() {
+    let mut config = alphabetical();
+    config.general.apply_mode = ApplyMode::Uri;
+    config.general.on_external_change = ExternalChangePolicy::ReassertNextTick;
+    let mut world = World::new(two_folders_with(config));
+    world.start(at(0), Style::Light);
+    world.set_key(at(5), Style::Light, "file:///home/u/Pictures/picked.jpg");
+
+    let trace = world.ask(at(10), 1, NEXT);
+
+    let Reply::Failed(why) = the_reply(&trace) else {
+        panic!("expected a failure");
+    };
+    assert!(why.contains("written later"), "{why}");
 }
