@@ -6,7 +6,7 @@ use gpaperd_core::style::{PerStyle, Style};
 
 use crate::support::{
     DEADLINE, World, alphabetical, armed, at, count, foreign_slot, init, is_ready, is_set_keys,
-    probed, published,
+    keys_written, probed, published, slot_uris,
 };
 
 #[test]
@@ -77,9 +77,15 @@ fn two_empty_styles_keep_their_slots_and_idle() {
 
     let trace = world.start(at(0), Style::Light);
 
+    let uris = slot_uris();
+    let both = PerStyle {
+        light: Some(uris.light.as_str()),
+        dark: Some(uris.dark.as_str()),
+    };
     assert!(probed(&trace).is_empty());
+    assert!(published(&trace).is_empty());
     assert!(armed(&trace).is_empty());
-    assert_eq!(count(&trace, is_set_keys), 1);
+    assert_eq!(keys_written(&trace), [(both, None)]);
     assert_eq!(count(&trace, is_ready), 1);
 }
 

@@ -43,6 +43,133 @@ die() {
     exit 1
 }
 
+# An XDG base is kept only when it is absolute. Anything else is the
+# home fallback, matching Paths::resolve.
+absolute_base() {
+    case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$2" ;;
+    esac
+}
+
+# Purge must not rm -rf a relative path the daemon does not use.
+remove_abs_trees() {
+    for dir in "$@"; do
+        case "$dir" in
+        /*) ;;
+        *) die "refusing to remove a relative path: $dir" ;;
+        esac
+    done
+    rm -rf -- "$@"
+}
+
+line_ends_with() {
+    text=$1
+    suffix=$2
+    text_len=${#text}
+    suffix_len=${#suffix}
+    [ "$text_len" -ge "$suffix_len" ] || return 1
+    drop=$((text_len - suffix_len))
+    while [ "$drop" -gt 0 ]; do
+        text=${text#?}
+        drop=$((drop - 1))
+    done
+    [ "$text" = "$suffix" ]
+}
+
+# The archive name is a fixed string. A miss does not run sha256sum.
+checksum_archive() {
+    archive=$1
+    sums=$2
+    found=
+    while IFS= read -r line || [ -n "$line" ]; do
+        if line_ends_with "$line" " $archive"; then
+            [ -z "$found" ] || die "SHA256SUMS names $archive more than once"
+            found=$line
+        fi
+    done < "$sums"
+    [ -n "$found" ] || die "checksum mismatch for $archive"
+    printf '%s\n' "$found" > "$work/checksum-line"
+    (cd "$work" && sha256sum -c --status checksum-line) ||
+        die "checksum mismatch for $archive"
+}
+
+# One ExecStart word. systemd splits on spaces, expands % and $, and
+# treats \ as a C escape. Do not pass the path through sed.
+systemd_exec_word() {
+    path=$1
+    escaped=
+    while [ -n "$path" ]; do
+        char=$(printf '%.1s' "$path")
+        path=${path#?}
+        case "$char" in
+        \\) escaped=$(printf '%s\\\\' "$escaped") ;;
+        '"') escaped=$(printf '%s\\"' "$escaped") ;;
+        %) escaped=$(printf '%s%%%%' "$escaped") ;;
+        '$') escaped=$(printf '%s$$' "$escaped") ;;
+        *) escaped=$(printf '%s%s' "$escaped" "$char") ;;
+        esac
+    done
+    printf '"%s"' "$escaped"
+}
+
+write_user_unit() {
+    src_unit=$1
+    dest=$2
+    exec_path=$3
+    case "$exec_path" in
+    *'
+'*) die "install prefix contains a newline" ;;
+    esac
+    unit_new=$unit_dir/.gpaperd.service.new
+    exec_word=$(systemd_exec_word "$exec_path")
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+        ExecStart=*) printf 'ExecStart=%s\n' "$exec_word" ;;
+        *) printf '%s\n' "$line" ;;
+        esac
+    done < "$src_unit" > "$unit_new"
+    chmod 644 "$unit_new"
+    mv -f "$unit_new" "$dest"
+}
+
+install_starter_config() {
+    config_dir=$1
+    example=$2
+    if [ ! -d "$config_dir" ]; then
+        mkdir -p "$config_dir"
+        chmod 700 "$config_dir"
+    fi
+    cp "$example" "$config_dir/config.example.toml"
+    config_file=$config_dir/config.toml
+    if [ -e "$config_file" ]; then
+        say "kept your config: $config_file"
+        return
+    fi
+    (
+        umask 077
+        set -C
+        cat > "$config_file" <<'EOF'
+# gpaperd config. Every key: man 5 gpaperd.toml, or config.example.toml here.
+# Edits apply while gpaperd runs; `gpaperd check-config` validates this file.
+
+[general]
+interval = "15m"        # 1m ..= 1h
+order = "random"        # or "alphabetical"
+
+[light]
+sources = ["~/Pictures/Wallpapers/light"]
+
+[dark]
+sources = ["~/Pictures/Wallpapers/dark"]
+EOF
+    )
+    chmod 600 "$config_file"
+    mkdir -p "$HOME/Pictures/Wallpapers/light" "$HOME/Pictures/Wallpapers/dark"
+    say "wrote a starter config: $config_file"
+    say "put images into ~/Pictures/Wallpapers/light and ~/Pictures/Wallpapers/dark"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
     --version)
@@ -66,10 +193,10 @@ done
 
 [ "$(id -u)" -ne 0 ] || die "run this as your own user, not as root: gpaperd is a per-user service"
 
-config_home=${XDG_CONFIG_HOME:-$HOME/.config}
-data_home=${XDG_DATA_HOME:-$HOME/.local/share}
-state_home=${XDG_STATE_HOME:-$HOME/.local/state}
-cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+config_home=$(absolute_base "${XDG_CONFIG_HOME:-}" "$HOME/.config")
+data_home=$(absolute_base "${XDG_DATA_HOME:-}" "$HOME/.local/share")
+state_home=$(absolute_base "${XDG_STATE_HOME:-}" "$HOME/.local/state")
+cache_home=$(absolute_base "${XDG_CACHE_HOME:-}" "$HOME/.cache")
 bin_dir="$prefix/bin"
 man_dir="$prefix/share/man"
 unit_dir="$config_home/systemd/user"
@@ -97,7 +224,8 @@ uninstall() {
         "$man_dir/man1/gpaperd.1" "$man_dir/man1/gpaperctl.1" "$man_dir/man5/gpaperd.toml.5"
     if have_systemd; then systemctl --user daemon-reload || true; fi
     if [ "$purge" -eq 1 ]; then
-        rm -rf "$config_home/gpaperd" "$data_home/gpaperd" "$state_home/gpaperd" "$cache_home/gpaperd"
+        remove_abs_trees "$config_home/gpaperd" "$data_home/gpaperd" \
+            "$state_home/gpaperd" "$cache_home/gpaperd"
         say "removed gpaperd, its config, state, slots and cache"
     else
         say "removed gpaperd; config ($config_home/gpaperd) and state stay (use --purge to remove them)"
@@ -118,12 +246,14 @@ aarch64 | arm64) arch="aarch64" ;;
 esac
 [ "$(uname -s)" = "Linux" ] || die "gpaperd runs on Linux only"
 
+# Same seconds as gpaperd_ctl::CALL_TIMEOUT. This file states no other bound.
+call_timeout=35
 if has curl; then
-    fetch() { curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
-    fetch_text() { curl --proto '=https' --tlsv1.2 -fsSL "$1"; }
+    fetch() { curl --proto '=https' --tlsv1.2 --max-time "$call_timeout" -fsSL "$1" -o "$2"; }
+    fetch_text() { curl --proto '=https' --tlsv1.2 --max-time "$call_timeout" -fsSL "$1"; }
 elif has wget; then
-    fetch() { wget -q --https-only -O "$2" "$1"; }
-    fetch_text() { wget -q --https-only -O - "$1"; }
+    fetch() { wget -q --https-only --timeout="$call_timeout" -O "$2" "$1"; }
+    fetch_text() { wget -q --https-only --timeout="$call_timeout" -O - "$1"; }
 else
     die "curl or wget is needed"
 fi
@@ -148,8 +278,7 @@ say "downloading $name"
 fetch "$base/$name.tar.gz" "$work/$name.tar.gz" ||
     die "no $arch build in release $version (see https://github.com/$repo/releases)"
 fetch "$base/SHA256SUMS" "$work/SHA256SUMS" || die "release $version has no SHA256SUMS"
-(cd "$work" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c --status) ||
-    die "checksum mismatch for $name.tar.gz"
+checksum_archive "$name.tar.gz" "$work/SHA256SUMS"
 tar -C "$work" -xzf "$work/$name.tar.gz"
 src="$work/$name"
 
@@ -169,32 +298,10 @@ for bin in gpaperd gpaperctl; do
 done
 cp "$src/dist/man/gpaperd.1" "$src/dist/man/gpaperctl.1" "$man_dir/man1/"
 cp "$src/dist/man/gpaperd.toml.5" "$man_dir/man5/"
-sed "s|^ExecStart=.*|ExecStart=$bin_dir/gpaperd|" "$src/dist/gpaperd.service" >"$unit"
+write_user_unit "$src/dist/gpaperd.service" "$unit" "$bin_dir/gpaperd"
 say "installed $("$bin_dir/gpaperd" --version) to $bin_dir"
 
-mkdir -p "$config_home/gpaperd"
-cp "$src/dist/config.example.toml" "$config_home/gpaperd/config.example.toml"
-if [ ! -e "$config_home/gpaperd/config.toml" ]; then
-    cat >"$config_home/gpaperd/config.toml" <<'EOF'
-# gpaperd config. Every key: man 5 gpaperd.toml, or config.example.toml here.
-# Edits apply while gpaperd runs; `gpaperd check-config` validates this file.
-
-[general]
-interval = "15m"        # 1m ..= 1h
-order = "random"        # or "alphabetical"
-
-[light]
-sources = ["~/Pictures/Wallpapers/light"]
-
-[dark]
-sources = ["~/Pictures/Wallpapers/dark"]
-EOF
-    mkdir -p "$HOME/Pictures/Wallpapers/light" "$HOME/Pictures/Wallpapers/dark"
-    say "wrote a starter config: $config_home/gpaperd/config.toml"
-    say "put images into ~/Pictures/Wallpapers/light and ~/Pictures/Wallpapers/dark"
-else
-    say "kept your config: $config_home/gpaperd/config.toml"
-fi
+install_starter_config "$config_home/gpaperd" "$src/dist/config.example.toml"
 
 # --- checks -----------------------------------------------------------------
 

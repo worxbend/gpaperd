@@ -1,13 +1,13 @@
 //! The write of the background keys: each key once, when its slot exists.
 
 use gpaperd_core::config::{Config, EmptyStylePolicy, PictureOptions};
-use gpaperd_core::event::Effect;
+use gpaperd_core::event::{Effect, Event};
 use gpaperd_core::style::{PerStyle, Style};
 
 use crate::support::{
-    DEADLINE, World, alphabetical, at, count, dark_folder_starts_broken, init, is_ready,
-    is_set_keys, keys_pointed, published, running_world, slot_uris, started, two_folders,
-    two_folders_with, user_keys,
+    CLOCK_CHANGED, DEADLINE, World, alphabetical, armed, at, count, dark_folder_starts_broken,
+    init, is_ready, is_set_keys, keys_pointed, keys_written, published, running_world, slot_uris,
+    started, two_folders, two_folders_with, user_keys,
 };
 
 fn set_keys_written(config: Config, picture_options: &str) -> Vec<Effect> {
@@ -117,4 +117,94 @@ fn picture_options_are_written_with_the_first_key_only() {
     let light_key_and_options = slot_keys(&[Style::Light], Some(PictureOptions::Spanned));
     let dark_key = slot_keys(&[Style::Dark], None);
     assert_eq!(written, [light_key_and_options, dark_key]);
+}
+
+#[test]
+fn a_refused_key_write_is_tried_again_after_a_minute() {
+    let mut world = running_world();
+    let slots = slot_uris();
+    let failed = Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: Some(slots.light),
+            dark: Some(slots.dark),
+        },
+        picture_options: Some(PictureOptions::Zoom),
+    };
+
+    let at_fail = world.run(at(100), failed);
+    let too_soon = world.run(at(159), DEADLINE);
+    let retried = world.run(at(160), DEADLINE);
+
+    assert!(keys_pointed(&at_fail).is_empty());
+    assert_eq!(armed(&at_fail), [Some(at(160))]);
+    assert!(keys_pointed(&too_soon).is_empty());
+    let zoom = keys_written(&retried).last().map(|(_, options)| *options);
+    assert_eq!(zoom, Some(Some(PictureOptions::Zoom)));
+}
+
+#[test]
+fn an_event_during_the_minute_does_not_pull_the_retry_forward() {
+    let mut world = running_world();
+    let slots = slot_uris();
+    let failed = Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: Some(slots.light),
+            dark: Some(slots.dark),
+        },
+        picture_options: Some(PictureOptions::Zoom),
+    };
+
+    world.run(at(100), failed);
+    let during = world.run(at(120), CLOCK_CHANGED);
+    let still_waiting = world.run(at(121), DEADLINE);
+    let retried = world.run(at(160), DEADLINE);
+
+    assert_eq!(armed(&during).last(), Some(&Some(at(160))));
+    assert!(keys_pointed(&still_waiting).is_empty());
+    assert!(!keys_pointed(&retried).is_empty());
+}
+
+#[test]
+fn a_refused_picture_options_write_waits_a_minute() {
+    let mut world = running_world();
+    let failed = Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: None,
+            dark: None,
+        },
+        picture_options: Some(PictureOptions::Zoom),
+    };
+
+    let at_fail = world.run(at(100), failed);
+    let too_soon = world.run(at(159), DEADLINE);
+    let retried = world.run(at(160), DEADLINE);
+
+    assert!(keys_pointed(&at_fail).is_empty());
+    assert_eq!(armed(&at_fail), [Some(at(160))]);
+    assert!(keys_pointed(&too_soon).is_empty());
+    let zoom = keys_written(&retried).last().map(|(_, options)| *options);
+    assert_eq!(zoom, Some(Some(PictureOptions::Zoom)));
+}
+
+#[test]
+fn a_refused_write_of_one_style_still_retries_the_other() {
+    let mut world = running_world();
+    let slots = slot_uris();
+    let failed = Event::KeyWriteFailed {
+        uris: PerStyle {
+            light: Some("file:///other".to_owned()),
+            dark: Some(slots.dark),
+        },
+        picture_options: Some(PictureOptions::Zoom),
+    };
+
+    let at_fail = world.run(at(100), failed);
+    let too_soon = world.run(at(159), DEADLINE);
+    let retried = world.run(at(160), DEADLINE);
+
+    assert!(keys_pointed(&at_fail).is_empty());
+    assert!(keys_pointed(&too_soon).is_empty());
+    assert_eq!(keys_pointed(&retried), [vec![Style::Dark]]);
+    let zoom = keys_written(&retried).last().map(|(_, options)| *options);
+    assert_eq!(zoom, Some(Some(PictureOptions::Zoom)));
 }

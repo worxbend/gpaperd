@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use rand::SeedableRng;
@@ -377,13 +377,16 @@ impl Model {
     /// Restoring: `current`, `slot`, the clock and the shuffle round come
     /// from `init.restored`. A restored id that is no longer in the catalog
     /// is not an error: `current` is kept, because the slot still shows that
-    /// image, and bag entries are dropped when reached. An image that the
-    /// restored round neither holds nor showed is new since the last run and
-    /// joins the round at a random position. When the configured order is
-    /// alphabetical the restored round is ignored.
+    /// image. A restored bag is not cut to a length. Local ids neither
+    /// catalog knows are dropped when every catalog is known, before the
+    /// next draw; known ids keep their order. `shown` is not shortened.
+    /// An image that the restored round neither holds nor showed is
+    /// new since the last run and joins the round at a random position. When
+    /// the configured order is alphabetical the restored round is ignored.
     ///
     /// A style whose `init.local_files` is `None` starts with an unknown
-    /// catalog, and all of the above happens when its scan arrives.
+    /// catalog. Unknown local bag ids are dropped once every style's catalog
+    /// is known.
     pub fn new(init: ModelInit) -> Model {
         let ModelInit {
             config,
@@ -557,16 +560,17 @@ impl Model {
         let slot_uri = self.lockable_uri(style);
         let is_locked = self.locks[style];
         let state = &mut self.styles[style];
+        let Some(value) = value else {
+            // A later uri-mode start still has to recognize the last daemon URI.
+            state.key.pause = Some(Pause::NoKey);
+            return;
+        };
         let saved_uri = state.saved_key_uri.take();
         // What the daemon's own value of the key is: the slot URI, or in uri
         // mode the image URI that the last run wrote.
         let daemons_uri = slot_uri.clone().or(saved_uri);
         let user_paused = state.user_paused;
         let key = &mut state.key;
-        let Some(value) = value else {
-            key.pause = Some(Pause::NoKey);
-            return;
-        };
         // Each is as if this run had written the daemon's value: a locked
         // key that names the slot, the key of a style that the last run left
         // paused by an external change, and a user-paused key that holds the
@@ -788,9 +792,47 @@ impl Model {
     /// Makes `style`'s catalog hold exactly the files of a scan. From now on
     /// the catalog is known.
     pub(crate) fn replace_catalog(&mut self, style: Style, files: Vec<LocalFile>) -> CatalogDelta {
+        let catalogs_were_known = self.catalogs_are_known();
         self.is_scanned[style] = true;
         self.awaits_rescan[style] = false;
-        self.catalogs[style].replace(files)
+        let delta = self.catalogs[style].replace(files);
+        if !catalogs_were_known && self.catalogs_are_known() {
+            for each in Style::ALL {
+                self.drop_unknown_bag(each);
+            }
+        }
+        delta
+    }
+
+    fn catalogs_are_known(&self) -> bool {
+        Style::ALL.into_iter().all(|style| self.is_scanned[style])
+    }
+
+    /// Drops local bag ids neither catalog knows. Known ids stay, in order.
+    /// A URL stays: its blob may still be on its way into the catalog.
+    fn drop_unknown_bag(&mut self, style: Style) {
+        if self.config.styles[style].order != Order::Random {
+            return;
+        }
+        let queued: Vec<ItemId> = self.styles[style].bag.queue().cloned().collect();
+        let shown: Vec<ItemId> = self.styles[style].bag.shown().cloned().collect();
+        let knows_shown = self.styles[style].bag.knows_shown();
+        let queue: Vec<ItemId> = queued
+            .into_iter()
+            .filter(|id| self.bag_id_is_known(id))
+            .collect();
+        self.styles[style].bag = if knows_shown {
+            ShuffleBag::restore(queue, shown)
+        } else {
+            ShuffleBag::restore_queue_only(queue)
+        };
+    }
+
+    fn bag_id_is_known(&self, id: &ItemId) -> bool {
+        Url::parse(id.as_str()).is_ok()
+            || Style::ALL
+                .into_iter()
+                .any(|style| self.catalogs[style].get(id).is_some())
     }
 
     /// Records that `style`'s sources changed and their scan is to come.
@@ -1061,10 +1103,13 @@ impl Model {
         if let Some(item) = self.catalogs[style].get(id) {
             return item.is_candidate().then(|| Candidate::of(item));
         }
-        let is_remote = Url::parse(id.as_str()).is_ok();
-        (!is_remote).then(|| Candidate {
+        let text = id.as_str();
+        if !is_pre_scan_path(text) {
+            return None;
+        }
+        Some(Candidate {
             id: id.clone(),
-            path: PathBuf::from(id.as_str()),
+            path: PathBuf::from(text),
             version: None,
         })
     }
@@ -1107,6 +1152,13 @@ impl Model {
             self.catalogs[style].set_remote(cached)
         })
     }
+}
+
+/// Whether `id` may be opened before the first scan. A relative id would be
+/// opened from the process cwd, and a lossy id is not the saved path. A URL
+/// has no file until the cache says so.
+fn is_pre_scan_path(id: &str) -> bool {
+    Url::parse(id).is_err() && Path::new(id).is_absolute() && !id.contains('\u{FFFD}')
 }
 
 /// Whether `catalog` holds `id` in `version`.

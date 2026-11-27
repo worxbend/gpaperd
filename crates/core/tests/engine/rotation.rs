@@ -62,11 +62,10 @@ fn a_publish_carries_the_configured_link_policy() {
 
     let trace = world.start(at(0), Style::Light);
 
-    let always_copies = |effect: &Effect| match effect {
-        Effect::Publish { link, .. } => *link == LinkPolicy::AlwaysCopy,
-        _ => true,
+    let always_copies = |effect: &Effect| {
+        matches!(effect, Effect::Publish { link, .. } if *link == LinkPolicy::AlwaysCopy)
     };
-    assert!(trace.iter().all(always_copies));
+    assert!(trace.iter().any(always_copies));
 }
 
 #[test]

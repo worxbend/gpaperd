@@ -352,6 +352,65 @@ fn reassert_next_tick_gives_a_style_with_one_image_a_tick() {
 }
 
 #[test]
+fn reassert_next_tick_writes_a_hidden_one_image_style_back() {
+    let single = init(
+        policy(ExternalChangePolicy::ReassertNextTick),
+        &["/l/only.jpg"],
+        &["/d/only.jpg"],
+    );
+    let mut world = World::new(single);
+    world.start(at(0), Style::Light);
+
+    let at_change = world.set_key(at(100), Style::Dark, PICKED);
+    let before = world.run(at(999), DEADLINE);
+    let at_tick = world.run(at(1000), DEADLINE);
+
+    assert_eq!(armed(&at_change), [Some(at(1000))]);
+    assert!(published(&at_change).is_empty());
+    assert!(keys_pointed(&before).is_empty());
+    assert!(published(&at_tick).is_empty());
+    assert_eq!(keys_pointed(&at_tick), [[Style::Dark]]);
+}
+
+#[test]
+fn an_event_during_a_hidden_reassert_does_not_pull_it_forward() {
+    let single = init(
+        policy(ExternalChangePolicy::ReassertNextTick),
+        &["/l/only.jpg"],
+        &["/d/only.jpg"],
+    );
+    let mut world = World::new(single);
+    world.start(at(0), Style::Light);
+    world.set_key(at(100), Style::Dark, PICKED);
+
+    let during = world.run(at(200), CLOCK_CHANGED);
+    let too_soon = world.run(at(201), DEADLINE);
+
+    assert_eq!(armed(&during).last(), Some(&Some(at(1000))));
+    assert!(keys_pointed(&too_soon).is_empty());
+}
+
+#[test]
+fn a_hidden_style_does_not_wait_on_a_stopped_clock() {
+    let images = init(
+        policy(ExternalChangePolicy::ReassertNextTick),
+        &["/l/only.jpg"],
+        &["/d/a.jpg", "/d/b.jpg"],
+    );
+    let mut world = World::new(images);
+    world.start(at(0), Style::Light);
+
+    let at_change = world.set_key(at(100), Style::Dark, PICKED);
+    let before = world.run(at(999), DEADLINE);
+    let at_due = world.run(at(1000), DEADLINE);
+
+    assert_eq!(armed(&at_change), [Some(at(1000))]);
+    assert!(keys_pointed(&before).is_empty());
+    assert!(published(&at_due).is_empty());
+    assert_eq!(keys_pointed(&at_due), [[Style::Dark]]);
+}
+
+#[test]
 fn a_restart_with_every_style_paused_writes_no_picture_options() {
     let mut config = alphabetical();
     config.general.picture_options = Some(PictureOptions::Zoom);

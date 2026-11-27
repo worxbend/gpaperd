@@ -6,7 +6,7 @@
 //! them into [`Item`]s, so identity and de-duplication rules live in one
 //! place.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -31,12 +31,13 @@ impl ItemId {
         ItemId(id.into())
     }
 
-    /// The id of a local file. `path` must be canonical. A non-UTF-8 path is
-    /// converted lossily; I/O uses [`LocalFile::path`], not the id. The one
-    /// exception is the item that the state file names for a slot: before
-    /// the first scan of a run, nothing else says where its file is.
+    /// The id of a local file. `path` must be canonical and UTF-8.
+    ///
+    /// The id is that path, byte for byte. A non-UTF-8 path has no id:
+    /// lossy text would merge two files, and another encoding would change
+    /// the id persist stores. Catalog inserts skip that path.
     pub fn from_path(path: &Path) -> ItemId {
-        ItemId(path.to_string_lossy().into_owned())
+        catalog_id(path).expect("a catalog id is the UTF-8 path")
     }
 
     /// The id of a remote image: its URL as written in the config.
@@ -226,8 +227,16 @@ pub struct CatalogDelta {
 ///
 /// Invariant: no two items share a [`FileId`], so symlinks, hardlinks and
 /// overlapping folders count once. Of the paths to one file, the smallest id
-/// is the item, whatever order the files were found in: a catalog that
-/// followed changes equals one built from a scan of the same files.
+/// is the item, whatever order the files were found in. Its stamp is the
+/// greatest [`FileStamp`] those paths showed (id, then size, then mtime),
+/// so a newer hard link is not dropped while a stale path stays the item.
+/// A catalog that followed changes equals one built from a scan of the same
+/// files.
+///
+/// One path in a scan keeps the greatest stamp of its listings. That is the
+/// stamp the watcher stores and can report again. A change keeps the last
+/// stamp it carries, including a lesser one: the watcher already merged the
+/// sources before it reported the change.
 ///
 /// A check belongs to a version of a file, which is its [`FileStamp`]. It is
 /// kept for as long as the catalog holds an item with that stamp, under
@@ -246,38 +255,36 @@ pub struct Catalog {
 impl Catalog {
     /// Builds a catalog from scan output, with every item [`Check::Unchecked`].
     ///
-    /// The id is [`ItemId::from_path`] of the file's path. When several files
-    /// share a [`FileId`], the one with the smallest id is kept, so the result
-    /// does not depend on input order.
+    /// The id is the path text when the path is UTF-8. A non-UTF-8 path is
+    /// skipped. When several paths share a [`FileId`], the smallest id is
+    /// the item and it keeps the greatest stamp seen for that file. A path
+    /// listed twice keeps the greatest stamp.
     pub fn from_local_files(files: Vec<LocalFile>) -> Catalog {
         let mut catalog = Catalog::default();
         catalog.replace(files);
         catalog
     }
 
-    /// Makes the catalog hold exactly the files of a new scan. Duplicates
-    /// are allowed, as in [`Catalog::from_local_files`].
-    pub fn replace(&mut self, mut files: Vec<LocalFile>) -> CatalogDelta {
-        // A path that was scanned twice may have two stamps. The sort makes
-        // the same one win whatever order the scanner found them in.
-        files.sort_by(|a, b| (&a.path, a.stamp).cmp(&(&b.path, b.stamp)));
+    /// Makes the catalog hold exactly the files of a new scan. A path may
+    /// be listed more than once; the greatest stamp is kept.
+    pub fn replace(&mut self, files: Vec<LocalFile>) -> CatalogDelta {
         let mut by_id = BTreeMap::new();
         for file in files {
-            by_id.entry(ItemId::from_path(&file.path)).or_insert(file);
+            record_local(&mut by_id, file);
         }
         self.rebuild(by_id)
     }
 
     /// Applies what the watcher saw, in order. A path that is already known
     /// with the same stamp, and a removed path that is not known, change
-    /// nothing.
+    /// nothing. The last [`FsChange::Found`] for a path is the one kept.
     pub fn apply(&mut self, changes: Vec<FsChange>) -> CatalogDelta {
         let mut files = self.aliases.clone();
         files.extend(self.local_files());
         for change in changes {
             match change {
-                FsChange::Found(file) => files.insert(ItemId::from_path(&file.path), file),
-                FsChange::Removed(path) => files.remove(&ItemId::from_path(&path)),
+                FsChange::Found(file) => store_found(&mut files, file),
+                FsChange::Removed(path) => forget_local(&mut files, &path),
             };
         }
         self.rebuild(files)
@@ -301,15 +308,10 @@ impl Catalog {
             .values()
             .filter_map(|item| Some((local_stamp(item)?, &item.check)))
             .collect();
-        self.aliases.clear();
-        let mut seen_files = BTreeSet::new();
+        let (winners, aliases) = winners_and_aliases(files);
+        self.aliases = aliases;
         let mut delta = CatalogDelta::default();
-        // In id order, so the smallest id of a file is the one that is kept.
-        for (id, file) in files {
-            if !seen_files.insert(file.stamp.id) {
-                self.aliases.insert(id, file);
-                continue;
-            }
+        for (id, file) in winners {
             match before.get(&id) {
                 None => delta.added.push(id.clone()),
                 Some(known) if local_stamp(known) != Some(file.stamp) => {
@@ -405,4 +407,68 @@ fn local_stamp(item: &Item) -> Option<FileStamp> {
         Origin::Local(file) => Some(file.stamp),
         Origin::Remote(_) => None,
     }
+}
+
+/// Catalog key of a local path. `None` when `path` is not UTF-8.
+fn catalog_id(path: &Path) -> Option<ItemId> {
+    path.to_str().map(ItemId::new)
+}
+
+/// Keeps one listing of a scan under its path. A path listed again keeps
+/// the greater [`FileStamp`] (id, then size, then mtime): the stamp the
+/// watcher stores and can report again. A lesser listing from a source
+/// that was not rescanned does not replace it. A non-UTF-8 path is left out.
+fn record_local(files: &mut BTreeMap<ItemId, LocalFile>, file: LocalFile) {
+    let Some(id) = catalog_id(&file.path) else {
+        return;
+    };
+    if let Some(kept) = files.get_mut(&id) {
+        if file.stamp > kept.stamp {
+            *kept = file;
+        }
+        return;
+    }
+    files.insert(id, file);
+}
+
+/// Stores one reported change. The last call for a path wins, even when
+/// its stamp is lesser: the watcher already merged every source, and this
+/// is the stamp it will report. A non-UTF-8 path is left out.
+fn store_found(files: &mut BTreeMap<ItemId, LocalFile>, file: LocalFile) {
+    if let Some(id) = catalog_id(&file.path) {
+        files.insert(id, file);
+    }
+}
+
+fn forget_local(files: &mut BTreeMap<ItemId, LocalFile>, path: &Path) {
+    if let Some(id) = catalog_id(path) {
+        files.remove(&id);
+    }
+}
+
+/// The smallest id of each inode, and every other path.
+///
+/// The item keeps the greatest stamp among those paths. [`FileStamp`] order
+/// is id, then size, then mtime: a later mtime on a hard link replaces a
+/// stale item, and a smaller size does not.
+fn winners_and_aliases(
+    files: BTreeMap<ItemId, LocalFile>,
+) -> (BTreeMap<ItemId, LocalFile>, BTreeMap<ItemId, LocalFile>) {
+    let mut by_file: BTreeMap<FileId, (ItemId, LocalFile)> = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    for (id, file) in files {
+        match by_file.get_mut(&file.stamp.id) {
+            Some((_, kept)) => {
+                if file.stamp > kept.stamp {
+                    kept.stamp = file.stamp;
+                }
+                aliases.insert(id, file);
+            }
+            None => {
+                by_file.insert(file.stamp.id, (id, file));
+            }
+        }
+    }
+    let winners = by_file.into_iter().map(|(_, winner)| winner).collect();
+    (winners, aliases)
 }

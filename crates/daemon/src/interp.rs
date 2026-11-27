@@ -2,11 +2,13 @@
 //! executes the effects it returns.
 //!
 //! One task owns the [`Model`]. Adapters turn the outside world into
-//! [`Event`]s, and every [`Effect`] runs through an adapter. A probe and a
-//! slot write run off the event loop, and their answer comes back as an
-//! event. A scan runs on the thread of its [`SourceWatch`]. A fetch of a
-//! remote image runs as a task of its own. So a stalled network mount or a
-//! slow server cannot hold up a style switch or a shutdown.
+//! [`Event`]s, and every [`Effect`] runs through an adapter. A probe, a
+//! slot write and a state save run off the event loop. A probe's or a slot
+//! write's answer comes back as an event. A scan runs on the thread of its
+//! [`SourceWatch`]. A fetch of a remote image runs as a task of its own.
+//! So a stalled network mount, a slow server or a stalled `fsync` cannot
+//! hold up a style switch or a shutdown. A state save is still awaited, so
+//! a healthy one finishes before a key write that waits on it.
 //!
 //! Control requests from the D-Bus server come in through the
 //! [`ControlPort`]. Each one gets a [`ReplyId`] from [`PendingReplies`],
@@ -105,6 +107,9 @@ pub struct Ports<G, C> {
 pub enum StartError {
     #[error("HTTP client for remote images cannot be built: {0}")]
     HttpClient(#[from] reqwest::Error),
+    /// An existing state file could not be read. It is left in place.
+    #[error("state file cannot be read: {0}")]
+    State(#[from] state::StateError),
 }
 
 /// Why the event loop ended before a shutdown was asked for.
@@ -131,8 +136,9 @@ pub struct Interpreter<G, C> {
     /// Whether the state file holds the user's original keys. Once the keys
     /// are replaced, that file is their only copy.
     originals_saved: bool,
-    /// The key writes that wait until it does, as one write.
-    held_keys: Option<KeyWrite>,
+    /// `false` after the screen-lock channel closes. One close reports
+    /// unlocked; further polls would be `None` every time.
+    screen_lock_open: bool,
     /// The remote cache, shared with the fetches and the garbage collector.
     cache: Arc<Cache>,
     fetcher: Arc<Fetcher>,
@@ -262,12 +268,18 @@ struct SourceWatches {
     /// How many image files the scan of each watch found. `None` while that
     /// scan is still to come.
     images_found: PerStyle<Option<usize>>,
+    /// Whether the watch the core asked for includes a [`Source::Url`].
+    /// A URL is not a file the scan can count.
+    has_url: PerStyle<bool>,
 }
 
 impl SourceWatches {
     /// Scans and watches `sources` for `style` from now on. Dropping the
     /// earlier watch stops it and discards its unread news.
     fn replace(&mut self, style: Style, sources: Vec<Source>) {
+        self.has_url[style] = sources
+            .iter()
+            .any(|source| matches!(source, Source::Url(_)));
         self.watches[style] = Some(SourceWatch::start(sources));
         self.images_found[style] = None;
     }
@@ -286,13 +298,15 @@ impl SourceWatches {
     }
 
     /// Records the scan of `style`'s watch. Once both scans are in and found
-    /// nothing, the daemon has nothing to show: that is worth one warning.
+    /// nothing, and no watched style has a URL, the daemon has nothing to
+    /// show: that is worth one warning. A URL-only style is not empty.
     fn record_scan(&mut self, style: Style, scan: &Scan) {
         self.images_found[style] = Some(scan.files.len());
-        let found_nothing = Style::ALL
+        let every_scan_empty = Style::ALL
             .iter()
             .all(|&scanned| self.images_found[scanned] == Some(0));
-        if found_nothing {
+        let any_url = Style::ALL.iter().any(|&watched| self.has_url[watched]);
+        if every_scan_empty && !any_url {
             tracing::warn!("no image found in any source: the wallpaper stays as it is");
         }
     }
@@ -319,8 +333,11 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     /// that has its I/O driver and its timers enabled, which the image check
     /// needs (see [`Prober::check`]).
     ///
-    /// Nothing here is fatal. A state file that cannot be used is logged and
-    /// the daemon starts without state.
+    /// I/O on an existing state file is fatal: that file is the only copy of
+    /// the user's original keys, and a failed read must not be replaced. A
+    /// corrupt file or an unsupported version is logged and the daemon
+    /// starts without state; the next save replaces it. A missing file is
+    /// no state.
     ///
     /// `config` is the running config until `run` is told of another. `None`
     /// when there is no config file: the daemon then idles, and touches no
@@ -333,6 +350,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     ///
     /// [`StartError::HttpClient`] when the HTTP client cannot be built from
     /// `ports.fetch`: its TLS backend failed to start.
+    /// [`StartError::State`] when an existing state file cannot be read.
     ///
     /// # Panics
     ///
@@ -351,7 +369,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             tokio::task::spawn_blocking(move || -> Result<_, StartError> {
                 // Building the client reads the system's TLS roots.
                 let fetcher = Fetcher::new(Arc::clone(&cache), settings, seed)?;
-                Ok((lay_groundwork(config, &paths, &cache, seed), fetcher))
+                Ok((lay_groundwork(config, &paths, &cache, seed)?, fetcher))
             })
         };
         // Only a panic ends that task early. A panic is a defect: pass it on.
@@ -377,7 +395,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             sources: SourceWatches::default(),
             slots_watch,
             originals_saved,
-            held_keys: None,
+            screen_lock_open: true,
             cache,
             fetcher: Arc::new(fetcher),
             fetches: Fetches::new(),
@@ -423,6 +441,8 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             .await?;
         let mut shutdown = pin!(shutdown);
         loop {
+            let listen_for_lock = self.screen_lock_open;
+            let mut lock_watch_stopped = false;
             let event = tokio::select! {
                 fired = self.ports.clock.wait() => Event::Fired(fired?),
                 Some(answer) = self.answers.recv() => answer,
@@ -431,7 +451,16 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 (style, news) = self.sources.next() => catalog_event(style, news),
                 style = self.slots_watch.lost() => Event::SlotLost(style),
                 Some(request) = self.ports.control.requests.recv() => self.control_event(request),
-                Some(lock) = self.ports.screen_lock.recv() => Event::ScreenLock(lock),
+                lock = self.ports.screen_lock.recv(), if listen_for_lock => match lock {
+                    Some(lock) => Event::ScreenLock(lock),
+                    // A closed watch must not freeze the last lock. One
+                    // unlock, then this arm stays off: a closed channel is
+                    // ready on every poll.
+                    None => {
+                        lock_watch_stopped = true;
+                        Event::ScreenLock(ScreenLock::Unlocked)
+                    }
+                },
                 loaded = config_watch.reloaded() => {
                     match config_event(&self.paths.config_file, loaded) {
                         Some(reload) => reload,
@@ -440,6 +469,10 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 }
                 () = &mut shutdown => Event::Shutdown,
             };
+            if lock_watch_stopped {
+                self.screen_lock_open = false;
+                tracing::warn!("screen lock watch stopped");
+            }
             let is_last = event == Event::Shutdown;
             self.dispatch(event, &config_file).await?;
             if is_last {
@@ -485,9 +518,34 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
 
     /// Steps the core with `event` and executes its effects, in order.
     async fn feed(&mut self, event: Event, config_file: &ConfigFile) -> Result<(), RunError> {
+        let shutting_down = matches!(event, Event::Shutdown);
         let effects = step(&mut self.model, self.ports.clock.now(), event);
+        if shutting_down {
+            self.execute_shutdown(effects, config_file).await
+        } else {
+            for effect in effects {
+                self.execute(effect, config_file).await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Shutdown is `Arm(None)` then `Persist`. A failed disarm is logged and
+    /// the save still runs. Any other arm error still fails the loop.
+    async fn execute_shutdown(
+        &mut self,
+        effects: Vec<Effect>,
+        config_file: &ConfigFile,
+    ) -> Result<(), RunError> {
         for effect in effects {
-            self.execute(effect, config_file).await?;
+            match effect {
+                Effect::Arm(None) => {
+                    if let Err(error) = self.ports.clock.arm(None) {
+                        tracing::error!(reason = %error, "shutdown did not disarm the timer");
+                    }
+                }
+                other => self.execute(other, config_file).await?,
+            }
         }
         Ok(())
     }
@@ -536,14 +594,21 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 self.ports.control.tell(BusNews::Changed { style, item });
             }
             Effect::ReadConfig(id) => self.read_config_later(id, config_file.clone()),
-            Effect::RestoreKeys { id, keys } => self.restore_keys(id, keys).await,
+            Effect::RestoreKeys { id, keys } => self.restore_keys(id, keys, config_file).await?,
         }
         Ok(())
     }
 
     /// Collects the remote cache's garbage on the blocking pool. Nothing
-    /// waits for it; the outcome is logged.
+    /// waits for it; the outcome is logged. Skipped when this process does
+    /// not own the bus name: another gpaperd may be sweeping the same cache.
     fn collect_garbage_later(&self, keep: Vec<Url>) {
+        if self.ports.control.news.is_closed() {
+            tracing::warn!(
+                "remote cache not collected: this process does not own the bus name"
+            );
+            return;
+        }
         let cache = Arc::clone(&self.cache);
         let now = self.ports.clock.now();
         tokio::task::spawn_blocking(move || match cache.collect_garbage(&keep, now) {
@@ -568,9 +633,17 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     }
 
     /// Writes the user's original keys back for `gpaperctl restore`, and
-    /// answers with exactly one `Event::KeysRestored`. The write is awaited
-    /// here, so that no later key write overtakes it.
-    async fn restore_keys(&self, id: ReplyId, keys: BackgroundKeys) {
+    /// feeds exactly one `Event::KeysRestored` before returning to the
+    /// loop. The reply is then sent before a shutdown queued on the same
+    /// select can answer `Failed`. The write is awaited here, so that no
+    /// later key write overtakes it. `KeysRestored` does not emit
+    /// `RestoreKeys`, so the feed does not re-enter this method.
+    async fn restore_keys(
+        &mut self,
+        id: ReplyId,
+        keys: BackgroundKeys,
+        config_file: &ConfigFile,
+    ) -> Result<(), RunError> {
         let result = self.ports.gnome.restore_keys(keys).await;
         match &result {
             Ok(()) => tracing::info!("the user's background keys are restored"),
@@ -578,12 +651,14 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 tracing::error!(reason = %error, "the user's background keys not restored");
             }
         }
-        let restored = Event::KeysRestored {
-            id,
-            result: result.map_err(|error| error.to_string()),
-        };
-        // Nobody listens once the event loop has ended.
-        let _ = self.answer_sender.send(restored);
+        self.feed(
+            Event::KeysRestored {
+                id,
+                result: result.map_err(|error| error.to_string()),
+            },
+            config_file,
+        )
+        .await
     }
 
     fn probe_later(&self, style: Style, item: ItemId, path: PathBuf, max_pixels: u64) {
@@ -639,17 +714,15 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
         });
     }
 
-    /// Writes the keys, unless the user's original keys are not on disk yet:
-    /// then the write waits for the next save that works.
-    async fn set_keys_once_saved(&mut self, write: KeyWrite) {
+    /// Writes the keys when the user's original keys are on disk. A write
+    /// that arrives before that save is not kept: a later save must not
+    /// flush it. The core hears `KeyWriteFailed` and retries the write.
+    async fn set_keys_once_saved(&self, write: KeyWrite) {
         if self.originals_saved {
             self.set_keys(write).await;
         } else {
             tracing::error!("background keys not written: the user's keys are not saved yet");
-            self.held_keys = Some(match self.held_keys.take() {
-                Some(earlier) => merged(earlier, write),
-                None => write,
-            });
+            self.fail_key_write(&write, None);
         }
     }
 
@@ -661,44 +734,71 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             .into_iter()
             .filter(|&style| write.uris[style].is_some())
             .collect();
-        match self.ports.gnome.set_keys(write).await {
+        match self.ports.gnome.set_keys(write.clone()).await {
             Ok(()) => tracing::info!(?styles, "background keys written"),
-            Err(error) => tracing::error!(reason = %error, "background keys not written"),
+            Err(error) => {
+                tracing::error!(reason = %error, "background keys not written");
+                match &error {
+                    GnomeError::Write { unstored, .. } => self.fail_key_write(&write, Some(unstored)),
+                    _ => self.fail_key_write(&write, None),
+                }
+            }
         }
     }
 
-    /// Saves the model as it is after the step that asked for it. A save
-    /// that works releases the key writes that waited for one.
+    /// Tells the core which keys of `write` were not stored. An empty
+    /// `unstored`, or none, means the whole write is unconfirmed.
+    fn fail_key_write(&self, write: &KeyWrite, unstored: Option<&[String]>) {
+        let keeps = |key: &str, value: Option<String>| -> Option<String> {
+            let named = match unstored {
+                None | Some([]) => true,
+                Some(names) => names.iter().any(|name| name == key),
+            };
+            named.then_some(value).flatten()
+        };
+        let options_named = match unstored {
+            None | Some([]) => true,
+            Some(names) => names.iter().any(|name| name == "picture-options"),
+        };
+        let failed = Event::KeyWriteFailed {
+            uris: PerStyle {
+                light: keeps("picture-uri", write.uris.light.clone()),
+                dark: keeps("picture-uri-dark", write.uris.dark.clone()),
+            },
+            picture_options: options_named.then_some(write.picture_options).flatten(),
+        };
+        let _ = self.answer_sender.send(failed);
+    }
+
+    /// Saves the model as it is after the step that asked for it. The save
+    /// runs on the blocking pool and is awaited, so a healthy one finishes
+    /// before a later key write in this step. A stalled `sync_all` does not
+    /// freeze the loop's other tasks. It does not flush a key write that
+    /// was refused because an earlier save failed.
     async fn persist(&mut self) {
-        if let Err(error) = state::save(&self.paths.state_file, &self.model.persisted()) {
-            tracing::error!(reason = %error, "state not saved");
-            return;
+        let path = self.paths.state_file.clone();
+        let saved = self.model.persisted();
+        let written = tokio::task::spawn_blocking(move || state::save(&path, &saved))
+            .await
+            .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()));
+        match written {
+            Ok(()) => self.originals_saved = true,
+            Err(error) => tracing::error!(reason = %error, "state not saved"),
         }
-        // From `Started` on, every saved state holds the original keys.
-        self.originals_saved = true;
-        if let Some(held) = self.held_keys.take() {
-            self.set_keys(held).await;
-        }
-    }
-}
-
-/// Two key writes as one. Where both name a value, the later one counts.
-fn merged(earlier: KeyWrite, later: KeyWrite) -> KeyWrite {
-    KeyWrite {
-        uris: PerStyle {
-            light: later.uris.light.or(earlier.uris.light),
-            dark: later.uris.dark.or(earlier.uris.dark),
-        },
-        picture_options: later.picture_options.or(earlier.picture_options),
     }
 }
 
 /// Blocking I/O: see [`Interpreter::start`].
-fn lay_groundwork(config: Option<Config>, paths: &Paths, cache: &Cache, seed: u64) -> Groundwork {
+fn lay_groundwork(
+    config: Option<Config>,
+    paths: &Paths,
+    cache: &Cache,
+    seed: u64,
+) -> Result<Groundwork, StartError> {
     if let Err(error) = slots::sweep_temp_files(&paths.slots_dir) {
         tracing::warn!(reason = %error, "temp files of an earlier run are still there");
     }
-    let restored = restore_state(&paths.state_file);
+    let restored = restore_state(&paths.state_file)?;
     let originals_saved = restored
         .as_ref()
         .is_some_and(|saved| saved.original_keys.is_some());
@@ -710,21 +810,27 @@ fn lay_groundwork(config: Option<Config>, paths: &Paths, cache: &Cache, seed: u6
         seed,
         slot_uris: PerStyle::from_fn(|style| slot_uri(paths, style)),
     });
-    Groundwork {
+    Ok(Groundwork {
         model,
         originals_saved,
         slots_watch: SlotsWatch::start(paths.slots_dir.clone()),
         cached: cache.load(),
-    }
+    })
 }
 
-/// The saved state of the last run. A file that cannot be used is logged and
-/// the daemon starts without state; the next save replaces the file.
-fn restore_state(state_file: &Path) -> Option<Persisted> {
-    state::load(state_file).unwrap_or_else(|error| {
-        tracing::warn!(reason = %error, "state file ignored");
-        None
-    })
+/// The saved state of the last run. A missing file is no state. Corrupt
+/// JSON and an unsupported version are logged and start as no state; the
+/// next save replaces them. Any other error, including I/O on a file that
+/// exists, is returned and the file is left as it is.
+fn restore_state(state_file: &Path) -> Result<Option<Persisted>, state::StateError> {
+    match state::load(state_file) {
+        Ok(saved) => Ok(saved),
+        Err(error @ (state::StateError::Corrupt(_) | state::StateError::UnsupportedVersion { .. })) => {
+            tracing::warn!(reason = %error, "state file ignored");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether the core applies a config for `event`: a config file that was

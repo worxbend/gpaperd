@@ -163,6 +163,46 @@ fn next_for_both_fails_when_one_style_cannot_rotate() {
 }
 
 #[test]
+fn a_retry_of_both_does_not_advance_the_style_that_moved() {
+    let mut config = alphabetical();
+    config.general.empty_style = EmptyStylePolicy::KeepCurrent;
+    let mut world = World::new(init(
+        config,
+        &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"],
+        &[],
+    ));
+    world.start(at(0), Style::Light);
+    world.ask(at(10), 1, Command::Next(StyleTarget::Both));
+
+    let retried = world.ask(at(20), 2, Command::Next(StyleTarget::Both));
+
+    assert!(published(&retried).is_empty());
+    assert_eq!(world.current(Style::Light), Some(id("/l/b.jpg")));
+    let Reply::Failed(why) = the_reply(&retried) else {
+        panic!("expected a failure");
+    };
+    assert!(why.contains("dark"), "{why}");
+}
+
+#[test]
+fn a_single_style_next_after_a_partial_both_still_advances() {
+    let mut config = alphabetical();
+    config.general.empty_style = EmptyStylePolicy::KeepCurrent;
+    let mut world = World::new(init(
+        config,
+        &["/l/a.jpg", "/l/b.jpg", "/l/c.jpg"],
+        &[],
+    ));
+    world.start(at(0), Style::Light);
+    world.ask(at(10), 1, Command::Next(StyleTarget::Both));
+
+    let alone = world.ask(at(20), 2, Command::Next(StyleTarget::Light));
+
+    assert_eq!(published(&alone), [(Style::Light, "/l/c.jpg")]);
+    assert_eq!(the_reply(&alone), &Reply::Done);
+}
+
+#[test]
 fn next_whose_candidates_all_fail_replies_with_a_failure() {
     let mut world = running_world();
     world.broken.insert(id("/l/b.jpg"));
@@ -531,6 +571,73 @@ fn refresh_remote_fetches_every_url_again() {
 }
 
 #[test]
+fn refresh_remote_before_the_cache_is_loaded_is_not_done() {
+    let a = "https://img.test/a.jpg";
+    let b = "https://img.test/b.jpg";
+    let mut world = World::new(init(remote_config(&[a], &[b]), &[], &[]));
+    world.start(at(0), Style::Light);
+
+    let trace = world.ask(at(1), 1, Command::RefreshRemote);
+
+    assert!(matches!(the_reply(&trace), Reply::Failed(_)));
+    assert!(fetches(&trace).is_empty());
+}
+
+#[test]
+fn an_older_config_read_does_not_replace_a_newer_one() {
+    let mut world = running_world();
+    step(&mut world.model, at(100), control(1, Command::Reload));
+    step(&mut world.model, at(101), control(2, Command::Reload));
+    let mut short = alphabetical();
+    short.styles.light.interval = Duration::from_secs(60);
+
+    let early = step(
+        &mut world.model,
+        at(102),
+        Event::ConfigRead {
+            id: ReplyId(1),
+            result: Ok(short.clone()),
+        },
+    );
+    let applied = step(
+        &mut world.model,
+        at(103),
+        Event::ConfigRead {
+            id: ReplyId(2),
+            result: Ok(short),
+        },
+    );
+
+    assert!(matches!(the_reply(&early), Reply::Reloaded(Err(_))));
+    assert!(published(&early).is_empty());
+    assert_eq!(published(&applied), [(Style::Light, "/l/b.jpg")]);
+    assert!(replies(&applied).iter().any(|(id, reply)| {
+        *id == 2 && *reply == &Reply::Reloaded(Ok(()))
+    }));
+}
+
+#[test]
+fn next_is_not_done_before_the_repair_probe() {
+    let mut world = running_world();
+    let asked = step(&mut world.model, at(10), control(1, NEXT));
+    assert_eq!(probed(&asked), [(Style::Light, "/l/b.jpg")]);
+    assert!(replies(&asked).is_empty());
+
+    let failed = step(
+        &mut world.model,
+        at(11),
+        Event::Probed {
+            style: Style::Light,
+            item: id("/l/b.jpg"),
+            verdict: Err(BadReason::NotAnImage),
+        },
+    );
+
+    assert_eq!(probed(&failed), [(Style::Light, "/l/c.jpg")]);
+    assert!(replies(&failed).is_empty());
+}
+
+#[test]
 fn restore_writes_the_original_keys_and_pauses_both_styles() {
     let mut world = running_world();
 
@@ -707,8 +814,8 @@ fn next_before_the_first_scan_waits_for_it() {
         crate::support::scanned(Style::Light, &["/l/a.jpg", "/l/b.jpg"]),
     );
 
-    // Nothing to pick from before the scan: a reply all the same.
-    assert_eq!(replies(&asked).len(), 1);
+    // Nothing to pick from before the scan: the reply says so.
+    assert!(matches!(the_reply(&asked), Reply::Failed(_)));
     assert!(replies(&scanned).is_empty());
 }
 

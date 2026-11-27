@@ -7,7 +7,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
-use std::mem;
 
 use rand::seq::SliceRandom;
 use rand::{Rng, RngExt};
@@ -22,8 +21,9 @@ pub struct ShuffleBag {
     /// The items the current round showed, oldest first. None of them gets
     /// a second place in the round.
     shown: Vec<ItemId>,
-    /// The round was restored without what it showed. Whatever first joins
-    /// it is the catalog as the round left it, so it was shown.
+    /// The round was restored without what it showed. The scan is that
+    /// catalog: none of it joins the round. A remote id before the scan is
+    /// new and may join.
     is_shown_unknown: bool,
 }
 
@@ -45,7 +45,7 @@ impl ShuffleBag {
 
     /// Restores the rest of a round from a persisted queue, next item first,
     /// when what the round showed was not saved: a state file from before
-    /// M2. The first [`ShuffleBag::insert`] tells it.
+    /// M2. The scan's [`ShuffleBag::insert`] tells it.
     pub fn restore_queue_only(queue: Vec<ItemId>) -> ShuffleBag {
         ShuffleBag {
             is_shown_unknown: true,
@@ -66,8 +66,7 @@ impl ShuffleBag {
     }
 
     /// Whether [`ShuffleBag::shown`] is all that the round showed. Not so
-    /// for a round from [`ShuffleBag::restore_queue_only`] that nothing
-    /// joined yet.
+    /// for a round from [`ShuffleBag::restore_queue_only`] until the scan.
     pub fn knows_shown(&self) -> bool {
         !self.is_shown_unknown
     }
@@ -98,6 +97,7 @@ impl ShuffleBag {
         failed: &[ItemId],
         rng: &mut impl Rng,
     ) -> Option<ItemId> {
+        self.remember_on_screen(on_screen);
         if let Some(next) = self.pop_next(catalog, on_screen, failed) {
             return Some(next);
         }
@@ -112,20 +112,29 @@ impl ShuffleBag {
     /// holds every item anyway. An id that is queued already, or that the
     /// round showed, is left out: no item has two turns in a round.
     ///
-    /// The first insert into a round from [`ShuffleBag::restore_queue_only`]
-    /// adds nothing: it records the ids as shown, because the round began
-    /// with every item that it does not hold.
+    /// A round from [`ShuffleBag::restore_queue_only`] does not know what it
+    /// showed until the scan. The cache load before that scan is not the
+    /// scan: it leaves the round unknown, and a remote id the round does not
+    /// hold joins it. The scan passes local ids and joins nothing. Each local
+    /// id the round does not hold was shown, including the one on screen when
+    /// the scan passes it.
     pub fn insert(&mut self, ids: impl IntoIterator<Item = ItemId>, rng: &mut impl Rng) {
         if self.queue.is_empty() {
             return;
         }
+        let incoming: Vec<ItemId> = ids.into_iter().collect();
         let in_round: BTreeSet<&ItemId> = self.queue.iter().chain(&self.shown).collect();
-        let newcomers: BTreeSet<ItemId> = ids
-            .into_iter()
-            .filter(|id| !in_round.contains(id))
+        let newcomers: BTreeSet<ItemId> = incoming
+            .iter()
+            .filter(|id| !in_round.contains(*id))
+            .cloned()
             .collect();
-        if mem::take(&mut self.is_shown_unknown) {
+        // Local ids are the scan. The cache load before it is only remote
+        // ids, and an empty newcomer set must not end the unknown state.
+        let is_scan = self.is_shown_unknown && incoming.iter().any(|id| !is_remote_id(id));
+        if is_scan {
             self.shown.extend(newcomers);
+            self.is_shown_unknown = false;
             return;
         }
         for id in newcomers {
@@ -171,6 +180,18 @@ impl ShuffleBag {
         next
     }
 
+    /// `on_screen` had its turn when it is in neither half of the round.
+    /// An id the queue still holds is waiting, not shown.
+    fn remember_on_screen(&mut self, on_screen: Option<&ItemId>) {
+        let Some(id) = on_screen else {
+            return;
+        };
+        if self.queue.contains(id) || self.shown.contains(id) {
+            return;
+        }
+        self.mark_shown(id);
+    }
+
     fn start_round(&mut self, catalog: &Catalog, on_screen: Option<&ItemId>, rng: &mut impl Rng) {
         let mut round: Vec<ItemId> = catalog.candidates().map(|item| item.id.clone()).collect();
         round.shuffle(rng);
@@ -203,7 +224,8 @@ pub fn next_alphabetical(catalog: &Catalog, cursor: Option<&ItemId>) -> Option<I
 }
 
 /// Sort order of two ids: natural and case-insensitive on the file name (the
-/// text after the last `/`), ties broken by the whole id.
+/// text after the last `/`, and before any `?` or `#`), ties broken by the
+/// whole id.
 ///
 /// It takes ids, not items, because the cursor may name a file that is gone.
 pub fn compare_ids(a: &ItemId, b: &ItemId) -> Ordering {
@@ -212,5 +234,14 @@ pub fn compare_ids(a: &ItemId, b: &ItemId) -> Ordering {
 
 fn file_name(id: &ItemId) -> &str {
     let id = id.as_str();
-    id.rsplit_once('/').map_or(id, |(_, name)| name)
+    let segment = id.rsplit_once('/').map_or(id, |(_, name)| name);
+    segment
+        .split_once(['?', '#'])
+        .map_or(segment, |(name, _)| name)
+}
+
+/// `http` and `https` ids are the cache. Anything else is a scan path.
+fn is_remote_id(id: &ItemId) -> bool {
+    let id = id.as_str();
+    id.starts_with("https://") || id.starts_with("http://")
 }

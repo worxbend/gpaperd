@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use gpaperd_core::catalog::FileId;
@@ -21,7 +21,7 @@ use crate::scan::file_id;
 /// Atomically replaces `slot` with the content of `src`. Blocking I/O.
 ///
 /// Stages `.<slot name>.tmp-<pid>` next to the slot, then renames it over the
-/// slot. The slot's directory is created when missing.
+/// slot. The slot's directory is created when missing, then set to mode `0700`.
 ///
 /// Staging with [`LinkPolicy::PreferLink`] tries a hardlink, then a reflink
 /// (`FICLONE`), then a copy. With [`LinkPolicy::AlwaysCopy`] it copies. A
@@ -38,7 +38,9 @@ use crate::scan::file_id;
 pub fn publish(src: &Path, slot: &Path, link: LinkPolicy) -> io::Result<SlotWrite> {
     let temp = temp_path(slot)?;
     if let Some(dir) = temp.parent() {
+        // A 0644 hardlink stays private only while this directory is not traversable.
         fs::create_dir_all(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     remove_if_present(&temp)?; // left by a crash of a process with this pid
     stage(src, &temp, slot, link)
@@ -264,6 +266,30 @@ mod tests {
         publish(&day, &slot, LinkPolicy::PreferLink).unwrap();
 
         assert_eq!(fs::read_to_string(&slot).unwrap(), "day");
+    }
+
+    #[test]
+    fn publish_creates_a_private_slots_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("share/gpaperd/slots");
+        let day = write_source(dir.path(), "day.jpg", "day");
+
+        publish(&day, &slots_dir.join("light"), LinkPolicy::PreferLink).unwrap();
+
+        assert_eq!(fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS, 0o700);
+    }
+
+    #[test]
+    fn publish_makes_an_existing_slots_directory_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("slots");
+        fs::create_dir(&slots_dir).unwrap();
+        fs::set_permissions(&slots_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let day = write_source(dir.path(), "day.jpg", "day");
+
+        publish(&day, &slots_dir.join("light"), LinkPolicy::PreferLink).unwrap();
+
+        assert_eq!(fs::metadata(&slots_dir).unwrap().mode() & PERMISSION_BITS, 0o700);
     }
 
     #[test]

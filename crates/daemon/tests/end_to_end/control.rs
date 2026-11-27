@@ -14,8 +14,8 @@ use gpaperd_daemon::dbus::{self, OwnError};
 
 use crate::bus::PrivateBus;
 use crate::world::{
-    ALPHABETICAL, Daemon, LIGHT_INTERVAL, MINUTE, PATIENCE, SEED, World, eventually,
-    let_the_daemon_run, scenario, users_keys,
+    ALPHABETICAL, Daemon, LIGHT_INTERVAL, MINUTE, PATIENCE, SEED, World, eventually, scenario,
+    start_time, users_keys,
 };
 
 /// How often [`property_becomes`] reads again.
@@ -113,8 +113,14 @@ fn a_paused_style_skips_its_deadline_and_rotates_on_resume() {
         let client = bus.client().await;
 
         client.pause("light").await.expect("Pause(light)");
-        world.clock.advance(LIGHT_INTERVAL + MINUTE);
-        let_the_daemon_run().await;
+        let armed = world.clock.times_armed();
+        world
+            .clock
+            .step_to(start_time() + LIGHT_INTERVAL + MINUTE);
+        eventually("the paused style's deadline is observed", || {
+            world.clock.times_armed() > armed
+        })
+        .await;
 
         let paused = status_report(&client).await;
         assert_eq!(paused.styles.light.paused, [Pause::User]);
@@ -176,16 +182,23 @@ fn restore_writes_the_users_keys_back_and_pauses_both_styles() {
         }
         // The keys stay the user's until a resume.
         let writes_before = world.gnome.key_writes().len();
-        world.clock.advance(LIGHT_INTERVAL + MINUTE);
-        let_the_daemon_run().await;
+        let armed = world.clock.times_armed();
+        world
+            .clock
+            .step_to(start_time() + LIGHT_INTERVAL + MINUTE);
+        eventually("the deadline after restore is observed", || {
+            world.clock.times_armed() > armed
+        })
+        .await;
         status_report(&client).await;
         assert_eq!(world.gnome.keys(), users_keys());
         assert_eq!(world.gnome.key_writes().len(), writes_before);
 
         client.resume("both").await.expect("Resume(both)");
 
-        eventually("the slot URIs in the keys", || {
+        eventually("the slot URIs in both keys", || {
             world.gnome.key(Style::Light) == Some(world.slot_uri(Style::Light))
+                && world.gnome.key(Style::Dark) == Some(world.slot_uri(Style::Dark))
         })
         .await;
         daemon.terminate().await;
@@ -209,6 +222,31 @@ fn restore_whose_write_fails_returns_the_error() {
             Some(world.slot_uri(Style::Light))
         );
         daemon.terminate().await;
+    });
+}
+
+#[test]
+fn a_restore_in_flight_when_the_daemon_stops_is_not_answered_failed() {
+    scenario(async {
+        let bus = PrivateBus::start();
+        let (world, mut daemon) = running_daemon(&bus).await;
+        let client = bus.client().await;
+        let (release, entered) = world.gnome.hold_the_next_restore();
+        let pending = tokio::task::spawn_local(async move { client.restore().await });
+        tokio::time::timeout(PATIENCE, entered)
+            .await
+            .expect("restore to start")
+            .expect("the restore entered");
+
+        daemon.signal_stop();
+        release.send(()).expect("release the restore");
+        let reply = tokio::time::timeout(PATIENCE, pending)
+            .await
+            .expect("restore to finish")
+            .expect("the client task");
+
+        assert!(reply.is_ok(), "{reply:?}");
+        assert!(daemon.outcome().await.is_ok());
     });
 }
 

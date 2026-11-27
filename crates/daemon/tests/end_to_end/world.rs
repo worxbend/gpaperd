@@ -279,7 +279,7 @@ impl World {
         fs::rename(&draft, &file).expect("put the config file in place");
     }
 
-    fn config_file(&self) -> ConfigFile {
+    pub fn config_file(&self) -> ConfigFile {
         ConfigFile {
             path: self.paths().config_file,
             home_dir: self.root.clone(),
@@ -292,6 +292,26 @@ impl World {
     pub fn start_daemon(&self, config: Config, seed: u64) -> Daemon {
         let config_watch = ConfigWatch::start(self.config_file());
         self.launch(Some(config), config_watch, seed, BusPorts::detached())
+    }
+
+    /// Starts the daemon on `config` with `screen_lock` instead of a bus
+    /// watch. The control interface is detached.
+    pub fn start_daemon_with_screen_lock(
+        &self,
+        config: Config,
+        seed: u64,
+        screen_lock: UnboundedReceiver<ScreenLock>,
+    ) -> Daemon {
+        let config_watch = ConfigWatch::start(self.config_file());
+        self.launch(
+            Some(config),
+            config_watch,
+            seed,
+            BusPorts {
+                control: ControlPort::detached(),
+                screen_lock,
+            },
+        )
     }
 
     /// Starts the daemon the way `main` does: on the config file, or idle
@@ -346,7 +366,7 @@ impl World {
         };
         Daemon {
             notices,
-            stop,
+            stop: Some(stop),
             run: tokio::task::spawn_local(run),
             _bus: None,
         }
@@ -560,7 +580,7 @@ impl io::Write for LogBook {
 /// A running interpreter and the scenario's hold on it.
 pub struct Daemon {
     notices: UnboundedReceiver<Notice>,
-    stop: oneshot::Sender<()>,
+    stop: Option<oneshot::Sender<()>>,
     run: JoinHandle<Result<(), RunError>>,
     /// The connection that owns the bus name, when the daemon serves its
     /// control interface.
@@ -605,9 +625,17 @@ impl Daemon {
             .expect("the daemon to be running")
     }
 
+    /// Asks the daemon to stop the way `SIGTERM` does, and keeps the task
+    /// so the scenario can wait for the answer to a request already in flight.
+    pub fn signal_stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.send(()).expect("the daemon to be running");
+        }
+    }
+
     /// Stops the daemon the way `SIGTERM` does and waits until it is gone.
-    pub async fn terminate(self) {
-        self.stop.send(()).expect("the daemon to be running");
+    pub async fn terminate(mut self) {
+        self.signal_stop();
         let outcome = stopped(self.run).await;
         assert!(outcome.is_ok(), "the daemon failed: {outcome:?}");
     }
@@ -642,6 +670,9 @@ struct FakeSession {
     key_writes: RefCell<Vec<KeyWrite>>,
     /// Every restore of the keys that a daemon asked for, oldest first.
     restores: RefCell<Vec<BackgroundKeys>>,
+    /// The next restore waits here. The sender tells the test it has
+    /// entered; the receiver lets it continue. Before any key changes.
+    restore_hold: RefCell<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl FakeGnome {
@@ -655,6 +686,7 @@ impl FakeGnome {
             events: RefCell::new(None),
             key_writes: RefCell::new(Vec::new()),
             restores: RefCell::new(Vec::new()),
+            restore_hold: RefCell::new(None),
         };
         FakeGnome {
             session: Rc::new(session),
@@ -685,6 +717,15 @@ impl FakeGnome {
     /// Every key write that a daemon asked for, oldest first.
     pub fn key_writes(&self) -> Vec<KeyWrite> {
         self.session.key_writes.borrow().clone()
+    }
+
+    /// The next `restore_keys` tells the test it has entered, then waits
+    /// for `release`, before it changes a key.
+    pub fn hold_the_next_restore(&self) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+        let (release, released) = oneshot::channel();
+        let (entered_sender, entered) = oneshot::channel();
+        *self.session.restore_hold.borrow_mut() = Some((entered_sender, released));
+        (release, entered)
     }
 
     /// Every restore of the keys that a daemon asked for, oldest first.
@@ -771,11 +812,19 @@ impl GnomePort for FakeGnome {
             writes_so_far <= MAX_KEY_WRITES,
             "the daemon writes the keys without end"
         );
+        // A locked key on another value fails before any key of the write
+        // changes, including `picture-options`.
+        let locked = self.names_locked_on_another_value(&write);
+        if !locked.is_empty() {
+            return Err(GnomeError::Write {
+                reason: format!("locked keys: {}", locked.join(", ")),
+                unstored: names_of_write(&write),
+            });
+        }
         let before = self.keys();
-        let mut locked = Vec::new();
         for style in Style::ALL {
             if let Some(uri) = write.uris[style].clone() {
-                locked.extend(self.write_uri(style, uri).err());
+                self.write_uri(style, uri).expect("the lock was checked");
             }
         }
         if let Some(options) = write.picture_options {
@@ -785,16 +834,16 @@ impl GnomePort for FakeGnome {
         if after != before {
             self.report(GnomeEvent::KeysChanged(after));
         }
-        if locked.is_empty() {
-            Ok(())
-        } else {
-            let reason = format!("locked keys: {}", locked.join(", "));
-            Err(GnomeError::Write(reason))
-        }
+        Ok(())
     }
 
     async fn restore_keys(&self, keys: BackgroundKeys) -> Result<(), GnomeError> {
         self.session.restores.borrow_mut().push(keys.clone());
+        let hold = self.session.restore_hold.borrow_mut().take();
+        if let Some((entered, release)) = hold {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
         let before = self.keys();
         // A locked key that holds another value refuses the transaction.
         let is_refused = {
@@ -807,7 +856,14 @@ impl GnomePort for FakeGnome {
                 || refuses(Style::Dark, keys.picture_uri_dark.as_ref())
         };
         if is_refused {
-            return Err(GnomeError::Write("locked keys".to_owned()));
+            return Err(GnomeError::Write {
+                reason: "locked keys".to_owned(),
+                unstored: vec![
+                    "picture-uri".to_owned(),
+                    "picture-uri-dark".to_owned(),
+                    "picture-options".to_owned(),
+                ],
+            });
         }
         {
             let held = &mut self.session.snapshot.borrow_mut().keys;
@@ -827,6 +883,41 @@ impl GnomePort for FakeGnome {
     }
 }
 
+impl FakeGnome {
+    /// URI keys of `write` that are locked on a different value.
+    fn names_locked_on_another_value(&self, write: &KeyWrite) -> Vec<&'static str> {
+        let snapshot = self.session.snapshot.borrow();
+        let mut names = Vec::new();
+        for style in Style::ALL {
+            let Some(uri) = write.uris[style].as_deref() else {
+                continue;
+            };
+            let held = snapshot.keys.uri(style);
+            if snapshot.locked[style] && held.is_some_and(|current| current != uri) {
+                names.push(match style {
+                    Style::Light => "picture-uri",
+                    Style::Dark => "picture-uri-dark",
+                });
+            }
+        }
+        names
+    }
+}
+
+fn names_of_write(write: &KeyWrite) -> Vec<String> {
+    let mut names = Vec::new();
+    if write.uris.light.is_some() {
+        names.push("picture-uri".to_owned());
+    }
+    if write.uris.dark.is_some() {
+        names.push("picture-uri-dark".to_owned());
+    }
+    if write.picture_options.is_some() {
+        names.push("picture-options".to_owned());
+    }
+    names
+}
+
 /// A wall clock that stands still until the scenario moves it.
 #[derive(Clone)]
 pub struct FakeClock {
@@ -844,6 +935,8 @@ struct FakeTime {
     alarms: Cell<usize>,
     /// Signalled when `now`, `armed` or `was_stepped` changed.
     changed: Notify,
+    /// The next `arm(None)` fails once. A test double for a disarm error.
+    fail_disarm: Cell<bool>,
 }
 
 impl FakeClock {
@@ -855,6 +948,7 @@ impl FakeClock {
             was_stepped: Cell::new(false),
             alarms: Cell::new(0),
             changed: Notify::new(),
+            fail_disarm: Cell::new(false),
         };
         FakeClock {
             time: Rc::new(time),
@@ -889,6 +983,11 @@ impl FakeClock {
         self.time.times_armed.get()
     }
 
+    /// The next disarm (`arm(None)`) fails once.
+    pub fn fail_the_next_disarm(&self) {
+        self.time.fail_disarm.set(true);
+    }
+
     fn is_due(&self) -> bool {
         self.armed().is_some_and(|deadline| deadline <= self.time())
     }
@@ -909,6 +1008,9 @@ impl Clock for FakeClock {
     }
 
     fn arm(&self, deadline: Option<SystemTime>) -> io::Result<()> {
+        if deadline.is_none() && self.time.fail_disarm.replace(false) {
+            return Err(io::Error::other("disarm failed"));
+        }
         self.time.armed.set(deadline);
         self.time.times_armed.set(self.times_armed() + 1);
         self.time.changed.notify_one();

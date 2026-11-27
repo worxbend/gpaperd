@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use url::Url;
 
 use crate::catalog::{BadReason, CatalogDelta, FileId, ItemId, Version};
-use crate::config::ApplyMode;
+use crate::config::{ApplyMode, ExternalChangePolicy};
 #[cfg(doc)]
 use crate::control::Reply;
 #[cfg(doc)]
@@ -35,6 +35,8 @@ pub const MAX_PUBLISH_ATTEMPTS: u32 = 5;
 pub const HIDDEN_REFRESH_DELAY: Duration = Duration::from_millis(500);
 /// How long `reassert-now` waits before it writes the keys back.
 pub const REASSERT_DELAY: Duration = Duration::from_secs(1);
+/// How long a refused key write waits before the next try.
+pub const KEY_WRITE_RETRY: Duration = Duration::from_secs(60);
 /// External key changes within one minute that `reassert-now` writes back.
 /// One more pauses the style: another tool is fighting for the keys.
 pub const MAX_KEY_FLIPS_PER_MINUTE: u32 = 3;
@@ -202,11 +204,18 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     once and any other keeps its deadline.
 ///   - `reassert-next-tick`: the key is written back when the next rotation
 ///     of any style is due. A style with nothing to rotate to gets a tick
-///     for this, one interval after the change.
+///     for this, one interval after the change. A hidden style whose clock
+///     is stopped, and no other style will tick, gets that same interval
+///     on its own: nothing else would make `AtNextTick` come due.
 ///   - `reassert-now`: the key is written back after [`REASSERT_DELAY`],
 ///     unless it holds the daemon's URI again by then. One change more than
 ///     [`MAX_KEY_FLIPS_PER_MINUTE`] within a minute pauses the style, as
 ///     `pause` does.
+/// - [`Event::KeyWriteFailed`]: the write did not land. Each style whose
+///   recorded URI is still the one that failed is dropped and tried again
+///   after [`KEY_WRITE_RETRY`]. A style the failure does not name is left
+///   alone. A failure of `picture-options` alone arms the same retry.
+///   Options owed for a write that still matches are restored.
 /// - [`Event::ConfigChanged`] with `Err`: nothing. The running config stays.
 /// - [`Event::ConfigChanged`] with `Ok`: the new config is the running one
 ///   from here on, and what differs is applied:
@@ -219,10 +228,13 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///   - `order`: the shuffle round is dropped. The alphabetical cursor is the
 ///     image on screen, which stays.
 ///   - `picture_options`: a new value is written, alone when no URI is owed.
-///     A value that left the config leaves the key alone.
+///     A value that left the config is not written, and one stored at start
+///     but not sent yet is dropped.
 ///   - `apply_mode`: both styles are filled anew, with the images they show,
 ///     and the keys follow.
 ///   - `max_pixels`: when it went up, every "too large" verdict is dropped.
+///     When it went down, the image on screen is probed again against the
+///     new cap.
 ///   - URLs: a URL that no style listed is fetched as at start. One that no
 ///     style lists any more leaves the catalogs at once and gets an
 ///     [`Effect::DropRemote`].
@@ -298,17 +310,18 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///   Later events yield no effects, except a [`Reply::Failed`] for an
 ///   [`Event::Control`].
 ///
-/// [`Effect::Changed`] follows each successful publish at once, and in uri
-/// mode each key write, for every image the write names.
+/// [`Effect::Changed`] follows each successful publish at once. In uri mode
+/// it follows the shell's report of the written URI, not the plan to write.
 ///
 /// Derived effects follow the event's own, in this order:
 /// - The first probe of every `Next` and `Previous` whose style is free, and
 ///   an [`Effect::Reply`] for every one that is over.
 /// - [`Effect::Republish`] for the dirty slot on screen, once its refresh is
-///   due and nothing else is in flight for its style. That uses the mark
-///   up: one refresh per mark, whatever comes of it. While it is in flight
-///   no rotation of that style starts. The refresh of a paused style waits
-///   for the pause to end, because its key names something else.
+///   due and nothing else is in flight for its style. The mark stays until
+///   the new inode is stored, or the refresh fails. A success that lands
+///   while the style is hidden keeps the mark. While the refresh is in
+///   flight no rotation of that style starts. The refresh of a paused style
+///   waits for the pause to end, because its key names something else.
 /// - The rotations that are due.
 /// - [`Effect::SetKeys`] for every key that does not hold what it must: the
 ///   slot URI when the slot file exists, or in uri mode the URI of the image
@@ -381,6 +394,7 @@ impl Turn<'_> {
             | Event::Fetched { .. }
             | Event::ConfigRead { .. }
             | Event::KeysRestored { .. }
+            | Event::KeyWriteFailed { .. }
             | Event::Gnome(_) => {}
         }
     }
@@ -414,6 +428,10 @@ impl Turn<'_> {
             Event::Control { id, command } => self.on_control(id, command),
             Event::ConfigRead { id, result } => self.on_config_read(id, result),
             Event::KeysRestored { id, result } => self.on_keys_restored(id, result),
+            Event::KeyWriteFailed {
+                uris,
+                picture_options,
+            } => self.on_key_write_failed(uris, picture_options),
             Event::Scanned { style, files } => {
                 let delta = self.model.replace_catalog(style, files);
                 self.follow_catalog(style, &delta);
@@ -464,6 +482,11 @@ impl Turn<'_> {
     fn stop(&mut self) {
         self.model.phase = Phase::Stopped;
         self.model.abandon_rotations();
+        // Shutdown drops the republish the interpreter still holds. The flag
+        // must not keep both styles busy after that effect is gone.
+        for style in Style::ALL {
+            self.model.styles[style].is_refreshing = false;
+        }
         self.refuse_waiting_requests();
         self.effects.push(Effect::Arm(None));
         self.effects.push(Effect::Persist);
@@ -473,11 +496,22 @@ impl Turn<'_> {
     /// no deadline stays further ahead than its whole delay.
     fn absorb_clock_steps(&mut self) {
         let now = self.now;
+        let policy = self.model.config().general.on_external_change;
+        let interval = PerStyle::from_fn(|style| self.model.config().styles[style].interval);
         for style in Style::ALL {
             let state = &mut self.model.styles[style];
             state.clock.absorb_clock_step(now);
+            // A refused write clears `written` before it arms `KEY_WRITE_RETRY`.
+            // That wait is not the 1s reassert and not the hidden interval.
+            let delay = if state.key.written.is_none() {
+                KEY_WRITE_RETRY
+            } else if policy == ExternalChangePolicy::ReassertNow {
+                REASSERT_DELAY
+            } else {
+                interval[style]
+            };
             if let Some(Reassert::At(due)) = &mut state.key.reassert {
-                *due = no_later_than(*due, now, REASSERT_DELAY);
+                *due = no_later_than(*due, now, delay);
             }
             state.refresh_due = state
                 .refresh_due
@@ -626,6 +660,7 @@ impl Turn<'_> {
             (Err(BadReason::Missing), Some(Version::Blob(remote))) => Some(remote.clone()),
             _ => None,
         };
+        let too_large = matches!(verdict, Err(BadReason::TooLarge { .. }));
         self.remember_verdict(&rotation.candidate, verdict);
         match self.model.candidate(style, item) {
             // The file changed under the probe: the verdict was about
@@ -635,7 +670,14 @@ impl Turn<'_> {
             }
             Some(_) if passed => self.publish_if_allowed(style, rotation),
             // The probe failed, or the item left the catalog meanwhile.
-            _ => self.drop_candidate(style, rotation),
+            // An image still on screen that is over the new cap has to leave
+            // before the retry: `drop_candidate` keeps whatever the slot shows.
+            _ => {
+                if too_large && self.model.shows(style, item) {
+                    self.model.clear_wallpaper(style);
+                }
+                self.drop_candidate(style, rotation);
+            }
         }
         // Someone emptied the cache. The rotation moved on already.
         if let Some(remote) = lost_blob {

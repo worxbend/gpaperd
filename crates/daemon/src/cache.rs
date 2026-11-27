@@ -15,7 +15,7 @@
 //! `meta.toml`; the next garbage collection deletes the temp files it left.
 //!
 //! `meta.toml` holds the URL as written, credentials and query included, so
-//! the directories are `0700` and `meta.toml` is `0600`.
+//! the directories are `0700` and `meta.toml` and each new blob are `0600`.
 //!
 //! The methods that a fetch calls ([`Cache::meta`], [`Cache::record`],
 //! [`Cache::draft`], [`Cache::publish`]) are async. The sweeps over the whole
@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +34,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpaperd_core::catalog::RemoteBlob;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use crate::fetch::redacted;
@@ -69,6 +68,9 @@ pub struct Cache {
     /// collector and by the last step of a publish. Held on the blocking
     /// pool only.
     sweep: Arc<RwLock<()>>,
+    /// URLs whose return to the config did not clear `orphaned_at` on disk.
+    /// The next absence starts then, not at the departure still recorded.
+    failed_clears: Mutex<BTreeSet<Url>>,
 }
 
 /// The content of an entry's `meta.toml`.
@@ -126,7 +128,8 @@ impl Meta {
 pub struct BlobDraft {
     // Declared before `file`, so the name goes before the handle closes.
     temp: TempFile,
-    file: tokio::fs::File,
+    file: File,
+    sweep: Arc<RwLock<()>>,
     hasher: blake3::Hasher,
     len: u64,
 }
@@ -146,6 +149,7 @@ impl Cache {
         Cache {
             root,
             sweep: Arc::default(),
+            failed_clears: Mutex::default(),
         }
     }
 
@@ -155,14 +159,21 @@ impl Cache {
     }
 
     /// Blocking. Every entry whose `meta.toml` reads and whose blob is a
-    /// regular file. A missing root is an empty cache. An entry that cannot
-    /// be read is logged and left out; nothing is deleted here.
+    /// regular file. A missing root is an empty cache. One bad directory
+    /// entry is logged and left out; nothing is deleted here.
+    ///
+    /// # Panics
+    ///
+    /// When the root is there but cannot be listed. An empty vec is what a
+    /// missing cache looks like, and startup would keep going.
     pub fn load(&self) -> Vec<RemoteBlob> {
+        // shortcut: `Vec` cannot tell an unlistable root from a missing one,
+        // so this panics. Return `Result` when every caller can take it.
         let dirs = match entry_dirs(&self.root) {
             Ok(dirs) => dirs,
             Err(error) => {
-                tracing::warn!(reason = %error, "remote cache not read: starting without it");
-                return Vec::new();
+                tracing::warn!(reason = %error, "remote cache not read");
+                panic!("remote cache not read: {error}");
             }
         };
         let mut blobs: Vec<RemoteBlob> = dirs.iter().filter_map(|dir| loaded_blob(dir)).collect();
@@ -217,19 +228,19 @@ impl Cache {
     pub async fn draft(&self, url: &Url) -> io::Result<BlobDraft> {
         let dir = self.entry_dir(url);
         let sweep = Arc::clone(&self.sweep);
+        let sweep_for_draft = Arc::clone(&self.sweep);
         // One hop under the sweep lock: a garbage collection between the
         // two would delete the new, still empty directory.
         let (temp, file) = blocking(move || {
             let _sweep = sweep.read().unwrap_or_else(PoisonError::into_inner);
             create_entry_dir(&dir)?;
-            let temp = TempFile::new_in(&dir);
-            let file = File::create_new(&temp.path)?;
-            Ok((temp, file))
+            open_new_temp(&dir)
         })
         .await?;
         Ok(BlobDraft {
             temp,
-            file: tokio::fs::File::from_std(file),
+            file,
+            sweep: sweep_for_draft,
             hasher: blake3::Hasher::new(),
             len: 0,
         })
@@ -257,13 +268,10 @@ impl Cache {
     ) -> io::Result<PathBuf> {
         let BlobDraft {
             temp,
-            mut file,
+            file,
             hasher,
             ..
         } = draft;
-        // tokio reports a failed write at the next operation: flush to see it.
-        file.flush().await?;
-        let file = file.into_std().await;
         let name = format!("{}.{extension}", hasher.finalize().to_hex());
         meta.blob = Some(name.clone());
         let text = encode(&meta)?;
@@ -298,9 +306,19 @@ impl Cache {
     /// deleted is logged and skipped.
     pub fn collect_garbage(&self, keep: &[Url], now: SystemTime) -> io::Result<GcReport> {
         let _sweep = self.sweep.write().unwrap_or_else(PoisonError::into_inner);
+        let mut failed_clears = self
+            .failed_clears
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut report = GcReport::default();
+        let mut collection = Collection {
+            keep,
+            now,
+            report: &mut report,
+            failed_clears: &mut failed_clears,
+        };
         for dir in entry_dirs(&self.root)? {
-            collect_entry(&dir, keep, now, &mut report);
+            collect_entry(&dir, &mut collection)?;
         }
         Ok(report)
     }
@@ -313,7 +331,16 @@ impl BlobDraft {
     ///
     /// Any I/O error, `ENOSPC` included.
     pub async fn append(&mut self, chunk: &[u8]) -> io::Result<()> {
-        self.file.write_all(chunk).await?;
+        // The sweep lock is not `Send`, so the write runs on the blocking
+        // pool. A collection cannot delete this temp between the two.
+        let sweep = Arc::clone(&self.sweep);
+        let mut file = self.file.try_clone()?;
+        let block = chunk.to_vec();
+        blocking(move || {
+            let _held = sweep.read().unwrap_or_else(PoisonError::into_inner);
+            file.write_all(&block)
+        })
+        .await?;
         self.hasher.update(chunk);
         self.len += chunk.len() as u64;
         Ok(())
@@ -448,7 +475,9 @@ fn url_hash(url: &Url) -> String {
     blake3::hash(url.as_str().as_bytes()).to_hex().to_string()
 }
 
-/// The subdirectories of `root`. A missing root has none.
+/// The subdirectories of `root`. A missing root has none. One bad directory
+/// entry is logged and left out; it does not fail the rest of the listing.
+/// Any other failure to open `root` is returned.
 fn entry_dirs(root: &Path) -> io::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -457,9 +486,23 @@ fn entry_dirs(root: &Path) -> io::Result<Vec<PathBuf>> {
     };
     let mut dirs = Vec::new();
     for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            dirs.push(entry.path());
+        let entry = match dir_entry(entry) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(reason = %error, "remote cache entry not listed");
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dirs.push(entry.path()),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    entry = %entry.path().display(),
+                    reason = %error,
+                    "remote cache entry not listed"
+                );
+            }
         }
     }
     Ok(dirs)
@@ -486,7 +529,11 @@ fn loaded_blob(dir: &Path) -> Option<RemoteBlob> {
     let meta = match entry_meta(dir) {
         Ok(meta) => meta?,
         Err(error) => {
-            tracing::warn!(entry = %dir.display(), reason = %error, "remote cache entry skipped");
+            tracing::warn!(
+                entry = %dir.display(),
+                reason = %logged_reason(&error),
+                "remote cache entry skipped"
+            );
             return None;
         }
     };
@@ -515,15 +562,58 @@ fn create_entry_dir(dir: &Path) -> io::Result<()> {
 /// Writes `bytes` to `dir/name`, readable by the user only: temp file in
 /// `dir`, `fsync`, rename.
 fn write_durably(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    let temp = TempFile::new_in(dir);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp.path)?;
+    let (temp, mut file) = open_new_temp(dir)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temp.path, dir.join(name))
+}
+
+/// Opens the next temp name in `dir`. A leftover from a reused PID makes
+/// `create_new` return [`io::ErrorKind::AlreadyExists`]; the counter moves
+/// and this call tries the next name.
+fn open_new_temp(dir: &Path) -> io::Result<(TempFile, File)> {
+    #[cfg(test)]
+    let _names = temp_name_lock();
+    create_temp_file(dir)
+}
+
+#[cfg(test)]
+fn temp_name_lock() -> std::sync::MutexGuard<'static, ()> {
+    static NAMES: Mutex<()> = Mutex::new(());
+    NAMES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn create_temp_file(dir: &Path) -> io::Result<(TempFile, File)> {
+    loop {
+        let temp = TempFile::new_in(dir);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp.path)
+        {
+            Ok(file) => {
+                // `mode` is masked by the umask. `fchmod` is not, and it
+                // lands before any hardlink of this inode.
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                return Ok((temp, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A parse failure's `Display` reprints the `meta.toml` line. That line can
+/// hold URL userinfo. The toml message, and our own `InvalidData` text, do not.
+fn logged_reason(error: &io::Error) -> String {
+    if let Some(parse) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<toml::de::Error>())
+    {
+        return parse.message().to_owned();
+    }
+    error.to_string()
 }
 
 /// Gives the draft in `temp` its blob name `name` in `dir`, then writes the
@@ -535,9 +625,9 @@ fn install_blob(dir: &Path, temp: TempFile, name: &str, meta_text: &[u8]) -> io:
     // When it cannot be read, nothing is deleted: garbage collection tells.
     let previous = entry_meta(dir).map(|meta| meta.and_then(|meta| meta.blob));
     let blob = dir.join(name);
-    // Same name, same bytes: the blob that is there stays, so a slot or a
-    // probe reading it sees no change.
-    let is_new = !blob.try_exists()?;
+    // Same name, same bytes: a regular file stays, so a slot or a probe
+    // reading it sees no change. A symlink is not that file.
+    let is_new = !regular_file(&blob)?;
     if is_new {
         fs::rename(&temp.path, &blob)?;
     }
@@ -553,45 +643,87 @@ fn install_blob(dir: &Path, temp: TempFile, name: &str, meta_text: &[u8]) -> io:
             .into_iter()
             .flatten()
             .collect();
-        delete_unnamed(dir, &named);
+        // The blob and `meta.toml` are already in place. A listing error is
+        // logged here and fails the next collection, not this store.
+        let _ = delete_unnamed(dir, &named);
     }
     Ok(blob)
 }
 
+fn regular_file(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(stat) => Ok(stat.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+struct Collection<'a> {
+    keep: &'a [Url],
+    now: SystemTime,
+    report: &'a mut GcReport,
+    failed_clears: &'a mut BTreeSet<Url>,
+}
+
 /// One entry's share of [`Cache::collect_garbage`].
-fn collect_entry(dir: &Path, keep: &[Url], now: SystemTime, report: &mut GcReport) {
+fn collect_entry(dir: &Path, collection: &mut Collection<'_>) -> io::Result<()> {
     let meta = match entry_meta(dir) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            tracing::warn!(entry = %dir.display(), reason = %error, "remote cache entry is corrupt: deleting its files");
+            tracing::warn!(
+                entry = %dir.display(),
+                reason = %logged_reason(&error),
+                "remote cache entry is corrupt: deleting its files"
+            );
             None
         }
         Err(error) => {
-            tracing::warn!(entry = %dir.display(), reason = %error, "remote cache entry not read: left for the next collection");
-            return;
+            tracing::warn!(
+                entry = %dir.display(),
+                reason = %error,
+                "remote cache entry not read: left for the next collection"
+            );
+            return Ok(());
         }
     };
     let Some(mut meta) = meta else {
-        report.blobs += delete_unnamed(dir, &[]);
+        collection.report.blobs += delete_unnamed(dir, &[])?;
         // Fails while a write of this process is in progress: it stays.
         let _ = fs::remove_dir(dir);
-        return;
+        return Ok(());
     };
-    if is_expired(&meta, keep, now) {
+    // A clear that never reached disk must not expire on the old departure.
+    if collection.failed_clears.contains(&meta.url) {
+        meta.orphaned_at = None;
+    }
+    if is_expired(&meta, collection.keep, collection.now) {
+        if keeps_live_temp(dir) {
+            collection.report.blobs += delete_unnamed(dir, &[])?;
+            return Ok(());
+        }
         match fs::remove_dir_all(dir) {
-            Ok(()) => report.entries += 1,
+            Ok(()) => collection.report.entries += 1,
             Err(error) => {
-                tracing::warn!(url = %redacted(&meta.url), reason = %error, "old remote cache entry not deleted")
+                tracing::warn!(
+                    url = %redacted(&meta.url),
+                    reason = %error,
+                    "old remote cache entry not deleted"
+                );
             }
         }
-        return;
+        return Ok(());
     }
-    update_orphaned_at(dir, &mut meta, keep, now);
+    update_orphaned_at(dir, &mut meta, collection);
     let named: Vec<&str> = [Some(META_FILE), meta.blob.as_deref()]
         .into_iter()
         .flatten()
         .collect();
-    report.blobs += delete_unnamed(dir, &named);
+    collection.report.blobs += delete_unnamed(dir, &named)?;
+    Ok(())
+}
+
+fn keeps_live_temp(dir: &Path) -> bool {
+    live_temps().iter().any(|path| path.starts_with(dir))
 }
 
 fn is_expired(meta: &Meta, keep: &[Url], now: SystemTime) -> bool {
@@ -603,35 +735,69 @@ fn is_expired(meta: &Meta, keep: &[Url], now: SystemTime) -> bool {
 }
 
 /// Starts the grace period of a URL that left the config, or ends it for
-/// one that is back, and writes the change.
-fn update_orphaned_at(dir: &Path, meta: &mut Meta, keep: &[Url], now: SystemTime) {
-    let orphaned_at = if keep.contains(&meta.url) {
+/// one that is back, and writes the change. A failed clear does not keep
+/// the old departure as the next absence's start.
+fn update_orphaned_at(dir: &Path, meta: &mut Meta, collection: &mut Collection<'_>) {
+    let returned_without_record = collection.failed_clears.contains(&meta.url);
+    let on_disk = if returned_without_record {
         None
     } else {
-        Some(meta.orphaned_at.unwrap_or(now))
+        meta.orphaned_at
     };
-    if orphaned_at == meta.orphaned_at {
+    let orphaned_at = if collection.keep.contains(&meta.url) {
+        None
+    } else {
+        Some(on_disk.unwrap_or(collection.now))
+    };
+    if orphaned_at == meta.orphaned_at && !returned_without_record {
         return;
     }
+    let previous = meta.orphaned_at;
     meta.orphaned_at = orphaned_at;
-    let written = encode(meta).and_then(|text| write_durably(dir, META_FILE, text.as_bytes()));
-    if let Err(error) = written {
-        tracing::warn!(url = %redacted(&meta.url), reason = %error, "remote cache entry not updated");
+    if let Err(error) = persist_meta(dir, meta) {
+        tracing::warn!(
+            url = %redacted(&meta.url),
+            reason = %error,
+            "remote cache entry not updated"
+        );
+        meta.orphaned_at = previous;
+        if collection.keep.contains(&meta.url) && previous.is_some() {
+            collection.failed_clears.insert(meta.url.clone());
+        }
+        return;
     }
+    collection.failed_clears.remove(&meta.url);
+}
+
+fn persist_meta(dir: &Path, meta: &Meta) -> io::Result<()> {
+    let text = encode(meta)?;
+    write_durably(dir, META_FILE, text.as_bytes())
 }
 
 /// Deletes every file in `dir` but those in `named` and this process's temp
 /// files in use. Returns how many files went, a `meta.toml` not counted.
-fn delete_unnamed(dir: &Path, named: &[&str]) -> usize {
+///
+/// # Errors
+///
+/// When `dir` cannot be listed, or one entry in it cannot be read. One file
+/// that cannot be deleted is logged and skipped.
+fn delete_unnamed(dir: &Path, named: &[&str]) -> io::Result<usize> {
     let files = match fs::read_dir(dir) {
         Ok(files) => files,
         Err(error) => {
             tracing::warn!(entry = %dir.display(), reason = %error, "remote cache entry not swept");
-            return 0;
+            return Err(error);
         }
     };
     let mut deleted = 0;
-    for file in files.flatten() {
+    for file in files {
+        let file = match dir_entry(file) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(entry = %dir.display(), reason = %error, "remote cache entry not swept");
+                return Err(error);
+            }
+        };
         let name = file.file_name();
         let name = name.to_string_lossy();
         if named.contains(&name.as_ref()) || live_temps().contains(&file.path()) {
@@ -645,7 +811,64 @@ fn delete_unnamed(dir: &Path, named: &[&str]) -> usize {
             }
         }
     }
-    deleted
+    Ok(deleted)
+}
+
+/// The next `read_dir` item. A test can fail one named entry here: that is
+/// the only way to yield a mid-iteration error. Permission bits fail the
+/// open, or do not fail at all when the process is privileged.
+fn dir_entry(entry: io::Result<fs::DirEntry>) -> io::Result<fs::DirEntry> {
+    #[cfg(not(test))]
+    {
+        entry
+    }
+    #[cfg(test)]
+    {
+        let entry = entry?;
+        if take_directory_entry_fault(&entry.file_name()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory entry unreadable",
+            ));
+        }
+        Ok(entry)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENTRY_FAULT: std::cell::RefCell<Option<std::ffi::OsString>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Fails one named entry on the next listing in this thread.
+#[cfg(test)]
+fn fail_directory_entry(name: &std::ffi::OsStr) -> DirectoryEntryFault {
+    ENTRY_FAULT.with(|fault| *fault.borrow_mut() = Some(name.to_os_string()));
+    DirectoryEntryFault
+}
+
+#[cfg(test)]
+struct DirectoryEntryFault;
+
+#[cfg(test)]
+impl Drop for DirectoryEntryFault {
+    fn drop(&mut self) {
+        ENTRY_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn take_directory_entry_fault(name: &std::ffi::OsStr) -> bool {
+    ENTRY_FAULT.with(|fault| {
+        let mut armed = fault.borrow_mut();
+        if armed.as_deref() == Some(name) {
+            *armed = None;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Runs `work` on the blocking pool. A panic there is re-raised here.
@@ -744,7 +967,7 @@ mod tests {
         let mut draft = cache.draft(&target).await.unwrap();
         let temp = draft.temp.path.clone();
         let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
-        draft.file = tokio::fs::File::from_std(full);
+        draft.file = full;
 
         let outcome = async {
             draft.append(&[0; 64 * 1024]).await?;
@@ -784,5 +1007,151 @@ mod tests {
             since + GC_GRACE * 2
         ));
         assert!(!is_expired(&meta, &[], since - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_reused_pid_temp_name_is_not_a_create_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _names = temp_name_lock();
+        let n = NEXT_TEMP.load(Ordering::Relaxed);
+        let leftover = dir.path().join(format!(".tmp-{}-{n}", process::id()));
+        fs::write(&leftover, b"partial").unwrap();
+
+        let (temp, _file) = create_temp_file(dir.path()).unwrap();
+
+        assert_ne!(temp.path, leftover);
+        assert!(!leftover.exists(), "the collision was not retired");
+        assert_eq!(
+            temp.path.file_name().unwrap(),
+            std::ffi::OsStr::new(&format!(".tmp-{}-{}", process::id(), n + 1))
+        );
+    }
+
+    #[test]
+    fn delete_unnamed_returns_an_open_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+
+        assert!(delete_unnamed(&file, &[]).is_err());
+    }
+
+    #[test]
+    fn delete_unnamed_returns_a_listing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let stray = dir.path().join("stray.bin");
+        fs::write(&stray, b"x").unwrap();
+        // Held until the listing returns. `let _ =` would drop it first.
+        let _fault = fail_directory_entry(std::ffi::OsStr::new("stray.bin"));
+
+        assert!(delete_unnamed(dir.path(), &[]).is_err());
+        assert!(stray.exists(), "the unread entry was deleted");
+    }
+
+    #[tokio::test]
+    async fn one_bad_directory_entry_does_not_hide_the_rest_of_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("remote"));
+        let kept = url("https://example.com/kept.png");
+        let blocked = url("https://example.com/blocked.png");
+        let blob = publish_bytes(&cache, &kept, b"kept").await;
+        publish_bytes(&cache, &blocked, b"blocked").await;
+        let blocked_name = cache.entry_dir(&blocked).file_name().unwrap().to_os_string();
+        let _fault = fail_directory_entry(&blocked_name);
+
+        let loaded = cache.load();
+
+        assert!(
+            loaded.iter().any(|cached| cached.url == kept && cached.blob == blob),
+            "one bad entry hid the cache: {loaded:?}"
+        );
+        assert!(
+            loaded.iter().all(|cached| cached.url != blocked),
+            "the bad entry was loaded: {loaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_does_not_succeed_when_a_directory_entry_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("remote"));
+        let target = url("https://example.com/a.png");
+        publish_bytes(&cache, &target, b"kept").await;
+        let entry = cache.entry_dir(&target);
+        let stray = entry.join("stray.bin");
+        fs::write(&stray, b"x").unwrap();
+        let _fault = fail_directory_entry(std::ffi::OsStr::new("stray.bin"));
+
+        let outcome = cache.collect_garbage(std::slice::from_ref(&target), UNIX_EPOCH);
+
+        assert!(
+            outcome.is_err(),
+            "a directory-entry error was dropped: {outcome:?}"
+        );
+        assert!(stray.exists(), "the unread entry was deleted");
+    }
+
+    async fn publish_bytes(cache: &Cache, target: &Url, body: &[u8]) -> PathBuf {
+        let mut draft = cache.draft(target).await.unwrap();
+        draft.append(body).await.unwrap();
+        cache
+            .publish(target, draft, "png", Meta::new(target.clone()))
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn a_meta_parse_error_log_omits_url_userinfo() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = Cache::new(root.path().join("remote"));
+        let target = url("https://user:secret@example.com/a.png?token=hide");
+        let entry = cache.entry_dir(&target);
+        fs::create_dir_all(&entry).unwrap();
+        // Userinfo is on the broken line, which is the line `Display` reprints.
+        fs::write(
+            entry.join(META_FILE),
+            "url = \"https://user:secret@example.com/a.png?token=hide\" [\n",
+        )
+        .unwrap();
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = std::sync::Arc::clone(&lines);
+        let collector = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || LogWriter(std::sync::Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(collector);
+
+        assert!(cache.load().is_empty());
+        assert!(cache.collect_garbage(&[], UNIX_EPOCH).unwrap().entries == 0);
+
+        let text = String::from_utf8(
+            lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            text.contains("remote cache entry"),
+            "parse failure was not logged: {text}"
+        );
+        assert!(!text.contains("secret"), "{text}");
+        assert!(!text.contains("token=hide"), "{text}");
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

@@ -409,13 +409,16 @@ fn a_blob_that_vanished_is_fetched_again_and_the_slot_keeps_its_image() {
     world.rejected.insert(id(NOON), BadReason::Missing);
 
     let tick = world.run(at(900), DEADLINE);
+
+    // current() is live state. The next tick publishes NOON.
+    assert_eq!(fetches(&tick), [NOON]);
+    assert!(published(&tick).is_empty());
+    assert_eq!(world.current(Style::Light), Some(id(DAWN)));
+
     world.rejected.clear();
     let refetched = world.run(at(905), stored(&blob(NOON, 1)));
     let next_tick = world.run(at(1800), DEADLINE);
 
-    assert_eq!(fetches(&tick), [NOON]);
-    assert!(published(&tick).is_empty());
-    assert!(world.slots.light.is_some());
     assert!(published(&refetched).is_empty());
     assert_eq!(published(&next_tick), [(Style::Light, NOON)]);
 }

@@ -7,9 +7,9 @@
 //! overwritten; it has the same length. `huge.png` has a valid header that
 //! claims 30000 x 30000 pixels. `notes.png` is text.
 //!
-//! Where glycin's sandbox cannot start, a check falls back to the magic
-//! bytes. Every test that needs a decode asks [`decodes_here`] and then
-//! asserts the fallback verdict instead.
+//! Where glycin's sandbox cannot start, a file that passed the magic-byte
+//! read still fails the check. Every test that needs a decode asks
+//! [`decodes_here`] first and asserts that failure instead of `Ok(())`.
 //!
 //! glycin only reads below the XDG directories: the loader configuration.
 //! The one cache it writes is for the SVG loader, and no fixture is an SVG.
@@ -19,12 +19,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
+use std::thread;
 use std::time::{Duration, SystemTime};
-use std::{mem, thread};
 
 use gpaperd_core::catalog::BadReason;
 use gpaperd_core::config::DEFAULT_MAX_PIXELS;
-use gpaperd_daemon::probe::Prober;
+use gpaperd_daemon::probe::{Prober, SANDBOX_DID_NOT_START};
 use tempfile::TempDir;
 
 /// Width times height of the `tiny` fixtures.
@@ -36,33 +36,50 @@ const NO_SANDBOX_VAR: &str = "GPAPERD_TEST_NO_SANDBOX";
 /// Whether glycin can decode in its sandbox on this machine: asked of glycin
 /// itself, not of the code under test.
 ///
-/// Asked once, on a thread and in a runtime of its own. glycin's own thread
-/// stays with the first runtime that uses it, so that runtime is never
-/// dropped, and no test's runtime may be the first.
+/// Asked once, on a thread and in a runtime of its own. glycin stays with
+/// the first runtime that uses it, so that runtime's driver keeps running
+/// after the answer is sent. No test runtime may be the first, and the
+/// driver must still be turning when those tests decode.
 static DECODES_HERE: LazyLock<bool> = LazyLock::new(|| {
-    let ask_glycin = || {
+    let (send, recv) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build a tokio runtime");
-        let mut loader = glycin::Loader::new(gio::File::for_path(fixture("tiny.png")));
-        loader.sandbox_selector(glycin::SandboxSelector::Bwrap);
-        // glycin's image must be dropped inside the runtime too.
-        let decodes = runtime.block_on(async { loader.load().await.is_ok() });
-        mem::forget(runtime);
-        decodes
-    };
-    thread::spawn(ask_glycin).join().expect("ask glycin")
+        runtime.block_on(async {
+            let mut loader = glycin::Loader::new(gio::File::for_path(fixture("tiny.png")));
+            loader.sandbox_selector(glycin::SandboxSelector::Bwrap);
+            // The image is dropped before the send, still inside this runtime.
+            let decodes = loader.load().await.is_ok();
+            let _ = send.send(decodes);
+            // Leaving `block_on` would stop the driver glycin is bound to.
+            std::future::pending::<()>().await
+        });
+    });
+    recv.recv().expect("ask glycin")
 });
 
 fn decodes_here() -> bool {
     *DECODES_HERE
 }
 
+/// A prober for this test. Asks [`decodes_here`] first so this test's runtime
+/// is not the one glycin stays with.
+fn prober() -> Prober {
+    // The keeper runtime has to be first. Its driver stays up for this process.
+    let _keeper = decodes_here();
+    Prober::new()
+}
+
 /// What a check of a file with an image's magic bytes must say: `decoded`
-/// where glycin decodes, and `Ok` where only the magic bytes are checked.
+/// where glycin decodes, and a sandbox failure where it does not.
 fn verdict_here(decoded: Result<(), BadReason>) -> Result<(), BadReason> {
-    if decodes_here() { decoded } else { Ok(()) }
+    if decodes_here() {
+        decoded
+    } else {
+        Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()))
+    }
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -105,8 +122,8 @@ fn swap_content_keeping_stamp(path: &Path, content_of: &str) {
     set_mtime(path, before.modified().expect("mtime"));
 }
 
-/// Asserts that glycin refused to decode the file. Where glycin cannot
-/// decode at all, asserts that the file passed on its magic bytes.
+/// Asserts that glycin refused to decode the file. Where the sandbox cannot
+/// start, asserts that same failure, not a pass on the magic bytes.
 fn assert_undecodable(verdict: &Result<(), BadReason>) {
     if decodes_here() {
         assert!(
@@ -114,13 +131,17 @@ fn assert_undecodable(verdict: &Result<(), BadReason>) {
             "{verdict:?}"
         );
     } else {
-        assert_eq!(verdict, &Ok(()));
+        assert_eq!(
+            verdict,
+            &Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()))
+        );
     }
 }
 
 #[tokio::test]
 async fn image_of_every_format_with_a_loader_passes() {
-    let prober = Prober::new();
+    let passed = verdict_here(Ok(()));
+    let prober = prober();
 
     for name in [
         "tiny.png",
@@ -132,18 +153,19 @@ async fn image_of_every_format_with_a_loader_passes() {
     ] {
         let verdict = prober.check(&fixture(name), DEFAULT_MAX_PIXELS).await;
 
-        assert_eq!(verdict, Ok(()), "{name}");
+        assert_eq!(verdict, passed, "{name}");
     }
 }
 
 #[tokio::test]
 async fn cut_off_file_that_was_just_written_is_truncated() {
+    let truncated = verdict_here(Err(BadReason::Truncated));
     let dir = TempDir::new().expect("temp dir");
     let copying = fresh_copy(&dir, "truncated.png");
 
-    let verdict = Prober::new().check(&copying, DEFAULT_MAX_PIXELS).await;
+    let verdict = prober().check(&copying, DEFAULT_MAX_PIXELS).await;
 
-    assert_eq!(verdict, verdict_here(Err(BadReason::Truncated)));
+    assert_eq!(verdict, truncated);
 }
 
 #[tokio::test]
@@ -151,7 +173,7 @@ async fn cut_off_file_that_rests_is_undecodable() {
     let dir = TempDir::new().expect("temp dir");
     let cut_off = resting_copy(&dir, "truncated.png");
 
-    let verdict = Prober::new().check(&cut_off, DEFAULT_MAX_PIXELS).await;
+    let verdict = prober().check(&cut_off, DEFAULT_MAX_PIXELS).await;
 
     assert_undecodable(&verdict);
 }
@@ -161,14 +183,14 @@ async fn corrupt_file_is_undecodable() {
     let dir = TempDir::new().expect("temp dir");
     let corrupt = resting_copy(&dir, "corrupt.png");
 
-    let verdict = Prober::new().check(&corrupt, DEFAULT_MAX_PIXELS).await;
+    let verdict = prober().check(&corrupt, DEFAULT_MAX_PIXELS).await;
 
     assert_undecodable(&verdict);
 }
 
 #[tokio::test]
 async fn text_file_with_an_image_name_is_not_an_image() {
-    let verdict = Prober::new()
+    let verdict = prober()
         .check(&fixture("notes.png"), DEFAULT_MAX_PIXELS)
         .await;
 
@@ -177,7 +199,7 @@ async fn text_file_with_an_image_name_is_not_an_image() {
 
 #[tokio::test]
 async fn file_that_is_not_there_is_missing() {
-    let verdict = Prober::new()
+    let verdict = prober()
         .check(&fixture("no-such.png"), DEFAULT_MAX_PIXELS)
         .await;
 
@@ -186,86 +208,93 @@ async fn file_that_is_not_there_is_missing() {
 
 #[tokio::test]
 async fn header_that_claims_more_than_max_pixels_is_too_large() {
-    let verdict = Prober::new()
+    let too_large = verdict_here(Err(BadReason::TooLarge {
+        width: 30000,
+        height: 30000,
+    }));
+
+    let verdict = prober()
         .check(&fixture("huge.png"), DEFAULT_MAX_PIXELS)
         .await;
 
-    let too_large = BadReason::TooLarge {
-        width: 30000,
-        height: 30000,
-    };
-    assert_eq!(verdict, verdict_here(Err(too_large)));
+    assert_eq!(verdict, too_large);
 }
 
 #[tokio::test]
 async fn image_of_exactly_max_pixels_passes() {
-    let verdict = Prober::new().check(&fixture("tiny.png"), TINY_PIXELS).await;
+    let passed = verdict_here(Ok(()));
 
-    assert_eq!(verdict, Ok(()));
+    let verdict = prober().check(&fixture("tiny.png"), TINY_PIXELS).await;
+
+    assert_eq!(verdict, passed);
 }
 
 #[tokio::test]
 async fn image_of_one_pixel_more_than_max_pixels_is_too_large() {
-    let verdict = Prober::new()
+    let too_large = verdict_here(Err(BadReason::TooLarge {
+        width: 16,
+        height: 12,
+    }));
+
+    let verdict = prober()
         .check(&fixture("tiny.png"), TINY_PIXELS - 1)
         .await;
 
-    let too_large = BadReason::TooLarge {
-        width: 16,
-        height: 12,
-    };
-    assert_eq!(verdict, verdict_here(Err(too_large)));
+    assert_eq!(verdict, too_large);
 }
 
 #[tokio::test]
 async fn file_with_the_stamp_of_a_passed_check_is_not_decoded_again() {
+    let passed = verdict_here(Ok(()));
     let dir = TempDir::new().expect("temp dir");
     let image = resting_copy(&dir, "tiny.png");
-    let prober = Prober::new();
+    let prober = prober();
     let first = prober.check(&image, DEFAULT_MAX_PIXELS).await;
     swap_content_keeping_stamp(&image, "corrupt.png");
 
     let second = prober.check(&image, DEFAULT_MAX_PIXELS).await;
 
-    assert_eq!((first, second), (Ok(()), Ok(())));
+    assert_eq!((first, second), (passed.clone(), passed));
 }
 
 #[tokio::test]
 async fn another_prober_decodes_the_file_itself() {
+    let passed = verdict_here(Ok(()));
     let dir = TempDir::new().expect("temp dir");
     let image = resting_copy(&dir, "tiny.png");
-    let first = Prober::new().check(&image, DEFAULT_MAX_PIXELS).await;
+    let first = prober().check(&image, DEFAULT_MAX_PIXELS).await;
     swap_content_keeping_stamp(&image, "corrupt.png");
 
-    let second = Prober::new().check(&image, DEFAULT_MAX_PIXELS).await;
+    let second = prober().check(&image, DEFAULT_MAX_PIXELS).await;
 
-    assert_eq!(first, Ok(()));
+    assert_eq!(first, passed);
     assert_undecodable(&second);
 }
 
 #[tokio::test]
 async fn remembered_size_is_checked_against_the_max_pixels_of_each_call() {
+    let passed = verdict_here(Ok(()));
+    let too_large = verdict_here(Err(BadReason::TooLarge {
+        width: 16,
+        height: 12,
+    }));
     let dir = TempDir::new().expect("temp dir");
     let image = resting_copy(&dir, "tiny.png");
-    let prober = Prober::new();
+    let prober = prober();
     let first = prober.check(&image, DEFAULT_MAX_PIXELS).await;
     swap_content_keeping_stamp(&image, "corrupt.png");
 
     let second = prober.check(&image, TINY_PIXELS - 1).await;
 
-    let too_large = BadReason::TooLarge {
-        width: 16,
-        height: 12,
-    };
-    assert_eq!(first, Ok(()));
-    assert_eq!(second, verdict_here(Err(too_large)));
+    assert_eq!(first, passed);
+    assert_eq!(second, too_large);
 }
 
 #[tokio::test]
 async fn failed_decode_is_remembered_too() {
     let dir = TempDir::new().expect("temp dir");
     let image = resting_copy(&dir, "corrupt.png");
-    let prober = Prober::new();
+    let prober = prober();
     let first = prober.check(&image, DEFAULT_MAX_PIXELS).await;
     swap_content_keeping_stamp(&image, "tiny.png");
 
@@ -277,21 +306,27 @@ async fn failed_decode_is_remembered_too() {
 
 #[tokio::test]
 async fn changed_file_is_decoded_again() {
+    let passed = verdict_here(Ok(()));
     let dir = TempDir::new().expect("temp dir");
     let image = resting_copy(&dir, "corrupt.png");
-    let prober = Prober::new();
+    let prober = prober();
     let first = prober.check(&image, DEFAULT_MAX_PIXELS).await;
     fs::copy(fixture("tiny.png"), &image).expect("repair the file");
 
     let second = prober.check(&image, DEFAULT_MAX_PIXELS).await;
 
     assert_undecodable(&first);
-    assert_eq!(second, Ok(()));
+    assert_eq!(second, passed);
 }
 
 #[tokio::test]
 async fn checks_at_the_same_time_all_get_their_answer() {
-    let prober = Prober::new();
+    let passed = verdict_here(Ok(()));
+    let too_large = verdict_here(Err(BadReason::TooLarge {
+        width: 30000,
+        height: 30000,
+    }));
+    let prober = prober();
     let (tiny, huge) = (fixture("tiny.png"), fixture("huge.png"));
 
     let (first, second, third) = tokio::join!(
@@ -300,34 +335,24 @@ async fn checks_at_the_same_time_all_get_their_answer() {
         prober.check(&huge, DEFAULT_MAX_PIXELS),
     );
 
-    let too_large = BadReason::TooLarge {
-        width: 30000,
-        height: 30000,
-    };
-    assert_eq!(
-        (first, second, third),
-        (Ok(()), Ok(()), verdict_here(Err(too_large)))
-    );
+    assert_eq!((first, second, third), (passed.clone(), passed, too_large));
 }
 
 #[tokio::test]
-async fn without_bwrap_only_the_magic_bytes_are_checked() {
+async fn without_bwrap_a_check_does_not_pass() {
     if is_child_without_sandbox() {
-        assert_only_the_magic_bytes_are_checked().await;
+        assert_missing_sandbox_is_not_a_pass().await;
     } else {
         let empty_dir = TempDir::new().expect("temp dir");
-        expect_child_to_pass(
-            "without_bwrap_only_the_magic_bytes_are_checked",
-            empty_dir.path(),
-        );
+        expect_child_to_pass("without_bwrap_a_check_does_not_pass", empty_dir.path());
     }
 }
 
 /// glycin itself would go on without a sandbox here. The check must not.
 #[tokio::test]
-async fn with_a_bwrap_that_may_not_make_namespaces_only_the_magic_bytes_are_checked() {
+async fn with_a_bwrap_that_may_not_make_namespaces_a_check_does_not_pass() {
     if is_child_without_sandbox() {
-        assert_only_the_magic_bytes_are_checked().await;
+        assert_missing_sandbox_is_not_a_pass().await;
     } else {
         let bin_dir = TempDir::new().expect("temp dir");
         let refusing_bwrap = bin_dir.path().join("bwrap");
@@ -337,7 +362,7 @@ async fn with_a_bwrap_that_may_not_make_namespaces_only_the_magic_bytes_are_chec
         fs::set_permissions(&refusing_bwrap, fs::Permissions::from_mode(0o755))
             .expect("make the bwrap stand-in executable");
         expect_child_to_pass(
-            "with_a_bwrap_that_may_not_make_namespaces_only_the_magic_bytes_are_checked",
+            "with_a_bwrap_that_may_not_make_namespaces_a_check_does_not_pass",
             bin_dir.path(),
         );
     }
@@ -366,22 +391,25 @@ fn expect_child_to_pass(name: &str, path_dir: &Path) {
     );
 }
 
-/// What a child process without a sandbox must see: files that only a decode
-/// would refuse pass, and the magic bytes still count.
-async fn assert_only_the_magic_bytes_are_checked() {
-    let prober = Prober::new();
+/// What a child process without a sandbox must see: an image that only a
+/// decode would refuse does not pass, and a non-image is still not an image.
+async fn assert_missing_sandbox_is_not_a_pass() {
+    assert!(!decodes_here(), "the child must not have a sandbox");
+    let checker = prober();
+    let failed = Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()));
 
-    let corrupt = prober
+    let corrupt = checker
         .check(&fixture("corrupt.png"), DEFAULT_MAX_PIXELS)
         .await;
-    let huge = prober.check(&fixture("huge.png"), DEFAULT_MAX_PIXELS).await;
-    let text = prober
+    let huge = checker
+        .check(&fixture("huge.png"), DEFAULT_MAX_PIXELS)
+        .await;
+    let text = checker
         .check(&fixture("notes.png"), DEFAULT_MAX_PIXELS)
         .await;
 
-    assert!(!decodes_here(), "the child must not have a sandbox");
     assert_eq!(
         (corrupt, huge, text),
-        (Ok(()), Ok(()), Err(BadReason::NotAnImage))
+        (failed.clone(), failed, Err(BadReason::NotAnImage))
     );
 }

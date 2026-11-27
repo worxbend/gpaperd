@@ -106,10 +106,12 @@ impl fmt::Display for Failure {
             Failure::NotRunning => f.write_str("gpaperd is not running"),
             Failure::NoAnswer => f.write_str("gpaperd did not answer"),
             Failure::NoBus(error) => write!(f, "cannot reach the session bus: {error}"),
-            Failure::ReloadFailed(error) => write!(f, "reload failed: {error}"),
+            Failure::ReloadFailed(error) => {
+                write!(f, "reload failed: {}", summary::replace_controls(error))
+            }
             Failure::Bus(error) => match error_message(error) {
-                Some(message) => f.write_str(message),
-                None => write!(f, "{error}"),
+                Some(message) => write!(f, "{}", summary::replace_controls(message)),
+                None => write!(f, "{}", summary::replace_controls(&error.to_string())),
             },
             Failure::BadStatus(error) => write!(f, "cannot read the daemon's status: {error}"),
         }
@@ -293,5 +295,15 @@ mod tests {
             failure.to_string(),
             "reload failed: line 3, column 7: bad interval"
         );
+    }
+
+    #[test]
+    fn reload_and_bus_errors_replace_controls() {
+        let reload = Failure::ReloadFailed("line 1\r\n\0\u{1b}: bad".to_owned());
+        assert_eq!(reload.to_string(), "reload failed: line 1????: bad");
+
+        let bus = fdo::Error::Failed("no\r\n\0\u{1b}keys".to_owned());
+        let failure = Failure::from_call(zbus::Error::FDO(Box::new(bus)));
+        assert_eq!(failure.to_string(), "no????keys");
     }
 }

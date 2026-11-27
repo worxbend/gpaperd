@@ -303,14 +303,15 @@ async fn gc_leaves_an_entry_whose_meta_cannot_be_read_for_now() {
     let blob = harness.publish(&url, PNG_START).await;
     let meta = harness.cache.entry_dir(&url).join(META_FILE);
     fs::set_permissions(&meta, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read(&meta).is_ok() {
-        // Root reads it anyway: nothing to test.
-        return;
-    }
-
-    let report = harness.cache.collect_garbage(&[], at(1)).unwrap();
-
+    let readable = fs::read(&meta);
+    let report = harness.cache.collect_garbage(&[], at(1));
     fs::set_permissions(&meta, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        readable.is_err(),
+        "mode 000 left meta.toml readable"
+    );
+
+    let report = report.unwrap();
     assert_eq!(report, GcReport::default());
     assert_eq!(fs::read(&blob).unwrap(), PNG_START);
     assert_eq!(harness.cache.meta(&url).await.unwrap().unwrap().url, url);
@@ -329,6 +330,38 @@ async fn meta_and_its_directories_are_private() {
     assert_eq!(mode(&harness.root), 0o700);
     assert_eq!(mode(&entry), 0o700);
     assert_eq!(mode(&entry.join(META_FILE)), 0o600);
+    assert_eq!(mode(&entry.join(blob_name(PNG_START))), 0o600);
+}
+
+#[tokio::test]
+async fn republishing_the_same_bytes_keeps_the_blob_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    let url = url("https://example.com/a.png");
+    let blob = harness.publish(&url, PNG_START).await;
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let again = harness.publish(&url, PNG_START).await;
+
+    assert_eq!(again, blob);
+    assert_eq!(fs::metadata(&again).unwrap().permissions().mode() & 0o777, 0o640);
+}
+
+#[tokio::test]
+async fn a_symlinked_blob_path_is_replaced_with_the_new_bytes() {
+    let harness = Harness::new();
+    let url = url("https://example.com/a.png");
+    let blob = harness.publish(&url, PNG_START).await;
+    let outside = harness.root.join("outside");
+    fs::write(&outside, b"not the image").unwrap();
+    fs::remove_file(&blob).unwrap();
+    std::os::unix::fs::symlink(&outside, &blob).unwrap();
+
+    let again = harness.publish(&url, PNG_START).await;
+
+    assert!(fs::symlink_metadata(&again).unwrap().is_file());
+    assert_eq!(fs::read(&again).unwrap(), PNG_START);
+    assert_eq!(fs::read(&outside).unwrap(), b"not the image");
 }
 
 #[tokio::test]
@@ -449,4 +482,71 @@ async fn deleting_a_blob_leaves_a_hardlinked_slot_intact() {
     assert_eq!(report.blobs, 1);
     assert!(!old.exists());
     assert_eq!(fs::read(slot).unwrap(), PNG_START);
+}
+
+#[tokio::test]
+async fn gc_keeps_a_live_temp_when_the_entry_is_expired() {
+    let harness = Harness::new();
+    let url = url("https://example.com/a.png");
+    harness.publish(&url, PNG_START).await;
+    let left = at(1_800_000_000);
+    harness.cache.collect_garbage(&[], left).unwrap();
+    let mut draft = harness.cache.draft(&url).await.unwrap();
+    draft.append(b"next").await.unwrap();
+    let temp = harness
+        .entry_files(&url)
+        .into_iter()
+        .find(|name| name.starts_with(".tmp-"))
+        .expect("the draft's temp file");
+
+    harness
+        .cache
+        .collect_garbage(&[], left + GC_GRACE + Duration::from_secs(1))
+        .unwrap();
+
+    assert!(
+        harness.entry_files(&url).contains(&temp),
+        "expired removal deleted the live temp"
+    );
+    draft.append(b" more").await.unwrap();
+    let blob = harness
+        .cache
+        .publish(&url, draft, "png", Meta::new(url.clone()))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(blob).unwrap(), b"next more");
+}
+
+#[tokio::test]
+async fn a_failed_orphan_clear_does_not_expire_on_the_old_departure() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    let url = url("https://example.com/a.png");
+    harness.publish(&url, PNG_START).await;
+    let left = at(1_800_000_000);
+    harness.cache.collect_garbage(&[], left).unwrap();
+    let dir = harness.cache.entry_dir(&url);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let cleared = harness
+        .cache
+        .collect_garbage(std::slice::from_ref(&url), left + Duration::from_secs(10));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    cleared.unwrap();
+
+    let far = left + GC_GRACE + Duration::from_secs(60);
+    harness.cache.collect_garbage(&[], far).unwrap();
+
+    let meta = harness.cache.meta(&url).await.unwrap().unwrap();
+    assert_ne!(meta.orphaned_at, Some(left));
+    assert!(harness.cache.entry_dir(&url).exists());
+}
+
+#[test]
+#[should_panic(expected = "remote cache not read")]
+fn an_unlistable_root_is_not_an_empty_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("remote");
+    fs::write(&root, b"not-a-directory").unwrap();
+
+    let _loaded = Cache::new(root).load();
 }

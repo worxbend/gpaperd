@@ -366,14 +366,17 @@ fn a_source_directory_that_disappears_drops_its_images_and_keeps_the_slot() {
     let unmounted = vec![removed("/l/a.jpg"), removed("/l/b.jpg")];
 
     let at_unmount = world.run(at(100), changed(Style::Light, unmounted));
+
+    assert!(probed(&at_unmount).is_empty());
+    assert_eq!(count(&at_unmount, is_set_keys), 0);
+    assert_eq!(world.model.persisted().styles.light.slot, slot_before);
+    assert_eq!(world.slots.light, slot_before);
+
     let at_mount = world.run(
         at(5000),
         changed(Style::Light, vec![found("/l/a.jpg"), found("/l/b.jpg")]),
     );
 
-    assert!(probed(&at_unmount).is_empty());
-    assert_eq!(count(&at_unmount, is_set_keys), 0);
-    assert_eq!(world.model.persisted().styles.light.slot, world.slots.light);
     assert_ne!(world.slots.light, slot_before);
     // Its images are back, and the one on screen is long overdue.
     assert_eq!(published(&at_mount), [(Style::Light, "/l/b.jpg")]);

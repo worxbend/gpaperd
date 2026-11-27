@@ -48,8 +48,11 @@ fn a_first_run_fills_both_slots() {
 fn a_first_run_writes_the_keys_once_after_both_slots_exist() {
     let trace = World::new(two_folders()).start(at(0), Style::Light);
 
-    let last_publish = trace.iter().rposition(is_publish);
-    let set_keys = trace.iter().position(is_set_keys);
+    let last_publish = trace
+        .iter()
+        .rposition(is_publish)
+        .expect("a slot is published");
+    let set_keys = trace.iter().position(is_set_keys).expect("keys are written");
     assert_eq!(count(&trace, is_set_keys), 1);
     assert!(last_publish < set_keys);
 }
@@ -70,8 +73,11 @@ fn readiness_is_signalled_once_after_the_first_apply() {
     let mut world = World::new(two_folders());
 
     let mut trace = world.start(at(0), Style::Light);
-    let last_publish = trace.iter().rposition(is_publish);
-    let ready = trace.iter().position(is_ready);
+    let last_publish = trace
+        .iter()
+        .rposition(is_publish)
+        .expect("a slot is published");
+    let ready = trace.iter().position(is_ready).expect("ready");
     trace.extend(world.run(at(900), DEADLINE));
 
     assert!(last_publish < ready);

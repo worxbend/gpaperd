@@ -136,7 +136,7 @@ fn a_lock_before_start_counts() {
 fn a_rotation_in_flight_when_the_screen_locks_is_not_published() {
     let mut world = locking_world();
     let at_deadline = step(&mut world.model, at(900), DEADLINE);
-    assert!(!probed(&at_deadline).is_empty());
+    assert_eq!(probed(&at_deadline), [(Style::Light, "/l/b.jpg")]);
 
     world.run(at(901), LOCKED);
     let trace = world.run(

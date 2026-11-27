@@ -3,15 +3,16 @@
 
 use gpaperd_core::catalog::{FileId, FsChange};
 use gpaperd_core::config::{ApplyMode, Config, PictureOptions};
-use gpaperd_core::control::{Command, StyleTarget};
+use gpaperd_core::control::{Command, Reply, StyleTarget};
 use gpaperd_core::event::{Effect, Event, Method, Pause, SlotWrite};
 use gpaperd_core::step::step;
 use gpaperd_core::style::{PerStyle, Style};
 
 use crate::support::{
-    DEADLINE, World, alphabetical, armed, at, changed, count, found, id, init, is_ready,
-    is_set_keys, keys_written, probed, published, removed, reported, republished, running_world,
-    slot_uris, started_with_locks, switch_to, two_folders_with, version,
+    DEADLINE, World, alphabetical, armed, at, changed, control, count, found, id, init, is_ready,
+    is_set_keys, keys_changed, keys_written, probed, published, removed, replies, reported,
+    republished, running_world, slot_uris, started_with_locks, switch_to, the_reply,
+    two_folders_with, version,
 };
 
 const PICKED: &str = "file:///home/u/Pictures/picked.jpg";
@@ -243,8 +244,11 @@ fn a_style_switch_republishes_nothing() {
     let at_switch = world.run(at(300), switch_to(Style::Dark));
     let later = world.run(at(301), DEADLINE);
 
-    // Nothing is planned but dark's next rotation.
+    // Nothing is planned but dark's next rotation, and the switch itself
+    // writes no slot and no key.
     assert_eq!(armed(&at_switch), [Some(at(1200))]);
+    assert_eq!(count(&at_switch, touches_a_slot), 0);
+    assert_eq!(count(&at_switch, is_set_keys), 0);
     assert_eq!(count(&later, touches_a_slot), 0);
     assert_eq!(count(&later, is_set_keys), 0);
 }
@@ -399,7 +403,10 @@ fn a_dirty_slot_file_is_not_refreshed_in_uri_mode() {
     let later = second.run(at(61), DEADLINE);
 
     assert!(armed(&at_start).is_empty());
+    assert_eq!(count(&at_start, touches_a_slot), 0);
+    assert_eq!(count(&at_start, is_set_keys), 0);
     assert_eq!(count(&later, touches_a_slot), 0);
+    assert_eq!(count(&later, is_set_keys), 0);
 }
 
 #[test]
@@ -449,4 +456,59 @@ fn a_lock_at_start_keeps_the_last_uri_and_the_pause_of_the_last_run() {
 
     assert!(saved.paused);
     assert_eq!(saved.key_uri.as_deref(), Some("file:///l/a.jpg"));
+}
+
+#[test]
+fn a_planned_key_write_does_not_announce_the_image() {
+    let mut world = running_in_uri_mode();
+    step(&mut world.model, at(900), DEADLINE);
+
+    let planned = step(
+        &mut world.model,
+        at(901),
+        probe_passed(Style::Light, "/l/b.jpg"),
+    );
+    let failed = step(
+        &mut world.model,
+        at(902),
+        Event::KeyWriteFailed {
+            uris: PerStyle {
+                light: Some("file:///l/b.jpg".to_owned()),
+                dark: None,
+            },
+            picture_options: None,
+        },
+    );
+
+    let announced = |effect: &Effect| matches!(effect, Effect::Changed { .. });
+    assert!(planned.iter().any(is_set_keys));
+    assert!(!planned.iter().any(announced));
+    assert!(!failed.iter().any(announced));
+}
+
+#[test]
+fn next_is_not_done_before_the_uri_key_write() {
+    let mut world = running_in_uri_mode();
+    step(
+        &mut world.model,
+        at(10),
+        control(1, Command::Next(StyleTarget::Visible)),
+    );
+
+    let planned = step(
+        &mut world.model,
+        at(11),
+        probe_passed(Style::Light, "/l/b.jpg"),
+    );
+    assert!(planned.iter().any(is_set_keys));
+    assert!(replies(&planned).is_empty());
+
+    world.keys.picture_uri = "file:///l/b.jpg".to_owned();
+    let landed = step(&mut world.model, at(12), keys_changed(world.keys.clone()));
+
+    assert!(landed.contains(&Effect::Changed {
+        style: Style::Light,
+        item: id("/l/b.jpg"),
+    }));
+    assert_eq!(the_reply(&landed), &Reply::Done);
 }

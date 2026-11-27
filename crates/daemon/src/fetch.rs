@@ -15,9 +15,10 @@
 //! | `404` or `410` | `gone` set, warned once: [`FetchOutcome::Gone`] |
 //! | `429`, `5xx` | [`FetchOutcome::Failed`], `Retry-After` honoured |
 //! | network error, timeout | [`FetchOutcome::Unreachable`] |
-//! | `200` that is not an image, by magic bytes | rejected, old blob kept: `Failed` |
-//! | `Content-Length` or body over [`MAX_BODY_BYTES`] | rejected: `Failed` |
-//! | more than [`MAX_REDIRECTS`] redirects, or `https` to `http` | rejected: `Failed` |
+//! | `401`, `403` | old blob kept, not retried: [`FetchOutcome::NotModified`] |
+//! | `200` that is not an image, by magic bytes | rejected, old blob kept, not retried: `NotModified` |
+//! | `Content-Length` or body over [`MAX_BODY_BYTES`] | rejected, old blob kept, not retried: `NotModified` |
+//! | too many redirects, `https` to `http`, or a reserved literal host | rejected: `Failed` |
 //! | `ENOSPC` while writing | temp file deleted, old blob kept: `Failed` |
 //!
 //! Only `http` and `https` are fetched. Every log line names the URL by
@@ -168,6 +169,26 @@ impl FetchError {
             _ => None,
         }
     }
+
+    /// `401`, `403`, a non-image, and an oversized body. The core retries
+    /// every [`FetchOutcome::Failed`]. These stay off that path, and off
+    /// [`FetchOutcome::Gone`], which is only `404` and `410`.
+    fn refuses_retry(&self) -> bool {
+        match self {
+            FetchError::NotAnImage | FetchError::TooLarge { .. } => true,
+            FetchError::Status { status, .. } => {
+                matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            }
+            FetchError::Network(_) | FetchError::Redirect(_) | FetchError::Cache(_) => false,
+        }
+    }
+}
+
+/// What the cache knew before this fetch. A read error is not a missing file.
+enum KnownMeta {
+    Missing,
+    Ready(Meta),
+    Unreadable,
 }
 
 impl Fetcher {
@@ -210,12 +231,15 @@ impl Fetcher {
     /// `If-None-Match` and `If-Modified-Since` from its `meta.toml`.
     ///
     /// Waits for one of [`MAX_CONCURRENT_FETCHES`] turns first. A success
-    /// resets `url`'s failure count; a failure raises it and comes with the
-    /// wait that [`backoff`] gives for the new count. Writes `last_error`
-    /// to `meta.toml` on a failure and clears it on a success.
+    /// resets `url`'s failure count. A retryable failure raises it and comes
+    /// with the wait that [`backoff`] gives for the new count. `401`, `403`,
+    /// a non-image, and an oversized body do not. Writes `last_error` on a
+    /// failure and clears it on a success. A `meta.toml` that cannot be read
+    /// is left in place.
     ///
     /// A URL that is not `http` or `https` is not requested: `Failed` with
-    /// [`BACKOFF_CEILING`].
+    /// [`BACKOFF_CEILING`]. A literal loopback, link-local, or private host
+    /// is not requested either.
     ///
     /// Cancel-safe: dropping the future deletes a draft in progress and
     /// leaves the cache as it was. The future is `Send`.
@@ -232,7 +256,7 @@ impl Fetcher {
             .await
             .expect("the fetch semaphore is never closed");
         let known = self.known_meta(url).await;
-        let answer = self.download(url, known.as_ref()).await;
+        let answer = self.download(url, &known).await;
         self.conclude(url, known, answer).await
     }
 
@@ -241,14 +265,18 @@ impl Fetcher {
         self.failure_counts().remove(url);
     }
 
-    /// The cached `meta.toml` of `url`. One that cannot be read is replaced
-    /// by the next write, so the fetch goes on without it.
-    async fn known_meta(&self, url: &Url) -> Option<Meta> {
-        let meta = self.cache.meta(url).await.unwrap_or_else(|error| {
-            tracing::warn!(url = %redacted(url), reason = %error, "cached metadata ignored");
-            None
-        })?;
-        Some(self.without_lost_blob(url, meta).await)
+    /// The cached `meta.toml` of `url`. A missing file is [`KnownMeta::Missing`].
+    /// A read or parse error is [`KnownMeta::Unreadable`]: the next write must
+    /// not replace it with a meta that names no blob.
+    async fn known_meta(&self, url: &Url) -> KnownMeta {
+        match self.cache.meta(url).await {
+            Ok(None) => KnownMeta::Missing,
+            Ok(Some(meta)) => KnownMeta::Ready(self.without_lost_blob(url, meta).await),
+            Err(error) => {
+                tracing::warn!(url = %redacted(url), reason = %error, "cached metadata not read");
+                KnownMeta::Unreadable
+            }
+        }
     }
 
     /// `meta` without its cached version when the blob it names is gone,
@@ -272,12 +300,18 @@ impl Fetcher {
         }
     }
 
-    async fn download(&self, url: &Url, known: Option<&Meta>) -> Result<Answer, FetchError> {
+    async fn download(&self, url: &Url, known: &KnownMeta) -> Result<Answer, FetchError> {
+        if let Some(reason) = reserved_literal(url) {
+            return Err(FetchError::Redirect(reason.to_owned()));
+        }
+        let known = known.as_meta();
         let has_blob = known.is_some_and(|meta| meta.blob.is_some());
         let mut request = self.client.get(url.clone());
         if let Some(meta) = known.filter(|_| has_blob) {
             request = request.headers(conditional_headers(meta));
         }
+        // shortcut: a hostname's peer address is only `Response::remote_addr`
+        // after send. Upgrade when reqwest exposes it before the GET.
         let response = request.send().await.map_err(FetchError::network)?;
         match response.status() {
             StatusCode::OK => self.store(url, known, response).await.map(Answer::Stored),
@@ -353,11 +387,12 @@ impl Fetcher {
     async fn conclude(
         &self,
         url: &Url,
-        known: Option<Meta>,
+        known: KnownMeta,
         answer: Result<Answer, FetchError>,
     ) -> FetchOutcome {
         let answer = match answer {
             Ok(answer) => answer,
+            Err(error) if error.refuses_retry() => return self.refused(url, known, error).await,
             Err(error) => return self.failed(url, known, error).await,
         };
         self.forget(url);
@@ -368,27 +403,39 @@ impl Fetcher {
             }
             Answer::NotModified => {
                 tracing::debug!(url = %redacted(url), "remote image not modified");
-                let mut meta = meta_or_new(known, url);
-                meta.fetched_at = Some(SystemTime::now());
-                meta.last_error = None;
-                meta.gone = false;
-                self.save_meta(url, &meta).await;
+                self.write_meta(url, known, |meta| {
+                    meta.fetched_at = Some(SystemTime::now());
+                    meta.last_error = None;
+                    meta.gone = false;
+                })
+                .await;
                 FetchOutcome::NotModified
             }
             Answer::Gone(status) => {
-                let mut meta = meta_or_new(known, url);
-                if !meta.gone {
-                    tracing::warn!(url = %redacted(url), %status, "remote image is gone: the cached copy stays");
-                }
-                meta.gone = true;
-                meta.last_error = Some(format!("HTTP {status}"));
-                self.save_meta(url, &meta).await;
+                self.write_meta(url, known, |meta| {
+                    if !meta.gone {
+                        tracing::warn!(url = %redacted(url), %status, "remote image is gone: the cached copy stays");
+                    }
+                    meta.gone = true;
+                    meta.last_error = Some(format!("HTTP {status}"));
+                })
+                .await;
                 FetchOutcome::Gone
             }
         }
     }
 
-    async fn failed(&self, url: &Url, known: Option<Meta>, error: FetchError) -> FetchOutcome {
+    /// Keeps the cached blob and does not arm a retry. `NotModified` is the
+    /// outcome the core already treats that way; `Gone` is only `404` and `410`.
+    async fn refused(&self, url: &Url, known: KnownMeta, error: FetchError) -> FetchOutcome {
+        tracing::warn!(url = %redacted(url), reason = %error, "remote image not fetched");
+        let text = error.to_string();
+        self.write_meta(url, known, |meta| meta.last_error = Some(text))
+            .await;
+        FetchOutcome::NotModified
+    }
+
+    async fn failed(&self, url: &Url, known: KnownMeta, error: FetchError) -> FetchOutcome {
         let failures = self.count_failure(url);
         let retry_in = backoff(failures, error.retry_after(), self.next_jitter());
         let retry_secs = retry_in.as_secs();
@@ -397,14 +444,27 @@ impl Fetcher {
         } else {
             tracing::debug!(url = %redacted(url), reason = %error, failures, retry_secs, "remote image not fetched");
         }
-        let mut meta = meta_or_new(known, url);
-        meta.last_error = Some(error.to_string());
-        self.save_meta(url, &meta).await;
+        let text = error.to_string();
+        self.write_meta(url, known, |meta| meta.last_error = Some(text))
+            .await;
         if matches!(error, FetchError::Network(_)) {
             FetchOutcome::Unreachable { retry_in }
         } else {
             FetchOutcome::Failed { retry_in }
         }
+    }
+
+    /// Applies `edit` and writes `meta.toml`. An unreadable meta is skipped,
+    /// so the previous blob stays named for collection.
+    async fn write_meta(&self, url: &Url, known: KnownMeta, edit: impl FnOnce(&mut Meta)) {
+        let base = match known {
+            KnownMeta::Unreadable => return,
+            KnownMeta::Missing => None,
+            KnownMeta::Ready(meta) => Some(meta),
+        };
+        let mut meta = meta_or_new(base, url);
+        edit(&mut meta);
+        self.save_meta(url, &meta).await;
     }
 
     /// Writes `meta`. Only the record of the fetch is lost when that fails.
@@ -439,6 +499,15 @@ fn meta_or_new(known: Option<Meta>, url: &Url) -> Meta {
     known.unwrap_or_else(|| Meta::new(url.clone()))
 }
 
+impl KnownMeta {
+    fn as_meta(&self) -> Option<&Meta> {
+        match self {
+            KnownMeta::Ready(meta) => Some(meta),
+            KnownMeta::Missing | KnownMeta::Unreadable => None,
+        }
+    }
+}
+
 /// At most [`MAX_REDIRECTS`], none to a scheme other than `http` or
 /// `https`, and none to `http` once the chain was on `https`.
 fn redirect_policy() -> redirect::Policy {
@@ -453,6 +522,10 @@ fn redirect_policy() -> redirect::Policy {
 
 /// Why a redirect to `next` after the chain `previous` is refused.
 fn redirect_refusal(previous: &[Url], next: &Url) -> Option<&'static str> {
+    scheme_refusal(previous, next).or_else(|| reserved_literal(next))
+}
+
+fn scheme_refusal(previous: &[Url], next: &Url) -> Option<&'static str> {
     match next.scheme() {
         "https" => None,
         "http" if previous.iter().any(|url| url.scheme() == "https") => {
@@ -461,6 +534,25 @@ fn redirect_refusal(previous: &[Url], next: &Url) -> Option<&'static str> {
         "http" => None,
         _ => Some("redirect to a scheme other than http or https refused"),
     }
+}
+
+/// A literal host in a loopback, link-local, or private range. Checked on
+/// the URL itself and on each redirect. A name is not checked: the
+/// connected address is not visible before the GET.
+fn reserved_literal(next: &Url) -> Option<&'static str> {
+    let reserved = match next.host() {
+        Some(url::Host::Ipv4(ip)) => is_reserved_v4(ip),
+        Some(url::Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
+            Some(mapped) => is_reserved_v4(mapped),
+            None => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+        },
+        _ => false,
+    };
+    reserved.then_some("loopback, link-local, or private address refused")
+}
+
+fn is_reserved_v4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private() || ip.is_link_local()
 }
 
 /// `If-None-Match` and `If-Modified-Since` from the cached version. A value
@@ -716,8 +808,18 @@ mod tests {
     fn redirect_from_https_to_http_is_refused() {
         let chain = [url("https://a.example/x"), url("http://b.example/y")];
 
-        assert!(redirect_refusal(&chain[..1], &url("http://c.example/")).is_some());
-        assert!(redirect_refusal(&chain, &url("http://c.example/")).is_some());
+        assert_eq!(
+            redirect_refusal(&chain[..1], &url("http://c.example/")),
+            Some("redirect from https to http refused")
+        );
+        assert_eq!(
+            redirect_refusal(&chain, &url("http://c.example/")),
+            Some("redirect from https to http refused")
+        );
+        assert_eq!(
+            redirect_refusal(&chain[..1], &url("http://127.0.0.1/")),
+            Some("redirect from https to http refused")
+        );
     }
 
     #[test]
@@ -726,6 +828,36 @@ mod tests {
 
         assert_eq!(redirect_refusal(&chain, &url("http://b.example/")), None);
         assert_eq!(redirect_refusal(&chain, &url("https://b.example/")), None);
+        assert_eq!(redirect_refusal(&chain, &url("https://1.1.1.1/x")), None);
+        assert_eq!(redirect_refusal(&chain, &url("https://8.8.8.8/x")), None);
+        assert_eq!(redirect_refusal(&chain, &url("https://172.32.0.1/x")), None);
+        assert_eq!(
+            redirect_refusal(&chain, &url("https://[::ffff:1.1.1.1]/x")),
+            None
+        );
+    }
+
+    #[test]
+    fn redirect_to_a_reserved_literal_address_is_refused() {
+        let chain = [url("https://cdn.example/a")];
+        for target in [
+            "https://127.0.0.1/x",
+            "https://10.1.2.3/x",
+            "https://172.16.0.1/x",
+            "https://192.168.0.1/x",
+            "https://169.254.1.1/x",
+            "https://[::1]/x",
+            "https://[fe80::1]/x",
+            "https://[fc00::1]/x",
+            "https://[::ffff:127.0.0.1]/x",
+            "https://[::ffff:192.168.1.1]/x",
+        ] {
+            assert_eq!(
+                redirect_refusal(&chain, &url(target)),
+                Some("loopback, link-local, or private address refused"),
+                "{target}"
+            );
+        }
     }
 
     #[test]

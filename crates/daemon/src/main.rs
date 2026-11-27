@@ -83,6 +83,12 @@ enum Failure {
 impl Failure {
     fn exit_code(&self) -> u8 {
         match self {
+            // I/O on a file that exists can clear. Exit 1 so systemd restarts.
+            // 78 stays in RestartPreventExitStatus for a config that is invalid.
+            Failure::Config {
+                reason: LoadError::Io(_),
+                ..
+            } => EXIT_FAILURE,
             Failure::Config { .. } => EXIT_CONFIG,
             Failure::NotGnome(_) => EXIT_UNAVAILABLE,
             Failure::Other(_) => EXIT_FAILURE,
@@ -96,7 +102,7 @@ impl From<GnomeError> for Failure {
             GnomeError::SchemaMissing { .. } | GnomeError::VolatileBackend { .. } => {
                 Failure::NotGnome(error)
             }
-            GnomeError::Write(_) | GnomeError::Stopped => Failure::Other(error.into()),
+            GnomeError::Write { .. } | GnomeError::Stopped => Failure::Other(error.into()),
         }
     }
 }
@@ -301,7 +307,7 @@ fn status_line(status: &Status) -> String {
         None => "nothing".to_owned(),
     };
     let next_change = match status.next_change {
-        Some(due) => format!("next change at {}", humantime::format_rfc3339_seconds(due)),
+        Some(due) => format!("next change at {}", deadline_text(due)),
         None => "no change scheduled".to_owned(),
     };
     let mut summary = format!(
@@ -316,6 +322,22 @@ fn status_line(status: &Status) -> String {
         }
     }
     summary.replace(char::is_control, "?")
+}
+
+/// `humantime` panics on a time before the Unix epoch and on year 10000 or
+/// later (`format!` turns its format error into a panic). D-Bus already
+/// maps a pre-epoch time to `0`. The same number is printed here. A later
+/// time is the raw unix seconds, still without `humantime`.
+const HUMANTIME_LIMIT_SECS: u64 = 253_402_300_800;
+
+fn deadline_text(due: SystemTime) -> String {
+    match due.duration_since(UNIX_EPOCH) {
+        Ok(since) if since.as_secs() < HUMANTIME_LIMIT_SECS => {
+            humantime::format_rfc3339_seconds(due).to_string()
+        }
+        Ok(since) => since.as_secs().to_string(),
+        Err(_) => "0".to_owned(),
+    }
 }
 
 fn pause_reason(pause: Pause) -> &'static str {
@@ -381,6 +403,17 @@ mod tests {
             message.contains("config.toml: line 2, column 12"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn an_unreadable_config_file_exits_1_so_systemd_can_restart() {
+        let (_dir, paths) = paths_in_temp_dir();
+        fs::create_dir(&paths.config_file).expect("a directory where the config would be");
+
+        let failure =
+            load_config(&config_file(&paths)).expect_err("a directory is not a config file");
+
+        assert_eq!(failure.exit_code(), EXIT_FAILURE);
     }
 
     #[test]
@@ -458,6 +491,34 @@ mod tests {
             "dark style on screen; light: dawn.jpg; dark: night sky.png; \
              next change at 2027-01-15T08:00:00Z"
         );
+    }
+
+    #[test]
+    fn status_line_of_a_deadline_before_the_epoch_uses_the_dbus_fallback() {
+        let status = Status {
+            visible: Style::Light,
+            current: PerStyle::default(),
+            next_change: Some(UNIX_EPOCH - Duration::from_secs(5)),
+            paused: PerStyle::default(),
+        };
+
+        let line = status_line(&status);
+
+        assert!(line.contains("next change at 0"), "{line}");
+    }
+
+    #[test]
+    fn status_line_of_a_deadline_at_year_10000_prints_unix_seconds() {
+        let status = Status {
+            visible: Style::Light,
+            current: PerStyle::default(),
+            next_change: Some(UNIX_EPOCH + Duration::from_secs(HUMANTIME_LIMIT_SECS)),
+            paused: PerStyle::default(),
+        };
+
+        let line = status_line(&status);
+
+        assert!(line.contains("next change at 253402300800"), "{line}");
     }
 
     #[test]

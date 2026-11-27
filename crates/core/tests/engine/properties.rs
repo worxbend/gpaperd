@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpaperd_core::catalog::{BadReason, FileId, FsChange, ItemId, LocalFile};
-use gpaperd_core::config::{ApplyMode, Config, ConfigError, RemoteRefresh, Source};
+use gpaperd_core::config::{
+    ApplyMode, Config, ConfigError, PictureOptions, RemoteRefresh, Source,
+};
 use gpaperd_core::control::ReplyId;
 use gpaperd_core::event::{
     BackgroundKeys, Connectivity, Effect, Event, FetchOutcome, Fired, GnomeEvent, Method,
@@ -194,16 +196,44 @@ fn any_change() -> impl Strategy<Value = FsChange> {
     ]
 }
 
+fn any_picture_options() -> impl Strategy<Value = Option<PictureOptions>> {
+    prop_oneof![
+        Just(None),
+        Just(Some(PictureOptions::Wallpaper)),
+        Just(Some(PictureOptions::Centered)),
+        Just(Some(PictureOptions::Scaled)),
+        Just(Some(PictureOptions::Stretched)),
+        Just(Some(PictureOptions::Zoom)),
+        Just(Some(PictureOptions::Spanned)),
+    ]
+}
+
+fn any_failed_uris() -> impl Strategy<Value = PerStyle<Option<String>>> {
+    (
+        prop::option::of(any_key(Style::Light)),
+        prop::option::of(any_key(Style::Dark)),
+    )
+        .prop_map(|(light, dark)| PerStyle { light, dark })
+}
+
 /// Any event at all: answers nobody asked for, a second `Started`, file
 /// changes before a scan, reloads into the other apply mode, fetch answers
 /// and cache reports in any order, control requests and config reads with
-/// any id, key locks and screen locks that come and go, events after
-/// `Shutdown`.
+/// any id, key locks and screen locks that come and go, a refused key write,
+/// events after `Shutdown`.
 fn any_event() -> impl Strategy<Value = Event> {
     let verdict = prop_oneof![
         Just(Ok(())),
         Just(Err(BadReason::Missing)),
+        Just(Err(BadReason::NotRegularFile)),
+        Just(Err(BadReason::Unreadable("permission denied".to_owned()))),
+        Just(Err(BadReason::NotAnImage)),
         Just(Err(BadReason::Truncated)),
+        Just(Err(BadReason::Undecodable("no loader".to_owned()))),
+        Just(Err(BadReason::TooLarge {
+            width: 20_000,
+            height: 10_000
+        })),
     ];
     let written = || {
         any_slot().prop_map(|slot| match slot {
@@ -239,6 +269,20 @@ fn any_event() -> impl Strategy<Value = Event> {
         1 => prop_oneof![Just(ScreenLock::Locked), Just(ScreenLock::Unlocked)].prop_map(Event::ScreenLock),
         2 => (0_u64..4, command()).prop_map(|(n, command)| Event::Control { id: ReplyId(n), command }),
         1 => (0_u64..4, any_reload()).prop_map(|(n, result)| Event::ConfigRead { id: ReplyId(n), result }),
+        1 => (0_u64..4, any::<bool>()).prop_map(|(n, wrote)| Event::KeysRestored {
+            id: ReplyId(n),
+            result: if wrote {
+                Ok(())
+            } else {
+                Err("the key is locked".to_owned())
+            },
+        }),
+        1 => (any_failed_uris(), any_picture_options()).prop_map(|(uris, picture_options)| {
+            Event::KeyWriteFailed {
+                uris,
+                picture_options,
+            }
+        }),
         1 => Just(Event::Shutdown),
     ]
 }

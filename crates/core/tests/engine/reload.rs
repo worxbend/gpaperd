@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use gpaperd_core::catalog::BadReason;
 use gpaperd_core::config::{
-    Config, ConfigError, EmptyStylePolicy, ExternalChangePolicy, LinkPolicy, Order, PictureOptions,
-    Source, StyleConfig,
+    ApplyMode, Config, ConfigError, EmptyStylePolicy, ExternalChangePolicy, LinkPolicy, Order,
+    PictureOptions, Source, StyleConfig,
 };
 use gpaperd_core::event::{Effect, Event};
 use gpaperd_core::model::ModelInit;
@@ -17,7 +17,7 @@ use gpaperd_core::style::{PerStyle, Style};
 use crate::support::{
     DEADLINE, World, alphabetical, armed, at, count, id, init, is_set_keys, is_watch, keys_pointed,
     keys_written, probed, published, reported, running_world, scanned, six_shuffled, slot_uris,
-    unscanned,
+    started, two_folders_with, unscanned, user_keys,
 };
 
 fn reloaded(config: Config) -> Event {
@@ -410,4 +410,86 @@ fn two_folders_config() -> Config {
         config.styles.light.sources = folder("/l");
         config.styles.dark.sources = folder("/d");
     })
+}
+
+#[test]
+fn a_lower_max_pixels_probes_the_image_on_screen() {
+    let mut world = running_world();
+    world.rejected.insert(
+        id("/l/a.jpg"),
+        BadReason::TooLarge {
+            width: 20_000,
+            height: 10_000,
+        },
+    );
+    let tighter = changed(|config| config.general.max_pixels = 1_000_000);
+
+    let trace = world.run(at(100), reloaded(tighter));
+
+    let probe = Effect::Probe {
+        style: Style::Light,
+        item: id("/l/a.jpg"),
+        path: PathBuf::from("/l/a.jpg"),
+        max_pixels: 1_000_000,
+    };
+    assert!(trace.contains(&probe));
+    assert_eq!(world.current(Style::Light), Some(id("/l/b.jpg")));
+}
+
+#[test]
+fn picture_options_dropped_before_the_first_write_are_not_sent() {
+    let mut config = alphabetical();
+    config.general.picture_options = Some(PictureOptions::Zoom);
+    let mut world = World::new(two_folders_with(config));
+    step(
+        &mut world.model,
+        at(0),
+        started(Style::Light, user_keys(), PerStyle::default()),
+    );
+    step(&mut world.model, at(1), reloaded(alphabetical()));
+
+    let trace = world.run_all(
+        at(2),
+        [
+            Event::Probed {
+                style: Style::Light,
+                item: id("/l/a.jpg"),
+                verdict: Ok(()),
+            },
+            Event::Probed {
+                style: Style::Dark,
+                item: id("/d/a.jpg"),
+                verdict: Ok(()),
+            },
+        ],
+    );
+
+    assert!(keys_written(&trace).iter().all(|(_, options)| options.is_none()));
+    assert!(!keys_written(&trace).is_empty());
+}
+
+#[test]
+fn an_apply_mode_change_does_not_borrow_before_the_rescan() {
+    let mut world = World::new(init(alphabetical(), &["/l/a.jpg", "/l/b.jpg"], &[]));
+    world.start(at(0), Style::Light);
+    let mut next = alphabetical();
+    next.general.apply_mode = ApplyMode::Uri;
+    next.styles.dark.sources = folder("/new-dark");
+
+    let trace = world.run(at(100), reloaded(next));
+
+    assert!(trace.iter().any(is_watch));
+    assert!(!published(&trace).iter().any(|(style, _)| *style == Style::Dark));
+}
+
+#[test]
+fn an_apply_mode_change_still_borrows_when_sources_stay() {
+    let mut world = World::new(init(alphabetical(), &["/l/a.jpg", "/l/b.jpg"], &[]));
+    world.start(at(0), Style::Light);
+    let mut next = alphabetical();
+    next.general.apply_mode = ApplyMode::Uri;
+
+    let trace = world.run(at(100), reloaded(next));
+
+    assert!(published(&trace).iter().any(|(style, _)| *style == Style::Dark));
 }

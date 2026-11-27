@@ -12,9 +12,9 @@ use gpaperd_core::config::{
 };
 use gpaperd_core::control::{Command, HISTORY_LEN, Reply, ReplyId};
 use gpaperd_core::event::{
-    BackgroundKeys, Effect, Event, Fired, GnomeEvent, Method, ScreenLock, SlotWrite,
+    BackgroundKeys, Effect, Event, Fired, GnomeEvent, Method, Pause, ScreenLock, SlotWrite,
 };
-use gpaperd_core::model::{Model, ModelInit, Persisted, StylePersisted};
+use gpaperd_core::model::{Model, ModelInit, Persisted, STATE_VERSION, StylePersisted};
 use gpaperd_core::step::{
     HIDDEN_REFRESH_DELAY, MAX_PROBE_RETRIES, MAX_PUBLISH_ATTEMPTS, PROBE_RETRY_DELAY,
     REASSERT_DELAY, step,
@@ -25,7 +25,7 @@ use proptest::test_runner::TestCaseError;
 
 use super::scenario::{Boot, Folders, Op, Reload, Scenario};
 use crate::support::{
-    at, id, is_set_keys, keys_changed, slot_uris, started_with_locks, user_keys, version,
+    at, id, is_set_keys, keys_changed, slot_uris, started, started_with_locks, user_keys, version,
 };
 
 /// Answers the daemon may still owe after the last generated op. Each style
@@ -145,6 +145,10 @@ pub struct Daemon<'a> {
     replied_in_step: BTreeSet<u64>,
     /// Whether the step in progress saves the state.
     saved_in_step: bool,
+    /// What the last [`Effect::Persist`] wrote. A restart loads this, not the
+    /// live model: a step that never saved is gone with the process. `None`
+    /// until the first save.
+    state_file: Option<Persisted>,
     /// The styles whose `Previous` the step in progress replies to: the walk
     /// is over, so any probe of the step starts a rotation of its own. The
     /// refill of a lost slot comes before the reply.
@@ -206,6 +210,7 @@ impl<'a> Daemon<'a> {
             stepping_back: BTreeSet::new(),
             replied_in_step: BTreeSet::new(),
             saved_in_step: false,
+            state_file: None,
             walks_ended: PerStyle::default(),
             next_request: 0,
             screen_locked: false,
@@ -688,10 +693,9 @@ impl<'a> Daemon<'a> {
         let found = self.scan(style);
         let files = local_files(&found);
         self.told[style] = Some(found);
-        // A catalog that learns of a file knows no verdict about it.
-        self.known_bad.clear();
-        self.still_copied.clear();
-        self.tried = PerStyle::default();
+        // The other style's catalog was not replaced, so its bad, truncated,
+        // and tried sets stay. Clearing them hides a probe the reducer still
+        // refuses.
         self.send(Event::Scanned { style, files })
     }
 
@@ -907,13 +911,12 @@ impl<'a> Daemon<'a> {
     }
 
     fn restart(&mut self, boot: &Boot, lost_slots: PerStyle<bool>) -> Result<(), TestCaseError> {
-        let state_file = self.model.persisted();
         for style in Style::ALL {
             if lost_slots[style] {
                 self.slots[style] = None;
             }
         }
-        self.start_run(boot, Some(state_file))
+        self.start_run(boot, self.state_file.clone())
     }
 
     /// Lets every scan come back and answers everything still owed, with no
@@ -1001,6 +1004,10 @@ impl<'a> Daemon<'a> {
             self.replied_in_step.iter().any(ends_walk)
         });
         self.saved_in_step = effects.contains(&Effect::Persist);
+        if self.saved_in_step {
+            // `persist` writes the model after `step` returns, not a later one.
+            self.state_file = Some(self.model.persisted());
+        }
         for effect in &effects {
             self.check(&event, effect)?;
         }
@@ -1529,4 +1536,150 @@ pub fn new_model(
         seed,
         slot_uris: slot_uris(),
     })
+}
+
+fn restored(styles: PerStyle<StylePersisted>, files: PerStyle<Option<Vec<LocalFile>>>) -> Model {
+    Model::new(ModelInit {
+        config: Some(Config::default()),
+        local_files: files,
+        restored: Some(Persisted {
+            version: STATE_VERSION,
+            styles,
+            original_keys: None,
+        }),
+        seed: 1,
+        slot_uris: slot_uris(),
+    })
+}
+
+#[test]
+fn a_missing_key_keeps_the_saved_uri_for_persist() {
+    let saved_uri = "file:///l/last.jpg".to_owned();
+    let style = StylePersisted {
+        key_uri: Some(saved_uri.clone()),
+        ..StylePersisted::default()
+    };
+    let mut model = restored(PerStyle { light: style.clone(), dark: style }, PerStyle::default());
+    let mut keys = user_keys();
+    keys.picture_uri_dark = None;
+
+    let effects = step(
+        &mut model,
+        at(0),
+        started(Style::Light, keys, PerStyle::default()),
+    );
+
+    let status = effects.iter().find_map(|effect| match effect {
+        Effect::Report(status) => Some(status),
+        _ => None,
+    });
+    let status = status.expect("start reports status");
+    assert_eq!(status.paused.dark, Some(Pause::NoKey));
+    assert_eq!(status.paused.light, None);
+    assert_eq!(
+        model.persisted().styles.dark.key_uri.as_deref(),
+        Some(saved_uri.as_str())
+    );
+}
+
+#[test]
+fn a_pre_scan_probe_does_not_open_a_relative_or_lossy_id() {
+    let probes = |current: &str| {
+        let light = StylePersisted {
+            current: Some(id(current)),
+            ..StylePersisted::default()
+        };
+        let mut model = restored(
+            PerStyle {
+                light,
+                dark: StylePersisted::default(),
+            },
+            PerStyle::default(),
+        );
+        let effects = step(
+            &mut model,
+            at(0),
+            started(Style::Light, user_keys(), PerStyle::default()),
+        );
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Probe { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert!(probes("l/a.jpg").is_empty());
+    assert!(probes("/l/\u{FFFD}.jpg").is_empty());
+    assert_eq!(probes("/l/a.jpg"), vec![PathBuf::from("/l/a.jpg")]);
+}
+
+#[test]
+fn a_restored_bag_is_not_cut_to_history_len() {
+    let count = HISTORY_LEN + 5;
+    let ids: Vec<ItemId> = (0..count).map(|n| id(&format!("/p/{n}"))).collect();
+    let over = restored(
+        PerStyle {
+            light: StylePersisted {
+                bag: ids.clone(),
+                shown: Some(ids.clone()),
+                ..StylePersisted::default()
+            },
+            dark: StylePersisted::default(),
+        },
+        PerStyle::default(),
+    );
+    let saved = over.persisted().styles.light;
+    assert_eq!(saved.bag, ids);
+    assert_eq!(saved.shown.as_deref(), Some(ids.as_slice()));
+
+    let short: Vec<ItemId> = (0..HISTORY_LEN).map(|n| id(&format!("/q/{n}"))).collect();
+    let exact = restored(
+        PerStyle {
+            light: StylePersisted {
+                bag: short.clone(),
+                shown: None,
+                ..StylePersisted::default()
+            },
+            dark: StylePersisted::default(),
+        },
+        PerStyle::default(),
+    );
+    let saved = exact.persisted().styles.light;
+    assert_eq!(saved.bag, short);
+    assert_eq!(saved.shown, None);
+}
+
+#[test]
+fn a_restored_bag_drops_ids_the_catalog_does_not_know() {
+    let keep = id("/l/keep.jpg");
+    let gone = id("/gone.jpg");
+    let next = id("/l/next.jpg");
+    let old = id("/l/old.jpg");
+    let queued = id("https://img.test/queued.jpg");
+    let model = restored(
+        PerStyle {
+            light: StylePersisted {
+                current: Some(old.clone()),
+                bag: vec![keep.clone(), gone.clone(), queued.clone(), next.clone()],
+                shown: Some(vec![old.clone()]),
+                ..StylePersisted::default()
+            },
+            dark: StylePersisted::default(),
+        },
+        PerStyle {
+            light: Some(vec![
+                version("/l/keep.jpg", 0),
+                version("/l/next.jpg", 0),
+                version("/l/old.jpg", 0),
+            ]),
+            dark: Some(Vec::new()),
+        },
+    );
+
+    let saved = model.persisted().styles.light;
+    assert_eq!(saved.bag, vec![keep, queued, next]);
+    assert!(!saved.bag.contains(&gone));
+    assert_eq!(saved.shown.as_deref(), Some([old].as_slice()));
 }

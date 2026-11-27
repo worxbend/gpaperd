@@ -26,8 +26,12 @@ On an older system, build from source (section 2.3).
 
 ### 2.1 Install script (recommended)
 
+Save the script and read it, then run it:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh
+curl -fsSLO https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh
+less install.sh
+sh install.sh
 ```
 
 The script:
@@ -47,20 +51,13 @@ The script:
 
 It needs no root and touches nothing outside your home directory.
 
-Options, passed after `sh -s --`:
+Options, on the script you just read:
 
 ```sh
-curl -fsSL .../install.sh | sh -s -- --version v0.1.1   # a given release
-curl -fsSL .../install.sh | sh -s -- --no-start         # install, do not start
-curl -fsSL .../install.sh | sh -s -- --prefix ~/apps    # binaries in ~/apps/bin
-```
-
-To read the script before running it:
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh
-less install.sh
 sh install.sh --help
+sh install.sh --version v0.1.1   # a given release
+sh install.sh --no-start         # install, do not start
+sh install.sh --prefix ~/apps    # binaries in ~/apps/bin
 ```
 
 ### 2.2 cargo binstall
@@ -186,9 +183,9 @@ style under `[light]` or `[dark]`.
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `interval` | `"15m"` | Time between changes, `1m` to `1h`. Counts only time the style is on screen |
+| `interval` | `"15m"` | Time between changes, `1m` to `1h`. Counts only time the style is on screen when `rotate_hidden` is false |
 | `order` | `"random"` | `random` shows every image once per round; `alphabetical` follows file names |
-| `picture_options` | not set | `zoom`, `scaled`, `centered`, `stretched`, `wallpaper` or `spanned`; unset leaves GNOME's choice |
+| `picture_options` | not set | `zoom`, `scaled`, `centered`, `stretched`, `wallpaper` or `spanned`. Unset leaves GNOME's value, but `none` becomes `zoom` |
 | `rotate_hidden` | `false` | Also rotate the style that is not on screen |
 | `empty_style` | `"use-other-style"` | A style without images shows the other style's image; `keep-current` leaves it |
 | `on_external_change` | `"pause"` | When you pick a wallpaper in Settings: `pause` gpaperd, or put its own back (`reassert-next-tick`, `reassert-now`) |
@@ -250,16 +247,18 @@ gpaperctl restore              # put your original wallpaper back and pause
 `--style` takes `light`, `dark`, `visible` (the default) or `both`.
 
 If you choose a wallpaper in GNOME Settings, gpaperd pauses that style
-(with the default `on_external_change = "pause"`). `gpaperctl resume` takes
-over again.
+(with the default `on_external_change = "pause"`). `gpaperctl resume` or a
+config reload writes gpaperd's image back. The pause also ends when the
+key points at gpaperd again.
 
 ## 6. Update
 
-Run the install script again. It replaces the binaries, keeps your config,
-and restarts gpaperd if it was running:
+Run the same script again. Save and read it first, as in section 2.1, if
+it is not already in this directory. It replaces the binaries, keeps your
+config, and restarts gpaperd if it was running:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh
+sh install.sh
 ```
 
 With binstall or from source, reinstall the same way, then
@@ -267,8 +266,10 @@ With binstall or from source, reinstall the same way, then
 
 ## 7. Uninstall
 
+Save and read the script as in section 2.1, then:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/worxbend/gpaperd/main/scripts/install.sh | sh -s -- --uninstall
+sh install.sh --uninstall
 ```
 
 This puts your original wallpaper back (`gpaperctl restore`), stops and
@@ -281,7 +282,11 @@ By hand:
 ```sh
 gpaperctl restore
 systemctl --user disable --now gpaperd.service
-rm ~/.config/systemd/user/gpaperd.service ~/.local/bin/gpaperd ~/.local/bin/gpaperctl
+rm ~/.config/systemd/user/gpaperd.service \
+    ~/.local/bin/gpaperd ~/.local/bin/gpaperctl \
+    ~/.local/share/man/man1/gpaperd.1 \
+    ~/.local/share/man/man1/gpaperctl.1 \
+    ~/.local/share/man/man5/gpaperd.toml.5
 systemctl --user daemon-reload
 ```
 
@@ -293,7 +298,7 @@ systemctl --user daemon-reload
 | The unit is skipped ("condition failed") | Not a GNOME session: `XDG_CURRENT_DESKTOP` does not contain `GNOME` |
 | The unit failed with status 78 | The config has an error: `gpaperd check-config` shows line and column. Fix it, then `systemctl --user restart gpaperd` |
 | The unit failed with status 69 | GNOME's background settings are missing: not a GNOME session |
-| Status says `paused: external change` | Something else set the wallpaper. `gpaperctl resume` |
+| Status says `paused: external change` | Something else set the wallpaper. `gpaperctl resume` or a config reload |
 | Status shows changes but the screen does not change | Your GNOME release does not reload slot files. Set `apply_mode = "uri"` |
 | Some images are never shown | `gpaperctl status --json` lists bad images with the reason. HEIC and JPEG XL need glycin loaders |
 | A network folder updates late | It is polled; set `poll = "1m"` on that source |

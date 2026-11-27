@@ -29,7 +29,10 @@ fn line(label: &str, value: &str) -> String {
 
 /// Two lines: the item in the slot, then catalog sizes and pauses.
 fn style_lines(label: &str, style: &StyleReport) -> [String; 2] {
-    let current = style.current.as_ref().map_or("none", |item| item.as_str());
+    let current = match style.current.as_ref() {
+        Some(item) => replace_controls(item.as_str()),
+        None => "none".to_owned(),
+    };
     let mut counts = format!(
         "{} items, {} usable, {} bad",
         style.items,
@@ -40,7 +43,13 @@ fn style_lines(label: &str, style: &StyleReport) -> [String; 2] {
         let reasons: Vec<&str> = style.paused.iter().copied().map(pause_label).collect();
         counts.push_str(&format!("; paused: {}", reasons.join(", ")));
     }
-    [line(label, current), line("", &counts)]
+    [line(label, &current), line("", &counts)]
+}
+
+/// A path or a bus error can carry CR, LF, NUL, or ESC. The daemon status
+/// line already turns every control character into `?`.
+pub(super) fn replace_controls(text: &str) -> String {
+    text.replace(char::is_control, "?")
 }
 
 fn pause_label(pause: Pause) -> &'static str {
@@ -143,6 +152,24 @@ mod tests {
 visible:     dark
 next change: 2027-01-15 08:12:05 +00:00 (in 12m 5s)
 light:       /pics/day.jpg
+             12 items, 11 usable, 1 bad; paused: by user, external change
+dark:        none
+             0 items, 0 usable, 0 bad
+";
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn summary_replaces_controls_in_the_item_id() {
+        let mut report = report();
+        report.styles.light.current = Some(ItemId::new("/pics/a\r\n\0\u{1b}b.jpg"));
+
+        let text = summary(&report, now(), &TimeZone::UTC);
+
+        let expected = "\
+visible:     dark
+next change: 2027-01-15 08:12:05 +00:00 (in 12m 5s)
+light:       /pics/a????b.jpg
              12 items, 11 usable, 1 bad; paused: by user, external change
 dark:        none
              0 items, 0 usable, 0 bad

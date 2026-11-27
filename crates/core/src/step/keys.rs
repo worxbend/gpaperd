@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use super::{MAX_KEY_FLIPS_PER_MINUTE, REASSERT_DELAY, Turn};
+use super::{KEY_WRITE_RETRY, MAX_KEY_FLIPS_PER_MINUTE, REASSERT_DELAY, Turn};
 use crate::config::{ApplyMode, Config, ExternalChangePolicy, PictureOptions};
 use crate::event::{BackgroundKeys, Effect, GnomeSnapshot};
 use crate::key::{KeyChange, Reassert};
@@ -27,7 +27,9 @@ impl Turn<'_> {
     /// GNOME's report that the background keys changed: first what the
     /// daemon wrote to them, then what their locks allow.
     pub(super) fn on_keys_changed(&mut self, keys: BackgroundKeys) {
+        let previous = self.model.gnome_keys.clone();
         self.follow_keys(&keys);
+        self.announce_landed_writes(&keys, previous.as_ref());
         self.model.gnome_keys = Some(keys);
         self.follow_locks();
     }
@@ -101,12 +103,91 @@ impl Turn<'_> {
     }
 
     pub(super) fn reassert_at_next_tick(&mut self, style: Style) {
-        // A style with nothing to rotate to has no tick. It gets one, a
-        // whole interval from now.
-        if !self.model.has_other_candidate(style) {
+        // A style with nothing to rotate to has no tick. A running one gets
+        // a fresh interval. A hidden one cannot keep its clock running.
+        if !self.model.has_other_candidate(style) && self.model.is_running(style) {
             self.model.restart_clock(style, self.now);
         }
-        self.model.styles[style].key.reassert = Some(Reassert::AtNextTick);
+        // `AtNextTick` only fires from a clock that is due. A hidden style
+        // whose clock is stopped never gets that, so the write waits one
+        // interval of its own unless some other style will tick.
+        let reassert = if self.waits_on_its_own(style) {
+            let due = self
+                .now
+                .checked_add(self.model.config().styles[style].interval);
+            due.map_or(Reassert::Now, Reassert::At)
+        } else {
+            Reassert::AtNextTick
+        };
+        self.model.styles[style].key.reassert = Some(reassert);
+    }
+
+    /// A hidden style has no clock of its own. It needs a deadline when it
+    /// has nothing to rotate to, and when no other style will tick either.
+    fn waits_on_its_own(&self, style: Style) -> bool {
+        if self.model.is_running(style) {
+            return false;
+        }
+        !self.model.has_other_candidate(style) || !self.another_style_ticks(style)
+    }
+
+    fn another_style_ticks(&self, style: Style) -> bool {
+        let other = style.other();
+        let state = &self.model.styles[other];
+        self.model.is_running(other)
+            && self.model.has_other_candidate(other)
+            && state.key.pause.is_none()
+            && !state.user_paused
+            && !self.model.is_held_by_lock()
+    }
+
+    /// The GNOME write failed. The keys still hold what they held. Each style
+    /// whose recorded URI is still the one that failed is dropped and tried
+    /// again after [`KEY_WRITE_RETRY`]. A style that already moved on is left
+    /// alone. A failure that names only `picture-options` arms the same retry
+    /// on every key this run still holds, and clears `written` so the 1s cap
+    /// is not applied to that wait.
+    pub(super) fn on_key_write_failed(
+        &mut self,
+        uris: PerStyle<Option<String>>,
+        picture_options: Option<PictureOptions>,
+    ) {
+        let due = self.now.checked_add(KEY_WRITE_RETRY);
+        let reassert = due.map_or(Reassert::Now, Reassert::At);
+        let mut matched = false;
+        for style in Style::ALL {
+            let Some(uri) = uris[style].as_deref() else {
+                continue;
+            };
+            let key = &mut self.model.styles[style].key;
+            if key.written.as_deref() == Some(uri) {
+                key.written = None;
+                key.reassert = Some(reassert);
+                matched = true;
+            }
+        }
+        let options_only = picture_options.is_some()
+            && Style::ALL.into_iter().all(|style| uris[style].is_none());
+        if options_only {
+            self.arm_held_keys(reassert);
+            matched = true;
+        }
+        if matched && picture_options.is_some() && self.model.picture_options_owed.is_none() {
+            self.model.picture_options_owed = picture_options;
+        }
+    }
+
+    /// Arms [`KEY_WRITE_RETRY`] on every key this run still holds and is not
+    /// already waiting. Clearing `written` marks the wait as a refused write.
+    fn arm_held_keys(&mut self, reassert: Reassert) {
+        for style in Style::ALL {
+            let key = &mut self.model.styles[style].key;
+            let already_waits = matches!(key.reassert, Some(Reassert::At(_)));
+            if key.written.is_some() && key.pause.is_none() && !already_waits {
+                key.written = None;
+                key.reassert = Some(reassert);
+            }
+        }
     }
 
     /// Plans the write-back of `style`'s key, [`REASSERT_DELAY`] from now.
@@ -148,9 +229,17 @@ impl Turn<'_> {
         }
         let uris = PerStyle::from_fn(|style| self.model.owed_uri(style).map(str::to_owned));
         let writes_a_uri = Style::ALL.iter().any(|&style| uris[style].is_some());
+        // A retry already armed must not send `picture-options` again in
+        // this step: that is the loop a refused options write would start.
+        let retries_later = Style::ALL.iter().any(|&style| {
+            matches!(
+                self.model.styles[style].key.reassert,
+                Some(Reassert::At(_))
+            )
+        });
         // `picture-options` alone is written only next to a key that is the
         // daemon's: without one, the background is none of its business.
-        let picture_options = if writes_a_uri || self.model.holds_a_key() {
+        let picture_options = if writes_a_uri || (self.model.holds_a_key() && !retries_later) {
             self.model.picture_options_owed.take()
         } else {
             None
@@ -168,24 +257,28 @@ impl Turn<'_> {
         }
         // The user's original keys must be on disk before they are replaced.
         self.persist();
-        let written: Vec<Style> = Style::ALL
-            .into_iter()
-            .filter(|&style| uris[style].is_some())
-            .collect();
         self.effects.push(Effect::SetKeys {
             uris,
             picture_options,
         });
-        self.announce_key_writes(&written);
     }
 
-    /// Uri mode: an image is on screen once its key names it, so the key
-    /// write is what `Changed` announces. In slots mode the publish was.
-    fn announce_key_writes(&mut self, written: &[Style]) {
+    /// Uri mode: `Changed` names an image once the shell reports the URI
+    /// this run wrote, and that URI is not the one the shell already had.
+    /// The plan to write is not that report. Slots mode announces the publish.
+    fn announce_landed_writes(&mut self, keys: &BackgroundKeys, previous: Option<&BackgroundKeys>) {
         if self.model.config().general.apply_mode != ApplyMode::Uri {
             return;
         }
-        for &style in written {
+        for style in Style::ALL {
+            let Some(reported) = keys.uri(style) else {
+                continue;
+            };
+            let landed = self.model.styles[style].key.written.as_deref() == Some(reported);
+            let previous_uri = previous.and_then(|held| held.uri(style));
+            if !landed || previous_uri == Some(reported) {
+                continue;
+            }
             if let Some(item) = self.model.styles[style].current.clone() {
                 self.effects.push(Effect::Changed { style, item });
             }

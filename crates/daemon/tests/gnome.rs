@@ -501,9 +501,10 @@ isolated_test!(
 
         assert_eq!(
             written,
-            Err(GnomeError::Write(
-                "locked keys: picture-uri, picture-uri-dark".to_owned()
-            ))
+            Err(GnomeError::Write {
+                reason: "locked keys: picture-uri, picture-uri-dark".to_owned(),
+                unstored: vec!["picture-uri".to_owned(), "picture-uri-dark".to_owned()],
+            })
         );
         assert_eq!(sandbox.read_settings(), users_settings);
     }
@@ -591,7 +592,7 @@ isolated_test!(
             .await;
 
         assert!(
-            matches!(&written, Err(GnomeError::Write(reason)) if reason.starts_with("picture-options: ")),
+            matches!(&written, Err(GnomeError::Write { reason, .. }) if reason.starts_with("picture-options: ")),
             "{written:?}"
         );
         let keys = gnome.snapshot().await.expect("snapshot").keys;

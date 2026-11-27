@@ -53,8 +53,10 @@ pub trait GnomePort {
     /// values that are already set changes nothing and raises no event.
     ///
     /// A locked key that already holds its value is fine. Any other locked
-    /// key is left alone: the writable keys are still written, and then the
-    /// call fails with a [`GnomeError::Write`] that names the locked keys.
+    /// key fails the call before any key is written, including a locked
+    /// `picture-options` that is still `none` (the shell loads no file)
+    /// even when this write does not name that key. The error names every
+    /// key of the write that was not stored.
     fn set_keys(&self, write: KeyWrite) -> impl Future<Output = Result<(), GnomeError>>;
 
     /// Writes `keys` back as they are, in one transaction: `picture-uri`,
@@ -85,9 +87,12 @@ pub enum GnomeError {
     /// `GSETTINGS_BACKEND=memory`. Fatal at start: exit code 69.
     #[error("GSettings backend {backend} does not persist settings")]
     VolatileBackend { backend: String },
-    /// A key is locked or the backend refused the write.
-    #[error("cannot write background keys: {0}")]
-    Write(String),
+    /// A key is locked, the backend refused the write, or the settings
+    /// thread did not answer. `unstored` names the keys that were not
+    /// stored. It is empty when the thread did not answer: the whole write
+    /// is then unconfirmed.
+    #[error("cannot write background keys: {reason}")]
+    Write { reason: String, unstored: Vec<String> },
     /// The GLib thread is gone.
     #[error("GNOME settings thread stopped")]
     Stopped,
@@ -167,7 +172,21 @@ impl GnomeThread {
         let (reply, answer) = oneshot::channel();
         let sent = self.commands.send(command(reply)).await;
         sent.map_err(|_| GnomeError::Stopped)?;
-        answer.await.map_err(|_| GnomeError::Stopped)
+        wait_for_reply(answer).await
+    }
+}
+
+/// Waits for the GLib thread. `gio::Settings::sync` has no cancellable, so
+/// the wait is what ends: at [`crate::dbus::REPLY_TIMEOUT`] the caller
+/// stops waiting and the reply, if it arrives later, is dropped.
+async fn wait_for_reply<T>(answer: oneshot::Receiver<T>) -> Result<T, GnomeError> {
+    match tokio::time::timeout(crate::dbus::REPLY_TIMEOUT, answer).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(GnomeError::Stopped),
+        Err(_elapsed) => Err(GnomeError::Write {
+            reason: "settings did not answer".to_owned(),
+            unstored: Vec::new(),
+        }),
     }
 }
 
@@ -237,10 +256,31 @@ fn run_settings_thread(
 ///
 /// The connection is a singleton that lives only while someone holds it,
 /// so the caller keeps it for the whole thread. `None` without a bus.
+///
+/// `bus_get_sync` blocks this thread. A cancellable on another thread
+/// bounds that wait by [`crate::dbus::REPLY_TIMEOUT`]. A failed open is
+/// tried once more, the same way. The connection this thread keeps,
+/// including one opened on the second try, is told not to exit on close.
 fn session_bus_that_outlives_the_bus() -> Option<gio::DBusConnection> {
-    let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
+    let bus = open_session_bus().or_else(open_session_bus)?;
     bus.set_exit_on_close(false);
     Some(bus)
+}
+
+/// One bounded `bus_get_sync`. `None` when the bus does not answer in time
+/// or the open fails.
+fn open_session_bus() -> Option<gio::DBusConnection> {
+    let cancellable = gio::Cancellable::new();
+    let (finished, wait) = sync_channel(1);
+    let cancel = cancellable.clone();
+    std::thread::spawn(move || {
+        if wait.recv_timeout(crate::dbus::REPLY_TIMEOUT).is_err() {
+            cancel.cancel();
+        }
+    });
+    let bus = gio::bus_get_sync(gio::BusType::Session, Some(&cancellable)).ok();
+    let _ = finished.send(());
+    bus
 }
 
 /// Answers commands until the handle closes the channel.
@@ -345,7 +385,7 @@ impl Session {
     }
 
     /// Writes, in one transaction, every key that does not hold its wanted
-    /// value yet. A locked one is skipped and fails the call afterwards.
+    /// value yet. A locked one fails the call before that transaction.
     fn write(&self, write: &KeyWrite) -> Result<(), GnomeError> {
         self.write_changes(self.wanted(write))
     }
@@ -361,20 +401,30 @@ impl Session {
         self.write_changes(wanted)
     }
 
-    /// Commits the writable changes that are not set yet, then fails with
-    /// the names of the locked ones, if any.
+    /// Commits the changes that are not set yet. A locked key, or
+    /// `picture-options` locked while it is still `none`, fails the call
+    /// before `commit`.
     fn write_changes(&self, wanted: Vec<KeyChange<'_>>) -> Result<(), GnomeError> {
-        let (writable, locked): (Vec<_>, Vec<_>) = wanted
-            .into_iter()
+        let outstanding: Vec<_> = wanted
+            .iter()
+            .copied()
             .filter(|change| self.is_outstanding(change))
-            .partition(|(key, _)| self.background.is_writable(key));
-        self.commit(&writable)?;
-        if locked.is_empty() {
-            Ok(())
-        } else {
-            let reason = format!("locked keys: {}", key_names(&locked));
-            Err(GnomeError::Write(reason))
+            .collect();
+        if outstanding.is_empty() {
+            return Ok(());
         }
+        let locked: Vec<_> = outstanding
+            .iter()
+            .copied()
+            .filter(|(key, _)| self.is_locked(key))
+            .collect();
+        let current_options = self.background.string(PICTURE_OPTIONS);
+        let options_block =
+            options_block_the_write(self.is_locked(PICTURE_OPTIONS), current_options.as_str());
+        if !locked.is_empty() || options_block {
+            return Err(refuse_locked(&wanted, &locked, options_block));
+        }
+        self.commit(&outstanding)
     }
 
     /// The value each key must hold after `write`.
@@ -404,14 +454,15 @@ impl Session {
         for (key, value) in changes {
             if let Err(error) = self.background.set_string(key, value) {
                 self.background.revert();
-                return Err(GnomeError::Write(format!("{key}: {error}")));
+                return Err(write_error(format!("{key}: {error}"), changes));
             }
         }
         self.background.apply();
         gio::Settings::sync();
 
         // `apply` returns nothing. A write the backend refused shows up as
-        // the old value once `sync` is done.
+        // the old value once `sync` is done. Only the refused keys are
+        // unstored: the ones that stayed are the user's.
         let refused: Vec<_> = changes
             .iter()
             .copied()
@@ -421,9 +472,38 @@ impl Session {
             Ok(())
         } else {
             let reason = format!("refused by the backend: {}", key_names(&refused));
-            Err(GnomeError::Write(reason))
+            Err(write_error(reason, &refused))
         }
     }
+}
+
+/// Nothing was stored. Every key of the wanted write is unstored, not only
+/// the locked names, so the caller can clear each one it recorded.
+fn refuse_locked(
+    wanted: &[KeyChange<'_>],
+    locked: &[KeyChange<'_>],
+    options_block: bool,
+) -> GnomeError {
+    let mut names: Vec<&str> = locked.iter().map(|(key, _)| *key).collect();
+    if options_block && !names.contains(&PICTURE_OPTIONS) {
+        names.push(PICTURE_OPTIONS);
+    }
+    write_error(format!("locked keys: {}", names.join(", ")), wanted)
+}
+
+fn write_error(reason: String, changes: &[KeyChange<'_>]) -> GnomeError {
+    GnomeError::Write {
+        reason,
+        unstored: changes.iter().map(|(key, _)| (*key).to_owned()).collect(),
+    }
+}
+
+/// A locked `picture-options` that is still `none` means the shell loads no
+/// file. No key of that transaction may be written, including a URI write
+/// that does not name `picture-options`. Locked at any other value does not
+/// block a write that leaves the key alone.
+fn options_block_the_write(options_locked: bool, current_options: &str) -> bool {
+    options_locked && current_options == "none"
 }
 
 fn key_names(changes: &[KeyChange<'_>]) -> String {
@@ -619,6 +699,8 @@ impl ChangeReporter {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::oneshot;
+
     use super::*;
 
     #[test]
@@ -630,5 +712,39 @@ mod tests {
 
         use Connectivity::{Full, Limited};
         assert_eq!(mapped, [Limited, Limited, Limited, Full]);
+    }
+
+    #[test]
+    fn picture_options_locked_at_none_blocks_the_uri_write() {
+        assert!(options_block_the_write(true, "none"));
+        assert!(!options_block_the_write(true, "zoom"));
+        assert!(!options_block_the_write(false, "none"));
+    }
+
+    #[tokio::test]
+    async fn a_ready_settings_reply_returns_at_once() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(7).expect("the receiver is alive");
+
+        let value = wait_for_reply(receiver).await.expect("a ready reply");
+
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn a_settings_reply_that_never_comes_ends_at_the_dbus_timeout() {
+        let (_sender, receiver) = oneshot::channel::<()>();
+        let started = std::time::Instant::now();
+
+        let outcome = wait_for_reply(receiver).await;
+
+        assert!(started.elapsed() >= crate::dbus::REPLY_TIMEOUT);
+        assert!(
+            matches!(
+                &outcome,
+                Err(GnomeError::Write { unstored, .. }) if unstored.is_empty()
+            ),
+            "{outcome:?}"
+        );
     }
 }

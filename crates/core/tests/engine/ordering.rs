@@ -258,6 +258,74 @@ fn an_item_the_round_showed_does_not_join_it_again() {
 }
 
 #[test]
+fn a_cache_insert_with_no_newcomer_leaves_shown_unknown() {
+    let cached = id("https://cdn.example/cached.jpg");
+    let mut bag = ShuffleBag::restore_queue_only(vec![cached.clone(), id("/l/2.jpg")]);
+
+    bag.insert([cached], &mut rng(1));
+
+    assert!(!bag.knows_shown());
+    assert_eq!(bag.queue().count(), 2);
+}
+
+#[test]
+fn a_cache_load_before_the_scan_does_not_queue_what_the_round_showed() {
+    let current = id("/l/3.jpg");
+    let cached = id("https://cdn.example/extra.jpg");
+    let mut bag = ShuffleBag::restore_queue_only(vec![id("/l/1.jpg"), id("/l/2.jpg")]);
+
+    bag.insert([cached.clone()], &mut rng(1));
+
+    assert!(!bag.knows_shown());
+    bag.insert(
+        [
+            id("/l/1.jpg"),
+            id("/l/2.jpg"),
+            current.clone(),
+            id("/l/4.jpg"),
+        ],
+        &mut rng(1),
+    );
+
+    assert!(bag.knows_shown());
+    let queued: BTreeSet<ItemId> = bag.queue().cloned().collect();
+    assert!(queued.contains(&cached));
+    assert!(queued.contains(&id("/l/1.jpg")));
+    assert!(queued.contains(&id("/l/2.jpg")));
+    assert!(!queued.contains(&current));
+    assert!(!queued.contains(&id("/l/4.jpg")));
+    let shown: BTreeSet<ItemId> = bag.shown().cloned().collect();
+    assert!(shown.contains(&current));
+    assert!(shown.contains(&id("/l/4.jpg")));
+}
+
+#[test]
+fn the_on_screen_id_omitted_from_the_scan_is_not_queued_again() {
+    let current = id("/l/3.jpg");
+    let mut bag = ShuffleBag::restore_queue_only(vec![id("/l/1.jpg"), id("/l/2.jpg")]);
+    bag.insert([id("https://cdn.example/a.jpg")], &mut rng(1));
+    bag.insert([id("/l/1.jpg"), id("/l/2.jpg"), id("/l/4.jpg")], &mut rng(1));
+    let images = catalog(&["/l/1.jpg", "/l/2.jpg", "/l/3.jpg", "/l/4.jpg"]);
+
+    bag.draw(&images, Some(&current), &[], &mut rng(1));
+    bag.insert([current.clone()], &mut rng(2));
+
+    assert!(bag.shown().any(|shown| shown == &current));
+    assert!(bag.queue().all(|queued| queued != &current));
+}
+
+#[test]
+fn a_scan_of_queued_files_still_ends_the_unknown_shown_state() {
+    let mut bag = ShuffleBag::restore_queue_only(vec![id("/l/1.jpg"), id("/l/2.jpg")]);
+
+    bag.insert([id("/l/1.jpg"), id("/l/2.jpg")], &mut rng(1));
+
+    assert!(bag.knows_shown());
+    bag.insert([id("/l/new.jpg")], &mut rng(1));
+    assert_eq!(bag.queue().count(), 3);
+}
+
+#[test]
 fn an_item_the_round_showed_is_not_put_back() {
     let mut bag = ShuffleBag::restore(vec![id("/w/b.png")], vec![id("/w/a.png")]);
 
@@ -337,6 +405,32 @@ fn file_names_sort_without_regard_to_case() {
     );
     assert_eq!(
         compare_ids(&id("/w/Cherry.png"), &id("/w/banana.png")),
+        Ordering::Greater
+    );
+}
+
+#[test]
+fn a_url_sorts_by_its_last_path_segment() {
+    let earlier = id("https://cdn.example/a/a.jpg?b=10");
+    let later = id("https://cdn.example/z/a.jpg?b=2");
+
+    // The last slash is first. The query or fragment of that segment is not
+    // the name, so the whole id breaks the tie.
+    assert_eq!(compare_ids(&earlier, &later), Ordering::Less);
+    assert_eq!(
+        compare_ids(
+            &id("https://cdn.example/a/a.jpg#10"),
+            &id("https://cdn.example/z/a.jpg#2"),
+        ),
+        Ordering::Less
+    );
+    // A `?` or `#` in a parent is not the name.
+    assert_eq!(
+        compare_ids(&id("/pics/?set/img10.png"), &id("/pics/?set/img2.png")),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare_ids(&id("/pics/#trip/img10.png"), &id("/pics/#trip/img2.png")),
         Ordering::Greater
     );
 }

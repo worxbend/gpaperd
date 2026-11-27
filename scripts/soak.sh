@@ -31,6 +31,10 @@ readonly MEM_KB="${SOAK_MEM_KB:-8388608}"
 readonly RSS_MAX_KB="${SOAK_RSS_MAX_KB:-262144}"
 readonly SCHEMA_SRC="$ROOT_DIR/crates/daemon/tests/schemas/gnome"
 readonly TINY_PNG="$ROOT_DIR/crates/daemon/tests/fixtures/tiny.png"
+# 20s, counted as 100 slices of 0.2s. The ready wait states this bound.
+# Both SIGTERM waits reuse it: a daemon that ignores the signal must not hang.
+readonly DAEMON_WAIT_TRIES=100
+readonly DAEMON_WAIT_SLICE=0.2
 
 log() { printf 'soak: %s\n' "$*" >&2; }
 die() {
@@ -46,6 +50,7 @@ die() {
 # ---------------------------------------------------------------- outer part
 
 outer() {
+  # Decimal whole seconds. Each arithmetic use is 10#, so a leading zero is not octal.
   [[ "$DURATION" =~ ^[0-9]+$ ]] || die "DURATION must be whole seconds, got '$DURATION'"
   local tool
   for tool in dbus-run-session glib-compile-schemas jq; do
@@ -157,7 +162,7 @@ inner() {
   local start now config_writes=0 invalid_writes=0 slot_deletes=0 flips=0
   local adds=0 deletes=0 renames=0 ctl_calls=0 ctl_failures=0 scheme=default
   start=$(date +%s)
-  while now=$(date +%s); (( now - start < DURATION )); do
+  while now=$(date +%s); (( now - start < 10#$DURATION )); do
     alive || die "daemon died after $((now - start)) s; see $DAEMON_LOG"
     sample_rss "$((now - start))"
     case $((RANDOM % 10)) in
@@ -199,8 +204,13 @@ inner() {
   final_rss="$(rss_kb)"
 
   kill -TERM "$DAEMON_PID"
-  local code=0
-  wait "$DAEMON_PID" || code=$?
+  local code
+  if ! code="$(wait_daemon)"; then
+    kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    wait_daemon >/dev/null || true
+    trap - EXIT
+    die "daemon ignored SIGTERM for 20 s; see $DAEMON_LOG"
+  fi
   trap - EXIT
   (( code == 0 )) || die "daemon exited $code on SIGTERM; see $DAEMON_LOG"
 
@@ -212,6 +222,15 @@ inner() {
   local errors expected_errors
   expected_errors=$(grep -c 'config file is invalid' "$DAEMON_LOG" || true)
   errors=$(grep -E ' (ERROR|WARN) ' "$DAEMON_LOG" | grep -vEc "$EXPECTED_WARNINGS" || true)
+  if (( errors > 0 )); then
+    # head can SIGPIPE sort; the failure is the die below, not that pipe.
+    grep -E ' (ERROR|WARN) ' "$DAEMON_LOG" | grep -vE "$EXPECTED_WARNINGS" \
+      | sed -E 's/^[^ ]+ +//' | sort | uniq -c | sort -rn | head -20 || true
+    die "$errors unexpected WARN/ERROR lines"
+  fi
+  # One refusal per invalid write. A swallow or an extra refusal is not a pass.
+  (( expected_errors == invalid_writes )) \
+    || die "invalid configs refused $expected_errors, wrote $invalid_writes"
   cat <<EOF
 soak passed: ${DURATION} s
   churn: images added $adds, deleted $deletes, renamed $renames; config writes $config_writes ($invalid_writes invalid); slot deletes $slot_deletes; color-scheme flips $flips; gpaperctl calls $ctl_calls ($ctl_failures failed)
@@ -219,10 +238,6 @@ soak passed: ${DURATION} s
   rss: final ${final_rss} kB, peak $(sort -k2 -n "$RSS_LOG" | tail -1 | cut -d' ' -f2) kB
   other WARN/ERROR lines: $errors
 EOF
-  if (( errors > 0 )); then
-    grep -E ' (ERROR|WARN) ' "$DAEMON_LOG" | grep -vE "$EXPECTED_WARNINGS" \
-      | sed -E 's/^[^ ]+ +//' | sort | uniq -c | sort -rn | head -20
-  fi
 }
 
 # Warnings the churn causes on purpose.
@@ -232,20 +247,52 @@ alive() { kill -0 "$DAEMON_PID" 2>/dev/null; }
 
 stop_daemon() {
   kill -TERM "$DAEMON_PID" 2>/dev/null || return 0
-  wait "$DAEMON_PID" 2>/dev/null || true
+  if ! wait_daemon >/dev/null; then
+    kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    wait_daemon >/dev/null || true
+  fi
+}
+
+# State letter from /proc. Empty when the pid is already gone.
+# The comm field can contain spaces, so the letter is the token after ") ".
+proc_state() {
+  local stat
+  stat="$(cat "/proc/$DAEMON_PID/stat" 2>/dev/null)" || return 0
+  stat="${stat##*) }"
+  printf '%s\n' "${stat%% *}"
+}
+
+# Reaps DAEMON_PID and prints its exit code. Returns 1 if it is still
+# running after the ready wait's 20s. A zombie still answers kill -0,
+# so this reads the proc state and only then waits.
+wait_daemon() {
+  local tries state code
+  for tries in $(seq 0 "$DAEMON_WAIT_TRIES"); do
+    state="$(proc_state)"
+    if [[ -z "$state" || "$state" == Z ]]; then
+      code=0
+      wait "$DAEMON_PID" 2>/dev/null || code=$?
+      printf '%s\n' "$code"
+      return 0
+    fi
+    if (( tries == DAEMON_WAIT_TRIES )); then
+      return 1
+    fi
+    sleep "$DAEMON_WAIT_SLICE"
+  done
 }
 
 count() { grep -c -- "$1" "$DAEMON_LOG" || true; }
 
 wait_ready() {
   local tries
-  for tries in $(seq 1 100); do
+  for tries in $(seq 1 "$DAEMON_WAIT_TRIES"); do
     alive || die "daemon exited at start; see $DAEMON_LOG"
     if "$GPAPERCTL" status >/dev/null 2>&1; then
       log "daemon $DAEMON_PID ready after $tries tries; log at $DAEMON_LOG"
       return
     fi
-    sleep 0.2
+    sleep "$DAEMON_WAIT_SLICE"
   done
   die "daemon not ready after 20 s"
 }
@@ -347,24 +394,62 @@ sample_rss() { printf '%s %s\n' "$1" "$(rss_kb)" >>"$RSS_LOG"; }
 # run is at most 1.5 times the peak of the first quarter plus 16 MiB.
 check_rss_growth() {
   (( $1 <= RSS_MAX_KB )) || die "final RSS $1 kB is over $RSS_MAX_KB kB"
-  local quarter=$((DURATION / 4)) first last
+  local quarter=$((10#$DURATION / 4)) first last
   first=$(awk -v q="$quarter" '$1 <= q && $2 > m { m = $2 } END { print m + 0 }' "$RSS_LOG")
-  last=$(awk -v q="$((DURATION - quarter))" '$1 >= q && $2 > m { m = $2 } END { print m + 0 }' "$RSS_LOG")
+  last=$(awk -v q="$((10#$DURATION - quarter))" '$1 >= q && $2 > m { m = $2 } END { print m + 0 }' "$RSS_LOG")
   (( last <= first * 3 / 2 + 16384 )) \
     || die "RSS grows: first-quarter peak $first kB, last-quarter peak $last kB"
 }
 
 check_slots() {
-  local style slot uri
+  local style slot uri light_uri dark_uri
   for style in light dark; do
     slot="$SLOTS/$style"
     [[ -s "$slot" ]] || die "slot $style is missing or empty"
     [[ "$(head -c 8 "$slot" | od -An -tx1 | tr -d ' \n')" == 89504e470d0a1a0a ]] \
       || die "slot $style is not a PNG"
   done
-  for uri in "picture-uri='file://$SLOTS/light'" "picture-uri-dark='file://$SLOTS/dark'"; do
+  light_uri="$(file_uri "$SLOTS/light")" || die "slot light path is not absolute"
+  dark_uri="$(file_uri "$SLOTS/dark")" || die "slot dark path is not absolute"
+  for uri in "picture-uri='$light_uri'" "picture-uri-dark='$dark_uri'"; do
     grep -qF -- "$uri" "$KEYFILE" || die "keyfile lacks $uri"
   done
+}
+
+# Same bytes as the daemon's file_uri (url::Url::from_file_path, which uses
+# Path::components). Empty and `.` segments are dropped; `..` stays. Each
+# kept segment is percent-encoded. Special-path bytes are controls, DEL,
+# non-ASCII, and space " # % < > ? \ ` { }.
+file_uri() {
+  FILE_URI_PATH="$1" LC_ALL=C awk '
+    BEGIN {
+      path = ENVIRON["FILE_URI_PATH"]
+      if (substr(path, 1, 1) != "/") exit 1
+      for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
+      uri = "file://"
+      n = split(path, parts, "/")
+      for (i = 2; i <= n; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        uri = uri "/" encode(parts[i])
+      }
+      if (uri == "file://") uri = "file:///"
+      print uri
+    }
+    function encode(seg,    i, c, b, out, hex) {
+      out = ""
+      hex = "0123456789ABCDEF"
+      for (i = 1; i <= length(seg); i++) {
+        c = substr(seg, i, 1)
+        b = ord[c]
+        if (b < 32 || b >= 127 || b == 32 || b == 34 || b == 35 || b == 37 ||
+            b == 60 || b == 62 || b == 63 || b == 92 || b == 96 || b == 123 ||
+            b == 125) {
+          out = out "%" substr(hex, int(b / 16) + 1, 1) substr(hex, (b % 16) + 1, 1)
+        } else out = out c
+      }
+      return out
+    }
+  '
 }
 
 check_no_temp_files() {

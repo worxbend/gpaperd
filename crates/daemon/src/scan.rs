@@ -34,10 +34,11 @@ pub struct Scan {
     /// Image files in discovery order. A file reached twice (overlapping
     /// sources, symlinks) appears twice; the catalog removes duplicates.
     pub files: Vec<LocalFile>,
-    /// Directories whose entries the scan listed, in discovery order: each
-    /// source directory and, with `recursive`, the directories below it down
-    /// to the depth limit. This is what a watch of the sources has to cover.
-    /// The paths are as the walk built them, not canonical. A directory that
+    /// Directories a watch of the sources has to cover, in discovery order:
+    /// each source directory and, with `recursive`, the directories below it
+    /// down to the depth limit. With `follow_symlinks`, the canonical parent
+    /// of a file symlink is here too, so a later write to the target is
+    /// scanned again. Walk paths are as the walk built them. A directory that
     /// could not be listed is here too, next to its warning.
     pub dirs: Vec<PathBuf>,
     /// Sources and entries that were skipped, for the log.
@@ -68,7 +69,8 @@ pub struct ScanWarning {
 ///   (compared without case). Hidden entries are skipped unless `hidden` is
 ///   set. In-progress names (`.part`, `.crdownload`, `.tmp`, a trailing `~`)
 ///   are skipped. Subdirectories are entered only with `recursive`, at most
-///   16 levels deep.
+///   16 levels deep. A followed symlink to a file is catalogued at its
+///   canonical path, and that parent is listed in [`Scan::dirs`].
 /// - An entry that cannot be read (permission denied, dangling symlink,
 ///   symlink loop) yields one warning and the scan goes on.
 ///
@@ -105,9 +107,39 @@ impl Scan {
     }
 
     fn add_file(&mut self, path: &Path) {
+        if let Some(file) = self.catalog_file(path) {
+            self.files.push(file);
+        }
+    }
+
+    /// Catalogues one directory entry. A followed file symlink also lists the
+    /// target's parent: the directory that holds the link does not see a
+    /// later write to the target.
+    fn add_image(&mut self, entry: &DirEntry, options: DirOptions) {
+        let Some(file) = self.catalog_file(entry.path()) else {
+            return;
+        };
+        if options.follow_symlinks && entry.path_is_symlink() {
+            if let Some(parent) = file.path.parent() {
+                self.list_dir(parent.to_owned());
+            }
+        }
+        self.files.push(file);
+    }
+
+    fn catalog_file(&mut self, path: &Path) -> Option<LocalFile> {
         match local_file(path) {
-            Ok(file) => self.files.push(file),
-            Err(err) => self.warn(path, err),
+            Ok(file) => Some(file),
+            Err(err) => {
+                self.warn(path, err);
+                None
+            }
+        }
+    }
+
+    fn list_dir(&mut self, dir: PathBuf) {
+        if !self.dirs.iter().any(|listed| listed == &dir) {
+            self.dirs.push(dir);
         }
     }
 
@@ -122,8 +154,8 @@ impl Scan {
             .filter_entry(|entry| options.hidden || !is_hidden(entry));
         for entry in entries {
             match entry {
-                Ok(entry) if is_image_file(&entry) => self.add_file(entry.path()),
-                Ok(entry) if is_listed_dir(&entry, max_depth) => self.dirs.push(entry.into_path()),
+                Ok(entry) if is_image_file(&entry) => self.add_image(&entry, options),
+                Ok(entry) if is_listed_dir(&entry, max_depth) => self.list_dir(entry.into_path()),
                 Ok(_) => {}
                 Err(err) => self.warn(err.path().unwrap_or(dir), walk_failure(&err)),
             }
@@ -452,6 +484,50 @@ mod tests {
     }
 
     #[test]
+    fn followed_file_symlink_lists_the_target_directory() {
+        let (_dir, root) = temp_root();
+        touch(&root.join("store/real.png"));
+        fs::create_dir(root.join("walls")).expect("create dir");
+        symlink(root.join("store/real.png"), root.join("walls/link.png")).expect("symlink");
+
+        let found = scan(&[dir_source(&root.join("walls"), DirOptions::default())]);
+
+        assert_eq!(relative_paths(&root, &found), ["store/real.png"]);
+        assert_eq!(found.dirs, [root.join("walls"), root.join("store")]);
+        assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+    }
+
+    #[test]
+    fn followed_file_symlink_into_a_listed_directory_does_not_duplicate_it() {
+        let (_dir, root) = temp_root();
+        touch(&root.join("walls/sub/real.png"));
+        symlink(root.join("walls/sub/real.png"), root.join("walls/link.png")).expect("symlink");
+
+        let found = scan(&[dir_source(&root.join("walls"), recursive())]);
+
+        assert_eq!(
+            relative_paths(&root, &found),
+            ["walls/sub/real.png", "walls/sub/real.png"]
+        );
+        assert_eq!(found.dirs, [root.join("walls"), root.join("walls/sub")]);
+    }
+
+    #[test]
+    fn followed_file_symlink_does_not_list_its_directory_twice() {
+        let (_dir, root) = temp_root();
+        touch(&root.join("walls/real.png"));
+        symlink(root.join("walls/real.png"), root.join("walls/link.png")).expect("symlink");
+
+        let found = scan(&[dir_source(&root.join("walls"), DirOptions::default())]);
+
+        assert_eq!(
+            relative_paths(&root, &found),
+            ["walls/real.png", "walls/real.png"]
+        );
+        assert_eq!(found.dirs, [root.join("walls")]);
+    }
+
+    #[test]
     fn symlinks_are_ignored_when_follow_symlinks_is_off() {
         let (_dir, root) = temp_root();
         touch(&root.join("store/real.png"));
@@ -468,6 +544,7 @@ mod tests {
         let found = scan(&[dir_source(&root.join("walls"), options)]);
 
         assert_eq!(relative_paths(&root, &found), ["walls/own.png"]);
+        assert_eq!(found.dirs, [root.join("walls")]);
         assert!(found.warnings.is_empty(), "{:?}", found.warnings);
     }
 

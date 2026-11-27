@@ -12,13 +12,14 @@ use std::future;
 use std::io;
 use std::panic;
 use std::path::{self, Path, PathBuf};
+use std::thread;
 use std::time::Duration;
 
 use gpaperd_core::config::{Config, ConfigError, ParseContext};
 use notify::event::AccessKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::sleep;
 
 /// How long the config file must be quiet before a change is loaded. One save
 /// by an editor is a burst of events.
@@ -116,6 +117,10 @@ pub struct ConfigWatch {
     /// A change was seen, and what loading gave after it was not returned
     /// yet. It outlives a cancelled [`ConfigWatch::reloaded`].
     change_seen: bool,
+    /// Thread that last walked the config path. The walk has to leave the
+    /// runtime thread; tests check this is not that thread.
+    #[cfg(test)]
+    walked_on: Option<thread::ThreadId>,
 }
 
 impl ConfigWatch {
@@ -143,6 +148,8 @@ impl ConfigWatch {
             events,
             watched_names: Vec::new(),
             change_seen: false,
+            #[cfg(test)]
+            walked_on: None,
         };
         watch.watch_names();
         watch
@@ -170,11 +177,40 @@ impl ConfigWatch {
         if !self.change_seen {
             self.next_change().await;
             self.change_seen = true;
+            // One event per poll, so shutdown and rotation are reached.
+            tokio::task::yield_now().await;
         }
-        // Every further change starts the quiet time again.
-        while timeout(RELOAD_DEBOUNCE, self.next_change()).await.is_ok() {}
+        // Every further change starts the quiet time again. Yielding returns
+        // this poll to the interpreter instead of draining a ready burst.
+        loop {
+            tokio::select! {
+                biased;
+                () = self.next_change() => {}
+                () = sleep(RELOAD_DEBOUNCE) => break,
+            }
+            tokio::task::yield_now().await;
+        }
         // Before the load: a change that comes after it must find the watch.
-        self.watch_names();
+        // The walk is the blocking work this function already moves off the
+        // runtime for the load.
+        let path = self.file.path.clone();
+        let (names, walked_on) = tokio::task::spawn_blocking(move || {
+            let walked_on = thread::current().id();
+            (names_to_watch(&path), walked_on)
+        })
+        .await
+        .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()));
+        #[cfg(test)]
+        {
+            self.walked_on = Some(walked_on);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = walked_on;
+        }
+        if let Some(names) = self.kept_names(names) {
+            self.apply_names(names);
+        }
         let file = self.file.clone();
         let loaded = tokio::task::spawn_blocking(move || file.load())
             .await
@@ -191,7 +227,9 @@ impl ConfigWatch {
         loop {
             match self.events.recv().await {
                 Some(Ok(event)) if self.is_change(&event) => return,
-                Some(Ok(_)) => {}
+                // An ignored event is still one queue item. Yield so a burst
+                // of them does not run ahead of the rest of the interpreter.
+                Some(Ok(_)) => tokio::task::yield_now().await,
                 Some(Err(error)) => {
                     tracing::warn!(reason = %error, "config watch failed: loading the file again");
                     return;
@@ -213,12 +251,40 @@ impl ConfigWatch {
     }
 
     /// Works out again which names to watch, and watches their directories.
-    /// Blocking I/O, a few calls on the config file's path.
+    /// Blocking I/O, a few calls on the config file's path. [`ConfigWatch::start`]
+    /// calls this on its own thread. [`ConfigWatch::reloaded`] walks on the
+    /// blocking pool and then applies the names here.
     fn watch_names(&mut self) {
+        if self.watcher.is_none() {
+            return;
+        }
+        if let Some(names) = self.kept_names(names_to_watch(&self.file.path)) {
+            self.apply_names(names);
+        }
+    }
+
+    /// `None` keeps the names already watched. An absolute-path failure must
+    /// not become an empty list: that unwatches everything and then waits.
+    fn kept_names(&self, names: io::Result<Vec<PathBuf>>) -> Option<Vec<PathBuf>> {
+        match names {
+            Ok(names) => Some(names),
+            Err(error) => {
+                let path = self.file.path.display();
+                tracing::error!(
+                    %path,
+                    reason = %error,
+                    "config file not watched: keeping the previous names"
+                );
+                None
+            }
+        }
+    }
+
+    /// Watches the directories of `names` and forgets the previous ones.
+    fn apply_names(&mut self, names: Vec<PathBuf>) {
         let Some(watcher) = &mut self.watcher else {
             return;
         };
-        let names = names_to_watch(&self.file.path);
         let dirs: BTreeSet<&Path> = names.iter().filter_map(|name| name.parent()).collect();
         if dirs.is_empty() {
             // An empty path, or the root directory.
@@ -250,10 +316,11 @@ impl ConfigWatch {
 ///
 /// A name is the real path of its directory joined with the name of the
 /// entry, so no directory is named twice. Blocking I/O.
-fn names_to_watch(file: &Path) -> Vec<PathBuf> {
+fn names_to_watch(file: &Path) -> io::Result<Vec<PathBuf>> {
     let mut names = Vec::new();
     let mut real_dir = PathBuf::new();
-    let mut ahead = steps_reversed(&path::absolute(file).unwrap_or_default());
+    let absolute = path::absolute(file)?;
+    let mut ahead = steps_reversed(&absolute);
     while names.len() < MAX_WATCHED_NAMES
         && let Some(step) = ahead.pop()
     {
@@ -277,7 +344,7 @@ fn names_to_watch(file: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    names
+    Ok(names)
 }
 
 /// The components of `path`, the last one first: `pop` gives the next step
@@ -293,6 +360,11 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    use notify::event::CreateKind;
+
     use super::*;
 
     /// A temp directory by its real path, so that no symlink leads to it.
@@ -306,21 +378,23 @@ mod tests {
     fn file_is_watched_by_its_own_name_whether_it_exists_or_not() {
         let (_dir, root) = real_temp_dir();
 
-        let names = names_to_watch(&root.join("config.toml"));
+        let names = names_to_watch(&root.join("config.toml")).expect("absolute path");
 
         assert_eq!(names, [root.join("config.toml")]);
     }
 
     #[test]
-    fn empty_path_has_no_name() {
-        assert_eq!(names_to_watch(Path::new("")), [] as [PathBuf; 0]);
+    fn empty_path_is_an_error() {
+        let error = names_to_watch(Path::new("")).expect_err("empty path");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn way_through_missing_directories_ends_at_the_first_missing_name() {
         let (_dir, root) = real_temp_dir();
 
-        let names = names_to_watch(&root.join("gpaperd/sub/config.toml"));
+        let names = names_to_watch(&root.join("gpaperd/sub/config.toml")).expect("absolute path");
 
         assert_eq!(names, [root.join("gpaperd")]);
     }
@@ -336,7 +410,7 @@ mod tests {
         )
         .expect("create symlink");
 
-        let names = names_to_watch(&root.join("config/config.toml"));
+        let names = names_to_watch(&root.join("config/config.toml")).expect("absolute path");
 
         assert_eq!(
             names,
@@ -353,7 +427,7 @@ mod tests {
         fs::create_dir(root.join("repo")).expect("create the repo");
         symlink(root.join("repo"), root.join("config")).expect("create symlink");
 
-        let names = names_to_watch(&root.join("config/config.toml"));
+        let names = names_to_watch(&root.join("config/config.toml")).expect("absolute path");
 
         assert_eq!(names, [root.join("config"), root.join("repo/config.toml")]);
     }
@@ -364,7 +438,7 @@ mod tests {
         fs::create_dir(root.join("repo")).expect("create the repo");
         symlink(root.join("repo"), root.join("link")).expect("create symlink");
 
-        let names = names_to_watch(&root.join("link/../config.toml"));
+        let names = names_to_watch(&root.join("link/../config.toml")).expect("absolute path");
 
         assert_eq!(names, [root.join("link"), root.join("config.toml")]);
     }
@@ -375,7 +449,7 @@ mod tests {
         symlink(root.join("there"), root.join("here")).expect("create symlink");
         symlink(root.join("here"), root.join("there")).expect("create symlink");
 
-        let names = names_to_watch(&root.join("here"));
+        let names = names_to_watch(&root.join("here")).expect("absolute path");
 
         assert_eq!(names.len(), MAX_WATCHED_NAMES);
         assert_eq!(names[..2], [root.join("here"), root.join("there")]);
@@ -386,11 +460,80 @@ mod tests {
         let working_dir = std::env::current_dir().expect("working directory");
         let real_working_dir = fs::canonicalize(working_dir).expect("real working directory");
 
-        let names = names_to_watch(Path::new("no-such-config.toml"));
+        let names = names_to_watch(Path::new("no-such-config.toml")).expect("absolute path");
 
         assert_eq!(
             names.last(),
             Some(&real_working_dir.join("no-such-config.toml"))
         );
+    }
+
+    fn config_at(root: &Path, path: PathBuf) -> ConfigFile {
+        ConfigFile {
+            path,
+            home_dir: root.to_owned(),
+            env: |_| None,
+        }
+    }
+
+    #[test]
+    fn absolute_failure_keeps_the_names_already_watched() {
+        let (_dir, root) = real_temp_dir();
+        let path = root.join("config.toml");
+        fs::write(&path, "[light]\ninterval = \"1m\"\n").expect("write config");
+        let mut watch = ConfigWatch::start(config_at(&root, path));
+        let watched = watch.watched_names.clone();
+
+        watch.file.path.clear();
+        watch.watch_names();
+
+        assert!(!watched.is_empty(), "the config directory was not watched");
+        assert_eq!(watch.watched_names, watched);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_walks_the_config_path_off_the_runtime() {
+        let (_dir, root) = real_temp_dir();
+        let path = root.join("config.toml");
+        fs::write(&path, "[light]\ninterval = \"1m\"\n").expect("write config");
+        let mut watch = ConfigWatch::start(config_at(&root, path));
+        watch.change_seen = true;
+        let runtime = thread::current().id();
+
+        let loaded = tokio::time::timeout(Duration::from_secs(5), watch.reloaded())
+            .await
+            .expect("reload finished")
+            .expect("load");
+
+        assert!(loaded.is_some());
+        assert_ne!(watch.walked_on.expect("the walk was recorded"), runtime);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_poll_does_not_drain_a_ready_burst() {
+        let (sender, events) = mpsc::unbounded_channel();
+        let path = PathBuf::from("/tmp/gpaperd-config.toml");
+        let mut watch = ConfigWatch {
+            file: config_at(Path::new("/tmp"), path.clone()),
+            watcher: None,
+            events,
+            watched_names: vec![path.clone()],
+            change_seen: false,
+            walked_on: None,
+        };
+        for _ in 0..1_000 {
+            let event = Event::new(EventKind::Create(CreateKind::Any)).add_path(path.clone());
+            sender.send(Ok(event)).expect("enqueue");
+        }
+
+        let polled = {
+            let mut waiting = std::pin::pin!(watch.reloaded());
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        };
+
+        assert!(polled.is_pending());
+        assert!(!watch.events.is_empty());
     }
 }

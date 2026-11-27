@@ -25,9 +25,14 @@ use crate::scan;
 /// amount when it is given a path.
 pub const HEADER_LEN: usize = 8192;
 
+/// [`BadReason::Undecodable`] text when the bwrap sandbox cannot start.
+/// Magic bytes are not a successful check.
+pub const SANDBOX_DID_NOT_START: &str = "glycin sandbox did not start";
+
 /// How long glycin may take over each of its two steps, the header and the
 /// first frame. A loader that hangs must not hold up a rotation. A 4K image
-/// decodes in well under a second.
+/// decodes in well under a second. The same limit bounds the stat and the
+/// header read the rotation waits on.
 const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A file that was modified less than this ago may still be written to.
@@ -190,7 +195,7 @@ impl Sandbox {
             Err(error) => {
                 tracing::warn!(
                     reason = %first_line(&error),
-                    "glycin cannot decode in its sandbox: images are checked by their magic bytes only"
+                    "glycin cannot decode in its sandbox: image checks fail"
                 );
                 false
             }
@@ -239,21 +244,24 @@ impl Prober {
     /// caller's thread. The runtime must have its I/O driver and its timers
     /// enabled (`enable_io`, `enable_time`). Without them glycin's tasks
     /// panic on glycin's thread, and that ends like a sandbox that cannot
-    /// start.
+    /// start. A stat or header read that outlasts the decode limit comes
+    /// back as [`BadReason::Truncated`].
     ///
     /// Checks, in this order:
     /// 1. Everything [`probe`] checks, with the same reasons.
     /// 2. glycin reads the image header: `width * height` must be at most
     ///    `max_pixels`, else [`BadReason::TooLarge`].
     /// 3. glycin decodes the first frame, else [`BadReason::Undecodable`]
-    ///    with the first line of glycin's error text: corrupt content, no
-    ///    loader for the format, or a loader that took too long. The header
+    ///    with the first line of glycin's error text: corrupt content or no
+    ///    loader for the format. A loader that took too long is
+    ///    [`BadReason::Truncated`], and that is not remembered. The header
     ///    alone does not show a cut-off file: glycin 4.0.5 loads a PNG, a
     ///    WebP and a JPEG XL that are cut short, and fails only on the frame.
     ///
     /// A failed decode of a file that is still being written is
     /// [`BadReason::Truncated`] instead: its stamp changed while the check
-    /// ran, or it was modified moments ago. That verdict is not remembered.
+    /// ran, it was modified moments ago, or its mtime is ahead of the clock.
+    /// That verdict is not remembered.
     ///
     /// The remembered answer is what glycin said, not the verdict, so a
     /// later call with another `max_pixels` needs no second decode. An image
@@ -261,8 +269,9 @@ impl Prober {
     ///
     /// The sandbox is tried once, with an image that is known to be good.
     /// When it cannot start (no `bwrap`, or a container that blocks it),
-    /// nothing can be decoded. That is logged once, as a warning, and from
-    /// then on a check ends after step 1.
+    /// nothing can be decoded. That is logged once, as a warning, and the
+    /// check is [`BadReason::Undecodable`] with [`SANDBOX_DID_NOT_START`].
+    /// Magic bytes are not a pass.
     #[expect(
         clippy::manual_async_fn,
         reason = "an `async fn` cannot promise the `Send` future that the interpreter spawns"
@@ -275,7 +284,7 @@ impl Prober {
         async move {
             let stamp = off_thread(path, examine).await?;
             let Some(sandbox) = self.sandbox().await else {
-                return Ok(());
+                return Err(BadReason::Undecodable(SANDBOX_DID_NOT_START.to_owned()));
             };
             match self.remembered(&stamp) {
                 Some(decoded) => decoded.map_err(BadReason::Undecodable)?.within(max_pixels),
@@ -327,14 +336,13 @@ impl Prober {
             Ok(after) => after,
             Err(gone) => return gone,
         };
-        if is_unfinished(&before, &after, SystemTime::now()) {
+        // A timeout says nothing about the content. `Truncated` is retried.
+        // `Undecodable` would stick until the stamp changes.
+        if is_unfinished(&before, &after, SystemTime::now()) || error.is_timeout() {
             return BadReason::Truncated;
         }
         let text = first_line(&error);
-        // A timeout says nothing about the content: a stalled mount recovers.
-        if !error.is_timeout() {
-            self.remember(before, Err(text.clone()));
-        }
+        self.remember(before, Err(text.clone()));
         BadReason::Undecodable(text)
     }
 
@@ -369,22 +377,45 @@ fn first_line(error: &glycin::Error) -> String {
 /// changed while the check ran, or it was modified less than [`SETTLE_TIME`]
 /// before `now`. Or after `now`: the clock of a file server may run ahead.
 fn is_unfinished(before: &FileStamp, after: &FileStamp, now: SystemTime) -> bool {
-    let since_modified = now
-        .duration_since(after.mtime)
-        .unwrap_or_else(|ahead| ahead.duration());
-    after != before || since_modified < SETTLE_TIME
+    if after != before {
+        return true;
+    }
+    match now.duration_since(after.mtime) {
+        Ok(age) => age < SETTLE_TIME,
+        // The error's duration is how far ahead the file clock is, not an age.
+        // A skew of `SETTLE_TIME` or more is still a file that may be written.
+        Err(_ahead) => true,
+    }
 }
 
 /// Runs `inspect`, which blocks on the file system, off the caller's thread.
+/// Gives up after [`DECODE_TIMEOUT`], the same limit as a glycin step.
 async fn off_thread(
     path: &Path,
     inspect: fn(&Path) -> Result<FileStamp, BadReason>,
 ) -> Result<FileStamp, BadReason> {
+    inspect_within(path, inspect, DECODE_TIMEOUT).await
+}
+
+/// `limit` is [`DECODE_TIMEOUT`] on the check path. A stuck read is
+/// [`BadReason::Truncated`]: the core probes that again, and the stat is
+/// not [`BadReason::Undecodable`].
+///
+/// Dropping the join does not cancel the read. The pool thread stays in
+/// the syscall. The rotation must not wait with it.
+async fn inspect_within(
+    path: &Path,
+    inspect: fn(&Path) -> Result<FileStamp, BadReason>,
+    limit: Duration,
+) -> Result<FileStamp, BadReason> {
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || inspect(&path))
-        .await
-        // Only a panic ends that task early. A panic is a defect: pass it on.
-        .unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()))
+    let read = tokio::task::spawn_blocking(move || inspect(&path));
+    let joined = match tokio::time::timeout(limit, read).await {
+        Ok(joined) => joined,
+        Err(_elapsed) => return Err(BadReason::Truncated),
+    };
+    // Only a panic ends that task early. A panic is a defect: pass it on.
+    joined.unwrap_or_else(|failure| panic::resume_unwind(failure.into_panic()))
 }
 
 /// Step 1 of [`Prober::check`]. Returns the stamp that the file had before
@@ -426,6 +457,7 @@ fn is_qoi(header: &[u8]) -> bool {
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use gpaperd_core::catalog::FileId;
     use tempfile::TempDir;
@@ -649,6 +681,22 @@ mod tests {
     }
 
     #[test]
+    fn file_modified_the_settle_time_ahead_of_the_clock_is_unfinished() {
+        let now = SystemTime::now();
+        let stamp = stamp_modified_at(now + SETTLE_TIME);
+
+        assert!(is_unfinished(&stamp, &stamp, now));
+    }
+
+    #[test]
+    fn file_modified_an_hour_ahead_of_the_clock_is_unfinished() {
+        let now = SystemTime::now();
+        let stamp = stamp_modified_at(now + AN_HOUR);
+
+        assert!(is_unfinished(&stamp, &stamp, now));
+    }
+
+    #[test]
     fn file_whose_stamp_changed_during_the_check_is_unfinished() {
         let now = SystemTime::now();
         let before = stamp_modified_at(now - AN_HOUR);
@@ -716,6 +764,89 @@ mod tests {
             .await;
 
         assert_eq!(reason, BadReason::Missing);
+    }
+
+    #[tokio::test]
+    async fn failed_decode_of_a_file_an_hour_ahead_is_truncated_and_not_remembered() {
+        let dir = TempDir::new().expect("temp dir");
+        let png = file_with(&dir, "wall.png", PNG_HEADER);
+        let file = File::options().write(true).open(&png).expect("open fixture");
+        file.set_modified(SystemTime::now() + AN_HOUR)
+            .expect("set mtime");
+        let stamp = current_stamp(&png).expect("stat fixture");
+        assert!(stamp.mtime > SystemTime::now(), "mtime stayed in the future");
+        let prober = Prober::new();
+
+        let reason = prober
+            .refused(&png, stamp, glycin::Error::other("no pixels"))
+            .await;
+
+        assert_eq!(reason, BadReason::Truncated);
+        assert_eq!(prober.remembered(&stamp), None);
+    }
+
+    #[tokio::test]
+    async fn timed_out_decode_is_truncated_and_not_remembered() {
+        let dir = TempDir::new().expect("temp dir");
+        let png = aged(file_with(&dir, "wall.png", PNG_HEADER));
+        let stamp = current_stamp(&png).expect("stat fixture");
+        let error = glycin_timeout().await;
+        let prober = Prober::new();
+
+        let reason = prober.refused(&png, stamp, error).await;
+
+        assert_eq!(reason, BadReason::Truncated);
+        assert_eq!(prober.remembered(&stamp), None);
+    }
+
+    /// glycin's timeout kind is not constructable outside that crate. A limit
+    /// of zero is how this test reaches [`glycin::Error::is_timeout`]. It is
+    /// not a daemon deadline: the decode limit stays [`DECODE_TIMEOUT`].
+    async fn glycin_timeout() -> glycin::Error {
+        let sandbox = Sandbox::start();
+        let mut loader = sandbox.loader(Loader::new_vec(KNOWN_GOOD_PNG.to_vec()));
+        loader.limits(Limits::default().timeout(Duration::ZERO));
+        match tokio::time::timeout(DECODE_TIMEOUT, loader.load()).await {
+            Ok(Err(error)) if error.is_timeout() => error,
+            Ok(other) => panic!("zero glycin limit did not time out: {other:?}"),
+            Err(_elapsed) => panic!("zero glycin limit waited out the decode timeout"),
+        }
+    }
+
+    static RELEASE_STUCK_READ: AtomicBool = AtomicBool::new(false);
+
+    struct ReleaseStuckRead;
+
+    impl ReleaseStuckRead {
+        fn arm() -> ReleaseStuckRead {
+            RELEASE_STUCK_READ.store(false, Ordering::Relaxed);
+            ReleaseStuckRead
+        }
+    }
+
+    impl Drop for ReleaseStuckRead {
+        fn drop(&mut self) {
+            RELEASE_STUCK_READ.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn block_until_released(_path: &Path) -> Result<FileStamp, BadReason> {
+        while !RELEASE_STUCK_READ.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err(BadReason::Missing)
+    }
+
+    #[tokio::test]
+    async fn stuck_stat_is_truncated_not_undecodable() {
+        let _release = ReleaseStuckRead::arm();
+        // `off_thread` passes [`DECODE_TIMEOUT`]. Zero is the same race, and
+        // it does not wait that limit out. The outer bound is that limit, so
+        // a stuck read that ignores it fails instead of hanging the suite.
+        let read = inspect_within(Path::new("unused"), block_until_released, Duration::ZERO);
+        let verdict = tokio::time::timeout(DECODE_TIMEOUT, read).await;
+
+        assert_eq!(verdict, Ok(Err(BadReason::Truncated)));
     }
 
     #[test]

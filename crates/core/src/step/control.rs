@@ -5,13 +5,20 @@ use std::mem;
 
 use super::{Turn, keys};
 use crate::catalog::ItemId;
-use crate::config::{Config, ConfigError};
+use crate::config::{ApplyMode, Config, ConfigError};
 use crate::control::{Command, Direction, Reply, ReplyId, Request, RequestStage, StyleTarget};
 use crate::event::{Effect, Event, Pause};
 use crate::style::Style;
 
 const STARTING: &str = "gpaperd is still starting";
 const STOPPING: &str = "gpaperd is stopping";
+const SUPERSEDED: &str = "a newer reload replaced this one";
+const CACHE_NOT_LOADED: &str = "the remote cache is not loaded yet";
+
+/// Styles a both-style command already moved. Not a caller: daemon ids and
+/// the property generator stay below this, and a reply here would be one
+/// nobody asked for.
+const PARTIAL_MOVE: ReplyId = ReplyId(u64::MAX);
 
 impl Turn<'_> {
     /// [`Event::Control`] before `Started`: nothing runs yet, but the caller
@@ -39,8 +46,12 @@ impl Turn<'_> {
                 self.effects.push(Effect::ReadConfig(id));
             }
             Command::RefreshRemote => {
-                self.model.remote.refresh_all();
-                self.reply(id, Reply::Done);
+                if self.model.remote.is_loaded() {
+                    self.model.remote.refresh_all();
+                    self.reply(id, Reply::Done);
+                } else {
+                    self.reply(id, Reply::Failed(CACHE_NOT_LOADED.to_owned()));
+                }
             }
             Command::Restore => self.restore(id),
             Command::Status => {
@@ -57,15 +68,28 @@ impl Turn<'_> {
         let Some(index) = self.model.reloads.iter().position(|&asked| asked == id) else {
             return;
         };
+        let is_newest = index + 1 == self.model.reloads.len();
         self.model.reloads.remove(index);
-        let outcome = match result {
+        if !is_newest {
+            self.reply(id, Reply::Reloaded(Err(SUPERSEDED.to_owned())));
+            return;
+        }
+        match result {
             Ok(config) => {
                 self.reload(config);
-                Ok(())
+                self.reply(id, Reply::Reloaded(Ok(())));
             }
-            Err(error) => Err(error.to_string()),
-        };
-        self.reply(id, Reply::Reloaded(outcome));
+            Err(error) => self.reply(id, Reply::Reloaded(Err(error.to_string()))),
+        }
+    }
+
+    /// A newer config, from the watcher or from the newest read, replaces
+    /// every `Reload` that is still waiting on its file.
+    pub(super) fn fail_listed_reloads(&mut self) {
+        let listed = mem::take(&mut self.model.reloads);
+        for id in listed {
+            self.reply(id, Reply::Reloaded(Err(SUPERSEDED.to_owned())));
+        }
     }
 
     /// [`Event::KeysRestored`]: answers the `Restore` that waits for it. An
@@ -87,7 +111,10 @@ impl Turn<'_> {
         let waiting = mem::take(&mut self.model.requests);
         let reloads = mem::take(&mut self.model.reloads);
         let restores = mem::take(&mut self.model.restores);
-        let ids = waiting.iter().map(|request| request.id);
+        let ids = waiting
+            .iter()
+            .filter(|request| request.id != PARTIAL_MOVE)
+            .map(|request| request.id);
         for id in ids.chain(reloads).chain(restores) {
             self.reply(id, Reply::Failed(STOPPING.to_owned()));
         }
@@ -97,6 +124,10 @@ impl Turn<'_> {
     /// is free, and answers every request that is finished.
     pub(super) fn serve_requests(&mut self) {
         let mut requests = mem::take(&mut self.model.requests);
+        let marker = requests
+            .iter()
+            .position(|request| request.id == PARTIAL_MOVE)
+            .map(|index| requests.remove(index));
         for part in requests.iter_mut().flat_map(|request| &mut request.styles) {
             if let RequestStage::Running { before } = &part.stage {
                 part.stage = self.follow_rotation(part.style, before.clone());
@@ -105,10 +136,27 @@ impl Turn<'_> {
         for index in 0..requests.len() {
             self.start_free_styles(&mut requests, index);
         }
+        let mut keep_marker = true;
         for request in requests {
             match request.reply() {
-                Some(reply) => self.reply(request.id, reply),
+                Some(reply) => {
+                    if request.styles.len() >= 2 {
+                        keep_marker = false;
+                    }
+                    self.note_partial_move(&request);
+                    self.reply(request.id, reply);
+                }
                 None => self.model.requests.push(request),
+            }
+        }
+        let replaced = self
+            .model
+            .requests
+            .iter()
+            .any(|request| request.id == PARTIAL_MOVE);
+        if keep_marker && !replaced {
+            if let Some(marker) = marker {
+                self.model.requests.push(marker);
             }
         }
     }
@@ -131,12 +179,15 @@ impl Turn<'_> {
     /// style showed when it started.
     fn follow_rotation(&self, style: Style, before: Option<ItemId>) -> RequestStage {
         let state = &self.model.styles[style];
-        if state.current != before {
-            RequestStage::Finished(Ok(()))
-        } else if !state.is_busy() {
-            RequestStage::Finished(Err(format!("no other {style} image could be shown")))
-        } else {
+        // `At` still owes the write: `owed_uri` is false until the retry is due.
+        let owes_uri = self.model.config().general.apply_mode == ApplyMode::Uri
+            && (self.model.owed_uri(style).is_some() || state.key.reassert.is_some());
+        if state.is_busy() || owes_uri {
             RequestStage::Running { before }
+        } else if state.current != before {
+            RequestStage::Finished(Ok(()))
+        } else {
+            RequestStage::Finished(Err(format!("no other {style} image could be shown")))
         }
     }
 
@@ -213,9 +264,74 @@ impl Turn<'_> {
 
     fn queue_request(&mut self, id: ReplyId, direction: Direction, target: StyleTarget) {
         let styles = target.styles(self.model.visible);
+        if styles.len() < 2 {
+            self.drop_partial_marker();
+            self.model
+                .requests
+                .push(Request::new(id, direction, styles));
+            return;
+        }
+        let mut request = Request::new(id, direction, styles);
+        self.carry_partial_move(&mut request, direction);
+        self.model.requests.push(request);
+    }
+
+    /// A both-style retry does not pick again for a style this command
+    /// already moved. A different direction drops that record.
+    fn carry_partial_move(&mut self, request: &mut Request, direction: Direction) {
+        let Some(index) = self
+            .model
+            .requests
+            .iter()
+            .position(|queued| queued.id == PARTIAL_MOVE)
+        else {
+            return;
+        };
+        let marker = self.model.requests.remove(index);
+        if marker.direction != direction {
+            return;
+        }
+        for part in &mut request.styles {
+            let already_moved = marker.styles.iter().any(|kept| {
+                kept.style == part.style && matches!(kept.stage, RequestStage::Finished(Ok(())))
+            });
+            if already_moved {
+                part.stage = RequestStage::Finished(Ok(()));
+            }
+        }
+    }
+
+    pub(super) fn drop_partial_marker(&mut self) {
         self.model
             .requests
-            .push(Request::new(id, direction, styles));
+            .retain(|request| request.id != PARTIAL_MOVE);
+    }
+
+    /// Remembers styles a mixed both-style command already moved, so the
+    /// next command of the same direction does not move them again.
+    fn note_partial_move(&mut self, request: &Request) {
+        if request.styles.len() < 2 {
+            return;
+        }
+        let moved: Vec<Style> = request
+            .styles
+            .iter()
+            .filter(|part| matches!(part.stage, RequestStage::Finished(Ok(()))))
+            .map(|part| part.style)
+            .collect();
+        let failed = request
+            .styles
+            .iter()
+            .any(|part| matches!(part.stage, RequestStage::Finished(Err(_))));
+        self.drop_partial_marker();
+        if moved.is_empty() || !failed {
+            return;
+        }
+        let mut marker = Request::new(PARTIAL_MOVE, request.direction, moved);
+        for part in &mut marker.styles {
+            part.stage = RequestStage::Finished(Ok(()));
+        }
+        self.model.requests.push(marker);
     }
 
     /// The user pause holds until `Resume`. The style's clock runs on.

@@ -29,8 +29,9 @@ TimeoutStartSec=30
 # On SIGTERM gpaperd sends STOPPING=1, saves its state and exits 0.
 TimeoutStopSec=5
 Slice=background.slice
+# The state save must finish inside TimeoutStopSec. Idle I/O can stall
+# that fsync until the stop timeout kills the process.
 Nice=10
-IOSchedulingClass=idle
 NoNewPrivileges=yes
 # Optional, test first: in user units these imply PrivateUsers=yes and
 # need unprivileged user namespaces.

@@ -13,8 +13,8 @@ use gpaperd_core::event::{Pause, Status};
 use gpaperd_core::style::{PerStyle, Style};
 use gpaperd_ctl::Gpaperd1Proxy;
 use gpaperd_daemon::dbus::{
-    BusNews, Control, ControlRequest, OwnError, control_ref, emit_changed, own_name_on, serve_news,
-    update_properties,
+    BusNews, Control, ControlPort, ControlRequest, OwnError, REPLY_TIMEOUT, RequestInbox,
+    control_ref, emit_changed, own_name_on, serve_news, update_properties,
 };
 use tokio::sync::mpsc;
 use zbus::{Connection, DBusError, connection};
@@ -74,7 +74,8 @@ async fn serve(
     timeout: Duration,
     answer: impl Fn(Command) -> Option<Reply> + Send + 'static,
 ) -> (Connection, Seen) {
-    let (requests, mut incoming) = mpsc::unbounded_channel::<ControlRequest>();
+    let (requests, incoming) = mpsc::unbounded_channel::<ControlRequest>();
+    let mut incoming = RequestInbox::new(incoming);
     let connection = own_name_on(bus.builder(), Control::with_timeout(requests, timeout))
         .await
         .expect("owns the name");
@@ -245,6 +246,51 @@ async fn a_handler_that_never_replies_times_out_with_failed() {
 }
 
 #[tokio::test]
+async fn a_caller_who_is_still_waiting_is_delivered() {
+    let (sender, incoming) = mpsc::unbounded_channel();
+    let (news, _news) = mpsc::unbounded_channel();
+    let mut port = ControlPort {
+        requests: RequestInbox::new(incoming),
+        news,
+    };
+    let control = Control::with_timeout(sender, REPLY_TIMEOUT);
+    let asking = tokio::spawn(async move { control.ask(Command::Status).await });
+
+    let request = port.requests.recv().await.expect("the command is delivered");
+    assert_eq!(request.command, Command::Status);
+    request
+        .reply
+        .send(Reply::Status(report()))
+        .expect("the caller is still waiting");
+
+    let reply = asking.await.unwrap().unwrap();
+    assert!(matches!(reply, Reply::Status(_)));
+}
+
+#[tokio::test]
+async fn a_timed_out_command_is_not_delivered() {
+    let (sender, incoming) = mpsc::unbounded_channel();
+    let (news, _news) = mpsc::unbounded_channel();
+    let mut port = ControlPort {
+        requests: RequestInbox::new(incoming),
+        news,
+    };
+    let control = Control::with_timeout(sender, Duration::from_millis(50));
+
+    let error = control
+        .ask(Command::Next(StyleTarget::Visible))
+        .await
+        .unwrap_err();
+
+    drop(control);
+    assert!(error.to_string().contains("did not reply"), "{error}");
+    assert!(
+        port.requests.recv().await.is_none(),
+        "timed-out command was delivered"
+    );
+}
+
+#[tokio::test]
 async fn a_dropped_reply_is_a_failed_error() {
     let bus = PrivateBus::start();
     let (requests, mut incoming) = mpsc::unbounded_channel::<ControlRequest>();
@@ -348,9 +394,12 @@ async fn updating_properties_does_not_wait_for_a_method_call_in_flight() {
     let client = bus.client().await;
     let control = control_ref(&server).await.expect("control is served");
     let pending = tokio::spawn(async move { client.status().await });
-    while seen.lock().unwrap().is_empty() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    within(async {
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 
     within(update_properties(&control, &status("/pics/a.jpg", false)))
         .await

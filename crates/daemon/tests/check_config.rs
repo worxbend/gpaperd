@@ -7,10 +7,11 @@
 //! user's own session.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,8 @@ const LOOK_PERIOD: Duration = Duration::from_millis(20);
 const EXIT_NO_INPUT: i32 = 66;
 /// `EX_CONFIG`.
 const EXIT_CONFIG: i32 = 78;
+/// Any failure that is not a missing or invalid config file.
+const EXIT_FAILURE: i32 = 1;
 
 const TINY_PNG: &[u8] = include_bytes!("fixtures/tiny.png");
 
@@ -93,14 +96,16 @@ impl Sandbox {
         ]
     }
 
-    /// Every path below the guarded directories.
-    fn snapshot(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
+    /// Every path below the guarded directories, with file bytes.
+    ///
+    /// Bytes are part of the record so an in-place rewrite compares unequal.
+    fn snapshot(&self) -> Vec<GuardedEntry> {
+        let mut entries = Vec::new();
         for dir in self.guarded() {
-            list(dir, &mut paths);
+            list(dir, &mut entries);
         }
-        paths.sort();
-        paths
+        entries.sort();
+        entries
     }
 
     /// Runs `gpaperd check-config` with `args` after it.
@@ -124,7 +129,13 @@ impl Sandbox {
             )
             .env("PICTURES", self.pictures.path())
             .current_dir(self.pictures.path());
-        run_bounded(command)
+        match run_bounded(command, RUN_LIMIT) {
+            Ok(output) => output,
+            Err(timed_out) => panic!(
+                "gpaperd check-config ran for more than {RUN_LIMIT:?}; child returned {}",
+                timed_out.status
+            ),
+        }
     }
 
     /// Fails when anything connected to the bus socket.
@@ -141,33 +152,107 @@ fn temp_dir() -> TempDir {
     tempfile::tempdir().expect("create a temp dir")
 }
 
-fn list(dir: &Path, paths: &mut Vec<PathBuf>) {
+/// One guarded path. `bytes` is `None` for a directory and the file contents
+/// otherwise, so a rewrite of the same path does not compare equal.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GuardedEntry {
+    path: PathBuf,
+    bytes: Option<Vec<u8>>,
+}
+
+fn list(dir: &Path, entries: &mut Vec<GuardedEntry>) {
     for entry in fs::read_dir(dir).expect("list a guarded dir") {
         let path = entry.expect("read an entry").path();
         if path.is_dir() {
-            list(&path, paths);
+            list(&path, entries);
+            entries.push(GuardedEntry { path, bytes: None });
+        } else {
+            let bytes = fs::read(&path).expect("read a guarded file");
+            entries.push(GuardedEntry {
+                path,
+                bytes: Some(bytes),
+            });
         }
-        paths.push(path);
     }
 }
 
-/// Runs `command` to its end, or kills it after [`RUN_LIMIT`] and fails.
-fn run_bounded(mut command: Command) -> Output {
+/// The child was killed once `limit` passed, and then reaped.
+#[derive(Debug)]
+struct TimedOut {
+    status: ExitStatus,
+    pid: u32,
+}
+
+/// Runs `command` until it exits or `limit` passes.
+///
+/// Stdout and stderr are drained while it runs, so a full pipe cannot stall
+/// it into the limit. Past the limit the child is killed and reaped. A
+/// check-config run passes [`RUN_LIMIT`]. A test passes a shorter limit to
+/// enter that branch without waiting out a hang.
+fn run_bounded(mut command: Command, limit: Duration) -> Result<Output, TimedOut> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("start gpaperd");
+    let stdout_reader = drain(child.stdout.take().expect("piped stdout"));
+    let stderr_reader = drain(child.stderr.take().expect("piped stderr"));
     let started = Instant::now();
-    while child.try_wait().expect("look at gpaperd").is_none() {
-        if started.elapsed() > RUN_LIMIT {
-            let _ = child.kill();
-            panic!("gpaperd check-config ran for more than {RUN_LIMIT:?}");
+    loop {
+        if let Some(status) = child.try_wait().expect("look at gpaperd") {
+            return Ok(Output {
+                status,
+                stdout: finish_drain(stdout_reader),
+                stderr: finish_drain(stderr_reader),
+            });
+        }
+        if started.elapsed() > limit {
+            let status = kill_and_reap(&mut child);
+            let pid = child.id();
+            finish_drain(stdout_reader);
+            finish_drain(stderr_reader);
+            return Err(TimedOut { status, pid });
         }
         thread::sleep(LOOK_PERIOD);
     }
-    child.wait_with_output().expect("collect the output")
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).expect("read gpaperd output");
+        bytes
+    })
+}
+
+fn finish_drain(reader: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    reader
+        .join()
+        .unwrap_or_else(|_| panic!("gpaperd output reader panicked"))
+}
+
+/// Kills `child` and reaps it. A child that has already returned is reaped
+/// too. Fails the test when that return is still unreaped.
+fn kill_and_reap(child: &mut Child) -> ExitStatus {
+    match child.kill() {
+        Ok(()) => child.wait().unwrap_or_else(|error| {
+            panic!(
+                "gpaperd check-config ran for more than {RUN_LIMIT:?} and the child was not reaped: {error}"
+            )
+        }),
+        Err(error) => match child.try_wait() {
+            Ok(Some(status)) => panic!(
+                "gpaperd check-config ran for more than {RUN_LIMIT:?}; kill failed ({error}) and the unreaped child returned {status}"
+            ),
+            Ok(None) => panic!(
+                "gpaperd check-config ran for more than {RUN_LIMIT:?}; kill failed ({error}) and the child is still unreaped"
+            ),
+            Err(wait_error) => panic!(
+                "gpaperd check-config ran for more than {RUN_LIMIT:?}; kill failed ({error}) and the child was not reaped ({wait_error})"
+            ),
+        },
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -197,6 +282,38 @@ fn cache_remote_image(cache_home: &Path, url: &Url) {
             .await
             .expect("publish the blob");
     });
+}
+
+/// How an unlistable cache path is undone.
+enum CacheLock {
+    /// Mode `000`. Drop restores `755`.
+    Mode(PathBuf),
+    /// The path is a file. Nothing to restore.
+    File,
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        if let CacheLock::Mode(dir) = self {
+            // Best effort: Drop cannot report this, and a leftover mode blocks temp-dir cleanup.
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+/// Makes `dir` unlistable. `dir` must already exist.
+///
+/// Root can still list mode `000`, so the path then becomes a file. `read_dir`
+/// rejects that for every user.
+fn lock_cache(dir: &Path) -> CacheLock {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).expect("lock the cache");
+    if fs::read_dir(dir).is_err() {
+        return CacheLock::Mode(dir.to_path_buf());
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).expect("unlock the cache");
+    fs::remove_dir(dir).expect("remove the cache dir");
+    fs::write(dir, b"not a directory").expect("replace the cache with a file");
+    CacheLock::File
 }
 
 #[test]
@@ -329,4 +446,158 @@ fn missing_config_file_exits_66_and_names_it() {
     );
     assert!(sandbox.snapshot().is_empty(), "{:?}", sandbox.snapshot());
     sandbox.assert_bus_untouched();
+}
+
+#[test]
+fn snapshot_fails_when_a_guarded_file_is_rewritten() {
+    let sandbox = Sandbox::new();
+    sandbox.write_default_config("before\n");
+    let before = sandbox.snapshot();
+
+    fs::write(sandbox.default_config(), "after\n").expect("rewrite the config");
+
+    assert_ne!(
+        sandbox.snapshot(),
+        before,
+        "an in-place rewrite still compared equal"
+    );
+}
+
+/// `dd` block size. The filler count is a whole number of these.
+const PIPE_BLOCK: usize = 1024;
+
+/// More bytes than a pipe on this machine can hold. A child that writes this
+/// much blocks in `write` until the parent reads, so a drain that starts
+/// only after exit never sees the child finish.
+fn bytes_past_a_pipe() -> usize {
+    let max = fs::read_to_string("/proc/sys/fs/pipe-max-size")
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .unwrap_or(64 * PIPE_BLOCK);
+    (max / PIPE_BLOCK + 2) * PIPE_BLOCK
+}
+
+#[test]
+fn a_full_pipe_is_read_while_the_child_runs() {
+    let bytes = bytes_past_a_pipe();
+    let blocks = bytes / PIPE_BLOCK;
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(format!(
+        "/bin/dd if=/dev/zero bs={PIPE_BLOCK} count={blocks} 2>/dev/null; \
+         /bin/dd if=/dev/zero bs={PIPE_BLOCK} count={blocks} >&2 2>/dev/null"
+    ));
+
+    let output = run_bounded(command, RUN_LIMIT).expect("a full pipe stalled until the limit");
+
+    assert_eq!(output.status.code(), Some(0), "{:?}", output.status);
+    assert_eq!(
+        output.stdout.len(),
+        bytes,
+        "stdout was read only after exit"
+    );
+    assert_eq!(
+        output.stderr.len(),
+        bytes,
+        "stderr was read only after exit"
+    );
+}
+
+#[test]
+fn a_child_past_the_limit_is_reaped() {
+    let mut command = Command::new("/bin/sleep");
+    command.arg(RUN_LIMIT.as_secs().to_string());
+
+    // One look crosses the same branch `check_config` uses with `RUN_LIMIT`.
+    let timed_out =
+        run_bounded(command, LOOK_PERIOD).expect_err("sleep returned before the limit");
+
+    assert_eq!(
+        timed_out.status.code(),
+        None,
+        "child exited instead of being killed"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{}", timed_out.pid)).exists(),
+        "pid {} is still unreaped",
+        timed_out.pid
+    );
+}
+
+#[test]
+fn a_file_and_a_symlink_to_it_count_once() {
+    let sandbox = Sandbox::new();
+    let image = sandbox.picture("walls/a.png");
+    symlink(
+        &image,
+        image.parent().expect("a parent").join("link.png"),
+    )
+    .expect("symlink");
+    sandbox.write_default_config(
+        r#"
+[light]
+sources = [
+  { dir = "$PICTURES/walls", follow_symlinks = true },
+]
+"#,
+    );
+
+    let output = sandbox.check_config(&[]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report = stdout(&output);
+    let walls = sandbox.pictures.path().join("walls");
+    assert!(
+        report.contains(&format!("{}: 1 image\n", walls.display())),
+        "{report}"
+    );
+}
+
+#[test]
+fn missing_remote_cache_is_not_cached() {
+    let sandbox = Sandbox::new();
+    sandbox.write_default_config("[light]\nsources = [\"https://img.test/walls/dawn.png\"]\n");
+
+    let output = sandbox.check_config(&[]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.contains("https://img.test/walls/dawn.png: remote, not cached\n"),
+        "{report}"
+    );
+}
+
+#[test]
+fn unreadable_remote_cache_is_a_failure() {
+    let sandbox = Sandbox::new();
+    sandbox.write_default_config("[light]\nsources = [\"https://img.test/walls/dawn.png\"]\n");
+    let cache_dir = sandbox.cache.path().join("gpaperd/remote");
+    fs::create_dir_all(&cache_dir).expect("create the cache dir");
+    let before_lock = sandbox.snapshot();
+    let lock = lock_cache(&cache_dir);
+    let before = match &lock {
+        CacheLock::Mode(_) => before_lock,
+        CacheLock::File => sandbox.snapshot(),
+    };
+
+    let output = sandbox.check_config(&[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_FAILURE),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("remote cache"),
+        "{}",
+        stderr(&output)
+    );
+    drop(lock);
+    assert_eq!(
+        sandbox.snapshot(),
+        before,
+        "check-config changed a guarded dir"
+    );
 }

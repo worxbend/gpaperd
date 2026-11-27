@@ -10,7 +10,16 @@ impl Turn<'_> {
     /// Makes `new` the running config and applies what it changes. The
     /// rotations that an interval makes due start when the step settles.
     pub(super) fn reload(&mut self, new: Config) {
+        self.drop_partial_marker();
+        self.fail_listed_reloads();
         let old = self.model.replace_config(new);
+        // Before `apply_mode` clears the wallpapers and refills: an empty
+        // style must not borrow the other catalog for sources still to scan.
+        for style in Style::ALL {
+            if self.model.config().styles[style].sources != old.styles[style].sources {
+                self.model.await_rescan(style);
+            }
+        }
         self.reload_general(&old.general);
         for style in Style::ALL {
             self.reload_style(style, &old.styles[style]);
@@ -25,7 +34,9 @@ impl Turn<'_> {
 
     pub(super) fn reload_general(&mut self, old: &General) {
         let new = self.model.config().general.clone();
-        if new.picture_options != old.picture_options && new.picture_options.is_some() {
+        if new.picture_options.is_none() {
+            self.model.picture_options_owed = None;
+        } else if new.picture_options != old.picture_options {
             self.model.picture_options_owed = new.picture_options;
         }
         if new.apply_mode != old.apply_mode {
@@ -40,6 +51,10 @@ impl Turn<'_> {
         if new.max_pixels > old.max_pixels {
             let fit_now = self.model.forget_size_verdicts();
             self.follow_dropped_checks(fit_now);
+        } else if new.max_pixels < old.max_pixels {
+            for style in Style::ALL {
+                self.publish_again(style);
+            }
         }
     }
 

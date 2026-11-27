@@ -95,6 +95,12 @@ pub enum Event {
         id: ReplyId,
         result: Result<(), String>,
     },
+    /// The [`Effect::SetKeys`] with these values did not land. The shell
+    /// still holds the previous keys.
+    KeyWriteFailed {
+        uris: PerStyle<Option<String>>,
+        picture_options: Option<PictureOptions>,
+    },
     /// The screen was locked or unlocked: `org.gnome.ScreenSaver`'s
     /// `ActiveChanged`, or its `GetActive` at start. May come before
     /// [`Event::Started`]. Only read under `pause_when_locked`.
@@ -245,8 +251,8 @@ pub enum Effect {
     /// Write the background keys in one transaction: `picture-uri` to
     /// `uris.light`, `picture-uri-dark` to `uris.dark` and, with `Some`,
     /// `picture-options`. A value that is `None` leaves its key as it is; at
-    /// least one of the three is `Some`. A failure is logged; no event comes
-    /// back.
+    /// least one of the three is `Some`. A failure is logged and answered
+    /// with [`Event::KeyWriteFailed`].
     ///
     /// A URI is the style's slot URI in slots mode and the image's own
     /// `file://` URI in uri mode. A key that later holds anything but the
