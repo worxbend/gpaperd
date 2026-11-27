@@ -66,7 +66,11 @@ const WATCH_CHECK_PERIOD: Duration = Duration::from_secs(30);
 /// How long the first scan of a watch waits for its remote scans. A remote
 /// scan that takes longer is reported later, as found files, so a stuck
 /// server does not hold the other sources.
-const FIRST_SCAN_REMOTE_WAIT: Duration = Duration::from_secs(5);
+///
+/// [`MAX_BURST`] already bounds how long the follower holds a report back
+/// for files that are still changing. The first report is held back for the
+/// same kind of reason, so it gets the same bound, not a second limit.
+const FIRST_SCAN_REMOTE_WAIT: Duration = MAX_BURST;
 
 // `f_type` values of statfs(2) for the file systems that another machine can
 // change, so that inotify does not see every change. FUSE covers sshfs,
@@ -2221,6 +2225,28 @@ mod tests {
         assert!(driven.follower.sources[0].dirs.contains_key(&store));
         assert!(driven.follower.watched.contains_key(&store));
         assert_eq!(told, ["found store/real.png"]);
+    }
+
+    #[test]
+    fn retargeting_a_middle_link_of_a_followed_chain_is_scanned_again() {
+        let (_dir, root) = temp_root();
+        let (walls, mid, store) = (root.join("walls"), root.join("mid"), root.join("store"));
+        write(&store.join("a.png"), "a");
+        write(&store.join("b.png"), "b");
+        fs::create_dir(&walls).expect("create the link directory");
+        fs::create_dir(&mid).expect("create the middle link directory");
+        symlink(store.join("a.png"), mid.join("hop.png")).expect("symlink");
+        symlink(mid.join("hop.png"), walls.join("link.png")).expect("symlink");
+        let mut driven = Driven::start(&root, &[flat(&walls)]);
+
+        fs::remove_file(mid.join("hop.png")).expect("remove the middle link");
+        symlink(store.join("b.png"), mid.join("hop.png")).expect("retarget the middle link");
+        driven.see_created(&mid.join("hop.png"), SECOND);
+        let mut told = driven.told_after(SECOND + BURST_GAP);
+        told.sort();
+
+        assert!(driven.follower.watched.contains_key(&mid));
+        assert_eq!(told, ["found store/b.png", "removed store/a.png"]);
     }
 
     #[test]
