@@ -198,7 +198,7 @@ fn an_image_above_max_pixels_is_skipped() {
         return;
     }
     scenario(async {
-        let world = World::new();
+        let world = World::decoding_with_glycin();
         world.add_huge_image(Style::Light, "a.png");
         world.add_images(Style::Light, &["b.png"]);
         world.add_images(Style::Dark, &["x.png"]);
@@ -217,7 +217,7 @@ fn an_image_that_is_still_copied_in_is_shown_once_it_is_whole() {
         return;
     }
     scenario(async {
-        let world = World::new();
+        let world = World::decoding_with_glycin();
         world.add_images(Style::Light, &["a.png"]);
         world.add_images(Style::Dark, &["x.png"]);
         let mut daemon = world.start_daemon(world.config(ALPHABETICAL), SEED);

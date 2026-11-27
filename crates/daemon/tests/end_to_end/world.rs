@@ -30,8 +30,11 @@ use gpaperd_daemon::config_watch::{ConfigFile, ConfigWatch};
 use gpaperd_daemon::dbus::{self, ControlPort};
 use gpaperd_daemon::fetch::{FetchSettings, ProxyPolicy};
 use gpaperd_daemon::gnome::{GnomeError, GnomePort, KeyWrite};
-use gpaperd_daemon::interp::{Clock, Interpreter, Notice, Ports, RunError};
+use gpaperd_daemon::interp::{
+    CheckFuture, Clock, ImageCheck, Interpreter, Notice, Ports, RunError,
+};
 use gpaperd_daemon::paths::Paths;
+use gpaperd_daemon::probe::{self, Prober};
 use gpaperd_daemon::{screensaver, slots, state};
 use tempfile::TempDir;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -170,10 +173,24 @@ pub struct World {
     log: LogBook,
     /// Routes this thread's log lines to `log` for as long as the world is.
     _log_route: DefaultGuard,
+    /// Makes the image check of each daemon that starts in this world.
+    image_check: fn() -> Arc<dyn ImageCheck>,
 }
 
 impl World {
+    /// A world whose daemon checks images by their magic bytes only, with
+    /// [`MagicBytesOnly`]: for every scenario that is not about decoding.
     pub fn new() -> World {
+        World::with_image_check(|| Arc::new(MagicBytesOnly))
+    }
+
+    /// A world whose daemon decodes each image with glycin, as `main` does.
+    /// For a scenario that needs a decode; it asks [`glycin_decodes`] first.
+    pub fn decoding_with_glycin() -> World {
+        World::with_image_check(|| Arc::new(Prober::new()))
+    }
+
+    fn with_image_check(image_check: fn() -> Arc<dyn ImageCheck>) -> World {
         let temp_dir = tempfile::tempdir().expect("create a temp dir");
         let root = fs::canonicalize(temp_dir.path()).expect("the real path of the temp dir");
         let log = LogBook::default();
@@ -184,6 +201,7 @@ impl World {
             gnome: FakeGnome::showing(Style::Light),
             _log_route: log.collect_this_threads_log(),
             log,
+            image_check,
         };
         for style in Style::ALL {
             fs::create_dir_all(world.images_dir(style)).expect("create an image folder");
@@ -413,6 +431,7 @@ impl World {
             },
             control: bus.control,
             screen_lock: bus.screen_lock,
+            image_check: (self.image_check)(),
         };
         (ports, notices)
     }
@@ -1051,11 +1070,24 @@ impl Clock for FakeClock {
     }
 }
 
+/// The image check of a scenario that is not about decoding: the magic-byte
+/// read of [`probe::probe`], and no glycin. Such a scenario then runs where
+/// glycin has no loaders or no `bwrap`, where the real check refuses every
+/// image. The read blocks the daemon's thread, which is fine for the small
+/// local files of a scenario.
+struct MagicBytesOnly;
+
+impl ImageCheck for MagicBytesOnly {
+    fn check<'a>(&'a self, path: &'a Path, _max_pixels: u64) -> CheckFuture<'a> {
+        Box::pin(async move { probe::probe(path) })
+    }
+}
+
 /// Whether glycin can decode in its sandbox here: asked of glycin itself,
 /// once, on a thread and in a runtime of its own (glycin keeps its thread on
 /// the first runtime that uses it, so that runtime is never dropped). Without
-/// it the daemon checks magic bytes only, and a test that needs a decode
-/// (pixel counts, a cut-off file) skips; tests/probe.rs covers that fallback.
+/// it the real check refuses every image, and a scenario that needs a decode
+/// (pixel counts, a cut-off file) skips; tests/probe.rs covers that refusal.
 pub fn glycin_decodes() -> bool {
     static DECODES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let ask = || {

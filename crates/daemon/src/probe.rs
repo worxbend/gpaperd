@@ -827,7 +827,10 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let png = aged(file_with(&dir, "wall.png", PNG_HEADER));
         let stamp = current_stamp(&png).expect("stat fixture");
-        let error = glycin_timeout().await;
+        let Some(error) = glycin_timeout().await else {
+            eprintln!("skipped: glycin has no loaders here");
+            return;
+        };
         let prober = Prober::new();
 
         let reason = prober.refused(&png, stamp, error).await;
@@ -839,12 +842,16 @@ mod tests {
     /// glycin's timeout kind is not constructable outside that crate. A limit
     /// of zero is how this test reaches [`glycin::Error::is_timeout`]. It is
     /// not a daemon deadline: the decode limit stays [`DECODE_TIMEOUT`].
-    async fn glycin_timeout() -> glycin::Error {
+    ///
+    /// `None` where glycin has no loaders and says so before the zero limit
+    /// runs out.
+    async fn glycin_timeout() -> Option<glycin::Error> {
         let sandbox = Sandbox::start();
         let mut loader = sandbox.loader(Loader::new_vec(KNOWN_GOOD_PNG.to_vec()));
         loader.limits(Limits::default().timeout(Duration::ZERO));
         match tokio::time::timeout(DECODE_TIMEOUT, loader.load()).await {
-            Ok(Err(error)) if error.is_timeout() => error,
+            Ok(Err(error)) if error.is_timeout() => Some(error),
+            Ok(Err(error)) if error.has_no_processor_configured() => None,
             Ok(other) => panic!("zero glycin limit did not time out: {other:?}"),
             Err(_elapsed) => panic!("zero glycin limit waited out the decode timeout"),
         }

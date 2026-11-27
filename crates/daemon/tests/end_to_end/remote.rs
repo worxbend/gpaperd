@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use gpaperd_core::catalog::ItemId;
 use gpaperd_core::event::{Connectivity, Status};
-use gpaperd_core::style::Style;
+use gpaperd_core::style::{PerStyle, Style};
 use url::Url;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -163,7 +163,17 @@ fn a_revalidation_answered_304_changes_nothing_visible() {
         let url = url_on(&server);
         world.cache_remote_image(&url, "cached", "\"v1\"").await;
         let mut daemon = start(&world, ALPHABETICAL, &[url.as_str()]);
-        light_shows(&mut daemon, &ItemId::from_url(&url)).await;
+        // Each key is written once its own image passes its check, in either
+        // order, so the count of writes waits for both styles.
+        let both_shown = PerStyle {
+            light: Some(ItemId::from_url(&url)),
+            dark: Some(world.item(Style::Dark, "x.png")),
+        };
+        daemon
+            .status_where("both styles to show their image", |status| {
+                status.current == both_shown
+            })
+            .await;
         let slot_inode = world.slot_inode(Style::Light);
         let key_writes = world.gnome.key_writes().len();
 

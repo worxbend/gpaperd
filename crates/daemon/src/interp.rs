@@ -23,7 +23,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::{self, Future};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::{io, mem, panic};
@@ -85,6 +85,24 @@ impl Clock for WallTimer {
     }
 }
 
+/// A port, so that tests that are not about decoding can run where glycin
+/// cannot decode. The real one is [`Prober`].
+pub trait ImageCheck: Send + Sync {
+    /// Whether the shell can show `path`, with the verdicts of
+    /// [`Prober::check`].
+    fn check<'a>(&'a self, path: &'a Path, max_pixels: u64) -> CheckFuture<'a>;
+}
+
+/// The verdict of an [`ImageCheck`], on its way. Boxed, so that the check
+/// can sit behind a `dyn`.
+pub type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<(), BadReason>> + Send + 'a>>;
+
+impl ImageCheck for Prober {
+    fn check<'a>(&'a self, path: &'a Path, max_pixels: u64) -> CheckFuture<'a> {
+        Box::pin(Prober::check(self, path, max_pixels))
+    }
+}
+
 /// News for the service manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
@@ -107,6 +125,9 @@ pub struct Ports<G, C> {
     /// Each screen lock and unlock, from [`crate::screensaver::watch`]:
     /// [`crate::screensaver::detached`] without a bus.
     pub screen_lock: mpsc::UnboundedReceiver<ScreenLock>,
+    /// The check of each image right before it is shown: one [`Prober`] for
+    /// the run, which remembers what glycin said about each file.
+    pub image_check: Arc<dyn ImageCheck>,
 }
 
 /// Why the interpreter cannot start.
@@ -136,8 +157,6 @@ pub struct Interpreter<G, C> {
     /// Probe and slot-write answers on their way back to the event loop.
     answers: mpsc::UnboundedReceiver<Event>,
     answer_sender: mpsc::UnboundedSender<Event>,
-    /// One for the run: it remembers what glycin said about each file.
-    prober: Arc<Prober>,
     sources: SourceWatches,
     slots_watch: SlotsWatch,
     /// Whether the state file holds the user's original keys. Once the keys
@@ -486,7 +505,6 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             ports,
             answers,
             answer_sender,
-            prober: Arc::new(Prober::new()),
             sources: SourceWatches::default(),
             slots_watch,
             originals_saved,
@@ -778,9 +796,9 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     }
 
     fn probe_later(&self, style: Style, item: ItemId, path: PathBuf, max_pixels: u64) {
-        let prober = Arc::clone(&self.prober);
+        let image_check = Arc::clone(&self.ports.image_check);
         // The check moves its own blocking I/O off this thread.
-        let check = tokio::spawn(async move { prober.check(&path, max_pixels).await });
+        let check = tokio::spawn(async move { image_check.check(&path, max_pixels).await });
         self.answer_later(check, move |verdict| Event::Probed {
             style,
             item,

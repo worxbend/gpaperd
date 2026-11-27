@@ -14,6 +14,7 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -29,6 +30,7 @@ use gpaperd_daemon::gnome::{GnomeError, GnomeThread};
 use gpaperd_daemon::interp::{Interpreter, Notice, Ports};
 use gpaperd_daemon::logging;
 use gpaperd_daemon::paths::Paths;
+use gpaperd_daemon::probe::Prober;
 use gpaperd_daemon::screensaver;
 use gpaperd_daemon::timer::WallTimer;
 use sd_notify::NotifyState;
@@ -237,6 +239,7 @@ async fn serve(
         fetch: FetchSettings::default(),
         control,
         screen_lock,
+        image_check: Arc::new(Prober::new()),
     };
     let start = Interpreter::start(config, paths, seed_from_clock(), ports);
     let started = tokio::select! {

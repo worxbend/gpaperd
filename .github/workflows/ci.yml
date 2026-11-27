@@ -50,8 +50,9 @@ jobs:
       # GLib/GIO for GSettings, libseccomp and fontconfig for glycin;
       # dbus-daemon for the control tests, groff for the man page check.
       # glycin's loaders are not packaged here: glycin cannot decode, so
-      # every check fails as "file is incomplete". The tests assert that,
-      # and decode-only end-to-end tests skip themselves.
+      # every real check fails as "file is incomplete". tests/probe.rs
+      # asserts that, end-to-end scenarios that are not about decoding check
+      # magic bytes only, and tests that need a decode print "skipped:".
       - name: Install system packages
         run: |
           sudo apt-get update

@@ -271,7 +271,11 @@ cargo deny check
 
 Tests never touch your real session. GSettings tests use compiled test
 schemas with `GSETTINGS_BACKEND=keyfile`, and D-Bus tests run a private
-`dbus-daemon`. `.github/workflows/ci.yml` runs the same steps, plus
+`dbus-daemon`. Where glycin cannot decode (no loaders or no working
+`bwrap`), the tests that need a decode print `skipped:` and pass; the
+end-to-end scenarios that are not about decoding check magic bytes only,
+in the tests, never in the daemon. `.github/workflows/ci.yml` runs the
+same steps, plus
 `.github/scripts/check-docs.sh`. That script checks that every key in the
 example config is documented here and in `gpaperd.toml(5)`, and that every
 command is in the man pages.
