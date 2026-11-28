@@ -12,7 +12,8 @@ use gpaperd_core::config::{
 };
 use gpaperd_core::control::{Command, HISTORY_LEN, Reply, ReplyId};
 use gpaperd_core::event::{
-    BackgroundKeys, Effect, Event, Fired, GnomeEvent, Method, Pause, ScreenLock, SlotWrite,
+    BackgroundKeys, Effect, Event, Fired, GnomeEvent, HookEvent, HookRun, Method, Pause,
+    ScreenLock, SlotWrite,
 };
 use gpaperd_core::model::{Model, ModelInit, Persisted, STATE_VERSION, StylePersisted};
 use gpaperd_core::step::{
@@ -1328,6 +1329,41 @@ impl<'a> Daemon<'a> {
             }
             Effect::SaveFavorites { .. } => {
                 prop_assert!(false, "{effect:?} without a favorite request");
+            }
+            Effect::RunHook(run) => self.check_hook_run(cause, run)?,
+        }
+        Ok(())
+    }
+
+    /// `on_change` runs with what its style shows after the step, for a
+    /// publish of another image or for a switch to that style.
+    fn check_hook_run(&self, cause: &Event, run: &HookRun) -> Result<(), TestCaseError> {
+        prop_assert_eq!(Some(&run.command), self.config.general.on_change.as_ref());
+        let current = &self.model.persisted().styles[run.style].current;
+        prop_assert_eq!(Some(&run.item), current.as_ref());
+        prop_assert_eq!(run.path.as_ref(), Some(&PathBuf::from(run.item.as_str())));
+        prop_assert_eq!(run.visible, run.style == self.visible);
+        match run.event {
+            HookEvent::Changed => {
+                let is_its_publish = matches!(
+                    cause,
+                    Event::Published { style, item, result: Ok(_) }
+                        if *style == run.style && *item == run.item
+                );
+                prop_assert!(is_its_publish, "{run:?} without its publish");
+                let shown_before = self.before.styles[run.style].current.as_ref();
+                prop_assert_ne!(
+                    shown_before,
+                    Some(&run.item),
+                    "the image was on screen already"
+                );
+            }
+            HookEvent::Switched => {
+                let is_its_switch = matches!(
+                    cause,
+                    Event::Gnome(GnomeEvent::StyleChanged(style)) if *style == run.style
+                );
+                prop_assert!(is_its_switch, "{run:?} without its switch");
             }
         }
         Ok(())

@@ -16,6 +16,8 @@ mod bus;
 mod control;
 #[path = "end_to_end/files.rs"]
 mod files;
+#[path = "end_to_end/hook.rs"]
+mod hook;
 #[path = "end_to_end/keys.rs"]
 mod keys;
 #[path = "end_to_end/reload.rs"]

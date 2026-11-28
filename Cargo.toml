@@ -44,7 +44,8 @@ thiserror = "2.0.21"
 # `time`: glycin's tokio backend needs the runtime's timers. The daemon's own
 # deadlines stay on the timerfd.
 # `fs`, `io-util`: remote downloads stream to a temp file in the cache.
-tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+# `process`: the `on_change` command runs and is reaped off the event loop.
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 # `display`: the cache writes meta.toml.
 toml = { version = "1.2.1", default-features = false, features = ["display", "parse", "serde", "std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }

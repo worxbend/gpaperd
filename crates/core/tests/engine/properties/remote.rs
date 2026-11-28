@@ -432,6 +432,10 @@ impl Daemon {
                 prop_assert!(false, "{effect:?} without a control command");
                 None
             }
+            Effect::RunHook(_) => {
+                prop_assert!(false, "{effect:?} without on_change");
+                None
+            }
         };
         Ok(answer)
     }

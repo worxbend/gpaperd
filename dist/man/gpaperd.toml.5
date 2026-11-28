@@ -158,6 +158,65 @@ and
 relative to the config file's directory.
 It is created at the first copy.
 Unset, the command fails.
+.TP
+.BR on_change " (unset)"
+A command to run when the image changes: a non-empty array of strings,
+the program and its arguments.
+It runs with no shell, and the daemon does not wait for it.
+A bare program name is looked up in
+.BR PATH ;
+a path must be absolute or start with
+.BR \(ti/ .
+Only the program gets
+.B \(ti
+expanded; the arguments are passed as written.
+Its stdin is
+.BR /dev/null ;
+its stdout and stderr are the daemon's.
+.IP
+It runs when a style shows another image (a rotation,
+.BR next ,
+.BR previous ,
+.B set
+or
+.BR ban ),
+for the hidden style too, and when GNOME switches between light and dark.
+It does not run for the same image published again, nor at start for the
+images that the slots still hold from the last run.
+In uri mode it runs once GNOME reports the new key.
+.IP
+The command gets the daemon's environment and these variables:
+.RS
+.TP
+.B GPAPERD_EVENT
+.B changed
+or
+.BR switched .
+.TP
+.B GPAPERD_STYLE
+.B light
+or
+.BR dark :
+the style that changed, or the style now on screen.
+.TP
+.B GPAPERD_ID
+The image's id.
+.TP
+.B GPAPERD_PATH
+The image's own file: a local file, or the cached download of a URL.
+Never the slot.
+Unset when the download is no longer known.
+.TP
+.B GPAPERD_VISIBLE
+.B 1
+when that style is on screen, else
+.BR 0 .
+.RE
+.IP
+A run starts even while an earlier run for the same event still runs;
+that is logged at most once a minute.
+A command that does not start, or exits with a non-zero status, is logged
+with its program and status.
 .SH [light] AND [dark]
 .TP
 .B interval
@@ -265,6 +324,7 @@ URI.
 interval = "15m"
 order = "random"
 pause_when_locked = true
+on_change = ["notify-send", "Wallpaper changed"]
 
 [light]
 sources = [

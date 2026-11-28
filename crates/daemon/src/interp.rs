@@ -25,7 +25,7 @@ use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use std::{io, mem, panic};
 
 use gpaperd_core::catalog::{BadReason, FileId, FsChange, ItemId, RemoteBlob};
@@ -48,6 +48,7 @@ use crate::fetch::{FetchSettings, Fetcher};
 use crate::gnome::{
     GnomeError, GnomePort, KeyWrite, PICTURE_OPTIONS, PICTURE_URI, PICTURE_URI_DARK,
 };
+use crate::hook::Hooks;
 use crate::paths::Paths;
 use crate::probe::Prober;
 use crate::scan::Scan;
@@ -175,6 +176,8 @@ pub struct Interpreter<G, C> {
     /// answered yet.
     pending: PendingReplies,
     saves: Saves,
+    /// The runs of `on_change` that are still running.
+    hooks: Hooks,
 }
 
 /// What a run starts from, as read from disk.
@@ -372,6 +375,7 @@ fn waits_for_saves(effect: &Effect) -> bool {
             | Effect::Report(_)
             | Effect::Reply { .. }
             | Effect::Changed { .. }
+            | Effect::RunHook(_)
     )
 }
 
@@ -515,6 +519,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             cached,
             pending: PendingReplies::default(),
             saves: Saves::default(),
+            hooks: Hooks::default(),
         })
     }
 
@@ -729,6 +734,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             Effect::ReadConfig(id) => self.read_config_later(id, config_file.clone()),
             Effect::RestoreKeys { id, keys } => self.restore_keys(id, keys, config_file).await?,
             Effect::SaveFavorites { id, dir, images } => self.save_favorites_later(id, dir, images),
+            Effect::RunHook(run) => self.hooks.run(run, Instant::now()),
         }
         Ok(())
     }

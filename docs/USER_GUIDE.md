@@ -215,6 +215,7 @@ style under `[light]` or `[dark]`.
 | `apply_mode` | `"slots"` | `uri` writes each image's own path to GNOME instead of using slot files |
 | `max_pixels` | `100_000_000` | Skip images larger than this (width × height) |
 | `favorites_dir` | not set | Folder that `gpaperctl favorite` copies into, such as `"~/Pictures/Favorites"`. Created when missing |
+| `on_change` | not set | A command to run when the image changes, such as `["notify-send", "Wallpaper changed"]`. See 4.5 |
 
 `~/.config/gpaperd/config.example.toml` shows every key with comments.
 
@@ -249,6 +250,43 @@ sources = ["~/Pictures/Wallpapers"]
 [dark]
 sources = ["~/Pictures/Wallpapers"]
 ```
+
+### 4.5 Run a command when the wallpaper changes
+
+`on_change` names a program and its arguments. gpaperd runs it, with no
+shell, each time a style shows another image and each time GNOME switches
+between light and dark:
+
+```toml
+[general]
+on_change = ["~/bin/wallpaper-changed"]
+```
+
+The program gets these variables:
+
+- `GPAPERD_EVENT`: `changed`, or `switched` for a light/dark switch.
+- `GPAPERD_STYLE`: `light` or `dark`.
+- `GPAPERD_ID`: the image's id, as `gpaperctl status` shows it.
+- `GPAPERD_PATH`: the image file itself, or the downloaded copy of a URL.
+- `GPAPERD_VISIBLE`: `1` when that style is on screen, `0` when it is the
+  other one.
+
+A minimal script:
+
+```sh
+#!/bin/sh
+[ "$GPAPERD_VISIBLE" = 1 ] || exit 0
+notify-send "New wallpaper" "$GPAPERD_PATH"
+```
+
+- A bare name like `notify-send` is looked up in `PATH`. A path must be
+  absolute or start with `~/`. Only the program gets `~` expanded.
+- No shell runs: `|`, `>` and `$VAR` in the arguments are passed as they
+  are. Use `["sh", "-c", "…"]` if you want a shell.
+- gpaperd does not wait for the command. Its output goes to the journal
+  (`journalctl --user -u gpaperd`), and so does a failure.
+- It does not run when gpaperd starts and the wallpaper is still the one
+  from last time.
 
 ## 5. Everyday use
 

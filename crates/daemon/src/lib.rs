@@ -7,6 +7,7 @@ pub mod dbus;
 pub mod favorites;
 pub mod fetch;
 pub mod gnome;
+pub mod hook;
 pub mod interp;
 pub mod logging;
 pub mod paths;

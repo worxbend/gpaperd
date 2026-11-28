@@ -18,7 +18,9 @@ use crate::control::Direction;
 use crate::control::Reply;
 #[cfg(doc)]
 use crate::event::Pause;
-use crate::event::{Effect, Event, Fired, GnomeEvent, GnomeSnapshot, SlotWrite};
+use crate::event::{
+    Effect, Event, Fired, GnomeEvent, GnomeSnapshot, HookEvent, HookRun, SlotWrite,
+};
 use crate::key::Reassert;
 use crate::model::{Candidate, Model, Phase, ProbeRetry, Rotation, Stage, Timer};
 use crate::style::{PerStyle, Style};
@@ -354,6 +356,16 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// [`Effect::Changed`] follows each successful publish at once. In uri mode
 /// it follows the shell's report of the written URI, not the plan to write.
+///
+/// With `on_change` set, [`Effect::RunHook`] runs it:
+/// - `changed`: right after an [`Effect::Changed`] that names another item
+///   than the style's last one: a rotation, `Next`, `Previous`, `Set` or
+///   `Ban`, for the style on screen and for the hidden one alike. The same
+///   image published again, a slot refilled with the item it had, and a
+///   start that finds the slots intact run nothing. The item a run starts
+///   with is the state file's.
+/// - `switched`: when the shell switches to the other style, with the image
+///   that style holds. A style with no image runs nothing.
 ///
 /// Derived effects follow the event's own, in this order:
 /// - The first probe of every `Next` and `Previous` whose style is free, and
@@ -703,6 +715,7 @@ impl Turn<'_> {
         self.model.visible = visible;
         self.follow_visibility_saved();
         self.plan_refresh();
+        self.run_hook(HookEvent::Switched, visible);
     }
 
     /// Runs or stops each style's clock as [`Model::is_running`] says, and
@@ -854,6 +867,37 @@ impl Turn<'_> {
             item: item.clone(),
         });
         self.record_show(style, item);
+        self.run_hook_if_changed(style);
+    }
+
+    /// Runs `on_change` when `style`'s current item is not the one that it
+    /// was last told of. Follows each [`Effect::Changed`].
+    pub(super) fn run_hook_if_changed(&mut self, style: Style) {
+        let current = &self.model.styles[style].current;
+        if *current == self.model.announced[style] {
+            return;
+        }
+        self.model.announced[style].clone_from(current);
+        self.run_hook(HookEvent::Changed, style);
+    }
+
+    /// Emits [`Effect::RunHook`] for `style`'s current item, when the config
+    /// sets `on_change` and the style has an item.
+    fn run_hook(&mut self, event: HookEvent, style: Style) {
+        let Some(command) = self.model.config().general.on_change.clone() else {
+            return;
+        };
+        let Some(item) = self.model.styles[style].current.clone() else {
+            return;
+        };
+        self.effects.push(Effect::RunHook(HookRun {
+            command,
+            event,
+            style,
+            item,
+            path: self.model.shown_file(style),
+            visible: style == self.model.visible,
+        }));
     }
 
     /// Records that `style` shows `item` now.

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::catalog::{BadReason, FileId, FsChange, ItemId, LocalFile, RemoteBlob};
-use crate::config::{Config, ConfigError, LinkPolicy, PictureOptions, Source};
+use crate::config::{Config, ConfigError, HookCommand, LinkPolicy, PictureOptions, Source};
 use crate::control::{Command, Reply, ReplyId};
 use crate::style::{PerStyle, Style};
 
@@ -362,6 +362,48 @@ pub enum Effect {
         dir: PathBuf,
         images: Vec<Favorite>,
     },
+    /// Start the `on_change` command, with no shell, and do not wait for
+    /// it: nothing comes back. A failure to start it and a non-zero exit
+    /// are logged.
+    RunHook(HookRun),
+}
+
+/// One run of the `on_change` command for [`Effect::RunHook`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRun {
+    pub command: HookCommand,
+    /// `GPAPERD_EVENT`.
+    pub event: HookEvent,
+    /// `GPAPERD_STYLE`: the style whose image changed, or the style now on
+    /// screen.
+    pub style: Style,
+    /// `GPAPERD_ID`: the item that style shows.
+    pub item: ItemId,
+    /// `GPAPERD_PATH`: the image's own file, a local image's path or a
+    /// remote image's cached blob, never the slot. `None` for a remote image
+    /// that no catalog holds any more.
+    pub path: Option<PathBuf>,
+    /// `GPAPERD_VISIBLE`: whether `style` is on screen.
+    pub visible: bool,
+}
+
+/// Why [`Effect::RunHook`] runs the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    /// A style shows another image.
+    Changed,
+    /// The shell switched to the other style.
+    Switched,
+}
+
+impl HookEvent {
+    /// `"changed"` or `"switched"`: the value of `GPAPERD_EVENT`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::Changed => "changed",
+            HookEvent::Switched => "switched",
+        }
+    }
 }
 
 /// One image for [`Effect::SaveFavorites`].

@@ -308,6 +308,7 @@ impl Turn<'_> {
             }
             if let Some(item) = self.model.styles[style].current.clone() {
                 self.effects.push(Effect::Changed { style, item });
+                self.run_hook_if_changed(style);
             }
         }
     }

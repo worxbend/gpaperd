@@ -50,6 +50,8 @@ every slide's texture, and the order is fixed when the file is generated.
 - Optional pause while the screen is locked (`pause_when_locked`).
 - Ban an image you are tired of (`gpaperctl ban`), or copy one you like into
   a folder (`gpaperctl favorite`). Neither deletes or moves a file.
+- Run your own command when the image changes (`on_change`), for example to
+  recolour a terminal theme from the new wallpaper.
 - A `Type=notify` systemd user unit that never restart-loops on a bad config.
 
 ## Install
@@ -154,6 +156,38 @@ has every key with a comment. The full reference is `gpaperd.toml(5)`.
 | `max_pixels` | `100_000_000` | Skip images larger than this, width times height |
 | `pause_when_locked` | `false` | Stop the timers while the screen is locked (`org.gnome.ScreenSaver`). A change that fell due happens at unlock |
 | `favorites_dir` | unset | Where `gpaperctl favorite` copies the image on screen. A path, expanded as source paths are; created when missing. Unset, `favorite` fails |
+| `on_change` | unset | A command, as a non-empty array of strings, that runs when the image changes. See [Hook command](#hook-command) |
+
+### Hook command
+
+`on_change = ["program", "arg", …]` runs with no shell. A bare program name
+is looked up in `PATH`; a path must be absolute or start with `~/`. Only the
+program gets `~` expanded; the arguments are passed as written. The daemon
+does not wait for it: stdin is `/dev/null`, stdout and stderr go to the
+journal. It runs when:
+
+- a style shows another image: a rotation, `next`, `previous`, `set` or
+  `ban`. That includes the style that is not on screen, with
+  `GPAPERD_VISIBLE=0`.
+- GNOME switches between light and dark.
+
+It does not run for the same image published again, nor at start when the
+slots still hold the images of the last run. The first start after
+installing runs it for each style. In `apply_mode = "uri"` it runs once
+GNOME reports the new key.
+
+| Variable | Value |
+| --- | --- |
+| `GPAPERD_EVENT` | `changed` (a style shows another image) or `switched` (light/dark switch) |
+| `GPAPERD_STYLE` | `light` or `dark`: the style that changed, or the one now on screen |
+| `GPAPERD_ID` | The image's id, as `gpaperctl status` prints it |
+| `GPAPERD_PATH` | The image's own file: the local file, or the cached download of a URL. Never the slot. Unset when the download is no longer known |
+| `GPAPERD_VISIBLE` | `1` when that style is on screen, else `0` |
+
+A run that starts while an earlier run for the same event is still running
+starts anyway; the daemon logs at most one warning a minute about that. A
+command that cannot start, or exits with a non-zero status, is logged with
+its program and status.
 
 ### `[light]` and `[dark]`
 

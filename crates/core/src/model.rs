@@ -179,6 +179,10 @@ pub struct Model {
     /// What the background keys hold, as last reported. `None` before
     /// `Started`.
     pub(crate) gnome_keys: Option<BackgroundKeys>,
+    /// The item that each style's last `Effect::Changed` named, or else its
+    /// restored current item: what `on_change` was last told of. A slot
+    /// refilled with that same item is no change.
+    pub(crate) announced: PerStyle<Option<ItemId>>,
 }
 
 /// The probes that one version of a truncated file was granted after its
@@ -449,6 +453,7 @@ impl Model {
             let saved = mem::take(&mut saved_styles[style]);
             StyleState::restore(saved, config.styles[style].order)
         });
+        let announced = PerStyle::from_fn(|style| styles[style].current.clone());
         let mut model = Model {
             config,
             awaits_config,
@@ -476,6 +481,7 @@ impl Model {
             screen_lock: ScreenLock::default(),
             locks: PerStyle::default(),
             gnome_keys: None,
+            announced,
         };
         for id in banned {
             model.ban(id);
@@ -536,20 +542,34 @@ impl Model {
     /// A local image that no catalog holds is copied from its path, gone
     /// or not: the copy then fails with the I/O error.
     pub(crate) fn favorite(&self, style: Style) -> Option<Favorite> {
-        let current = self.styles[style].current.as_ref()?;
-        let held = Style::ALL
-            .into_iter()
-            .find_map(|owner| self.catalogs[owner].get(current));
-        let source = match held {
-            Some(item) => item.origin.path().to_owned(),
-            None if is_pre_scan_path(current.as_str()) => PathBuf::from(current.as_str()),
-            None => return None,
-        };
-        let name = match held.map(|item| &item.origin) {
+        let (source, origin) = self.shown_image(style)?;
+        let name = match origin {
             Some(Origin::Remote(remote)) => url_file_name(&remote.url),
             Some(Origin::Local(_)) | None => path_file_name(&source),
         };
         Some(Favorite { source, name })
+    }
+
+    /// The file of the image that `style` shows: a local image's path or a
+    /// remote image's cached blob, as [`Model::favorite`] copies it.
+    pub(crate) fn shown_file(&self, style: Style) -> Option<PathBuf> {
+        self.shown_image(style).map(|(source, _)| source)
+    }
+
+    /// The file of `style`'s current item, and its origin when a catalog
+    /// holds it.
+    fn shown_image(&self, style: Style) -> Option<(PathBuf, Option<&Origin>)> {
+        let current = self.styles[style].current.as_ref()?;
+        let held = Style::ALL
+            .into_iter()
+            .find_map(|owner| self.catalogs[owner].get(current));
+        match held {
+            Some(item) => Some((item.origin.path().to_owned(), Some(&item.origin))),
+            None if is_pre_scan_path(current.as_str()) => {
+                Some((PathBuf::from(current.as_str()), None))
+            }
+            None => None,
+        }
     }
 
     pub fn config(&self) -> &Config {

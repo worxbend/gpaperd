@@ -76,6 +76,8 @@ impl Config {
     /// - `pause_when_locked`: bool.
     /// - `favorites_dir`: a path or a `file://` URI, expanded as source
     ///   paths are. Unset by default.
+    /// - `on_change`: a non-empty array of strings, the program and its
+    ///   arguments: [`HookCommand`]. Unset by default.
     ///
     /// `[light]` and `[dark]` keys: `interval` and `order` (each overrides the
     /// general value for that style) and `sources`.
@@ -182,6 +184,8 @@ pub struct General {
     /// Where `gpaperctl favorite` copies the image on screen: absolute and
     /// expanded. `None` when unset: the command then fails.
     pub favorites_dir: Option<PathBuf>,
+    /// What runs when the image on screen changes. `None` when unset.
+    pub on_change: Option<HookCommand>,
 }
 
 impl Default for General {
@@ -197,8 +201,19 @@ impl Default for General {
             max_pixels: DEFAULT_MAX_PIXELS,
             pause_when_locked: false,
             favorites_dir: None,
+            on_change: None,
         }
     }
+}
+
+/// The `on_change` command, run with no shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookCommand {
+    /// An absolute path, a leading `~` already expanded, or a bare name
+    /// that is looked up in `PATH` when the command runs.
+    pub program: PathBuf,
+    /// Passed as written: no `~` or `$VAR` expansion.
+    pub args: Vec<String>,
 }
 
 /// One style's settings, with `[general]` values already filled in.
@@ -407,6 +422,7 @@ struct RawGeneral {
     max_pixels: Option<Spanned<i64>>,
     pause_when_locked: bool,
     favorites_dir: Option<Spanned<String>>,
+    on_change: Option<Spanned<Vec<String>>>,
 }
 
 impl RawGeneral {
@@ -445,6 +461,10 @@ impl RawGeneral {
                     local_path(raw.get_ref(), ctx)
                         .map_err(|message| Invalid::at(raw, format!("favorites_dir: {message}")))?,
                 ),
+                None => None,
+            },
+            on_change: match &self.on_change {
+                Some(raw) => Some(hook_command(raw, ctx)?),
                 None => None,
             },
         })
@@ -525,6 +545,48 @@ fn max_pixels(raw: &Spanned<i64>) -> Result<u64, Invalid> {
             );
             Invalid::at(raw, message)
         })
+}
+
+/// The program of `on_change` gets only `~` expanded: it is no source path,
+/// and its arguments are the program's business.
+fn hook_command(
+    raw: &Spanned<Vec<String>>,
+    ctx: &ParseContext<'_>,
+) -> Result<HookCommand, Invalid> {
+    let Some((program, args)) = raw.get_ref().split_first() else {
+        let message = "on_change must be a non-empty array of strings, such as \
+                       [\"notify-send\", \"Wallpaper changed\"]";
+        return Err(Invalid::at(raw, message.to_owned()));
+    };
+    let program = hook_program(program, ctx.home_dir)
+        .map_err(|message| Invalid::at(raw, format!("on_change: {message}")))?;
+    Ok(HookCommand {
+        program,
+        args: args.to_vec(),
+    })
+}
+
+/// A relative path with a `/` would depend on the daemon's working
+/// directory, so only a bare name, an absolute path or `~/…` is accepted.
+/// `~` alone or a trailing `/` names a directory, which can never run.
+fn hook_program(text: &str, home_dir: &Path) -> Result<PathBuf, String> {
+    if text.is_empty() {
+        return Err("the program must not be empty".to_owned());
+    }
+    if text == "~" || text.ends_with('/') {
+        return Err("the program must name a file, not a directory".to_owned());
+    }
+    let (mut program, rest) = expand_tilde(text, home_dir)?;
+    program.push(rest);
+    let program = PathBuf::from(program);
+    let is_bare_name = !text.contains('/') && !text.starts_with('~');
+    if is_bare_name || program.is_absolute() {
+        Ok(program)
+    } else {
+        Err("a program path must be absolute or start with `~/`; \
+             a bare name is looked up in PATH"
+            .to_owned())
+    }
 }
 
 /// Parses the `poll` period of a directory source.
@@ -687,17 +749,7 @@ fn file_uri_path(text: &str) -> Result<PathBuf, String> {
 
 /// Expands `~`, `$VAR` and `${VAR}`, then makes the path absolute.
 fn expand_path(text: &str, ctx: &ParseContext<'_>) -> Result<PathBuf, String> {
-    let (mut expanded, rest) = match text.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            (ctx.home_dir.as_os_str().to_owned(), rest)
-        }
-        Some(_) => {
-            return Err("`~user` is not expanded: only `~` and `~/…` are; \
-                        for a file named like that, write `./~…`"
-                .to_owned());
-        }
-        None => (OsString::new(), text),
-    };
+    let (mut expanded, rest) = expand_tilde(text, ctx.home_dir)?;
     expanded.push(expand_variables(rest, ctx.env)?);
     // Checked after the expansion: a variable that is set to nothing would
     // otherwise turn the source into the config directory.
@@ -705,6 +757,20 @@ fn expand_path(text: &str, ctx: &ParseContext<'_>) -> Result<PathBuf, String> {
         return Err("a path must not be empty".to_owned());
     }
     Ok(ctx.config_dir.join(expanded))
+}
+
+/// Splits a leading `~`, alone or before `/`, off `text` as `home_dir`.
+/// Returns the expanded start, empty without a `~`, and the rest.
+fn expand_tilde<'t>(text: &'t str, home_dir: &Path) -> Result<(OsString, &'t str), String> {
+    match text.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            Ok((home_dir.as_os_str().to_owned(), rest))
+        }
+        Some(_) => Err("`~user` is not expanded: only `~` and `~/…` are; \
+                        for a file named like that, write `./~…`"
+            .to_owned()),
+        None => Ok((OsString::new(), text)),
+    }
 }
 
 fn expand_variables(
@@ -885,6 +951,7 @@ apply_mode = "uri"
 max_pixels = 50_000_000
 pause_when_locked = true
 favorites_dir = "~/Pictures/Favorites"
+on_change = ["~/bin/wallpaper-hook", "--quiet"]
 "#;
 
         let general = parse(text).expect("config parses").general;
@@ -900,6 +967,10 @@ favorites_dir = "~/Pictures/Favorites"
             max_pixels: 50_000_000,
             pause_when_locked: true,
             favorites_dir: Some(PathBuf::from("/home/ada/Pictures/Favorites")),
+            on_change: Some(HookCommand {
+                program: PathBuf::from("/home/ada/bin/wallpaper-hook"),
+                args: vec!["--quiet".to_owned()],
+            }),
         };
         assert_eq!(general, expected);
     }
@@ -991,6 +1062,106 @@ favorites_dir = "~/Pictures/Favorites"
     #[test]
     fn favorites_dir_in_a_style_table_is_rejected() {
         let err = parse("[light]\nfavorites_dir = \"/favs\"\n").expect_err("general only");
+
+        assert_eq!((err.line, err.column), (2, 1));
+    }
+
+    #[test]
+    fn on_change_is_unset_unless_set() {
+        let general = parse("").expect("config parses").general;
+
+        assert_eq!(general.on_change, None);
+    }
+
+    #[test]
+    fn on_change_takes_a_program_and_its_arguments_as_written() {
+        let text = "[general]\non_change = [\"notify-send\", \"-a\", \"$WALLS\", \"~/x\"]\n";
+
+        let general = parse(text).expect("config parses").general;
+
+        let expected = HookCommand {
+            program: PathBuf::from("notify-send"),
+            args: vec!["-a".to_owned(), "$WALLS".to_owned(), "~/x".to_owned()],
+        };
+        assert_eq!(general.on_change, Some(expected));
+    }
+
+    #[test]
+    fn on_change_expands_a_tilde_in_the_program_only() {
+        let text = "[general]\non_change = [\"~/bin/hook\", \"~/arg\"]\n";
+
+        let general = parse(text).expect("config parses").general;
+
+        let expected = HookCommand {
+            program: PathBuf::from("/home/ada/bin/hook"),
+            args: vec!["~/arg".to_owned()],
+        };
+        assert_eq!(general.on_change, Some(expected));
+    }
+
+    #[test]
+    fn on_change_with_an_absolute_program_keeps_it() {
+        let text = "[general]\non_change = [\"/usr/bin/true\"]\n";
+
+        let general = parse(text).expect("config parses").general;
+
+        let expected = HookCommand {
+            program: PathBuf::from("/usr/bin/true"),
+            args: Vec::new(),
+        };
+        assert_eq!(general.on_change, Some(expected));
+    }
+
+    #[test]
+    fn on_change_without_a_usable_program_is_rejected() {
+        for (written, message) in [
+            (
+                "[]",
+                "on_change must be a non-empty array of strings, such as [\"notify-send\", \"Wallpaper changed\"]",
+            ),
+            ("[\"\"]", "on_change: the program must not be empty"),
+            (
+                "[\"~\"]",
+                "on_change: the program must name a file, not a directory",
+            ),
+            (
+                "[\"~/\"]",
+                "on_change: the program must name a file, not a directory",
+            ),
+            (
+                "[\"/usr/bin/\"]",
+                "on_change: the program must name a file, not a directory",
+            ),
+            (
+                "[\"bin/hook\"]",
+                "on_change: a program path must be absolute or start with `~/`; \
+                 a bare name is looked up in PATH",
+            ),
+            (
+                "[\"~bob/hook\"]",
+                "on_change: `~user` is not expanded: only `~` and `~/…` are; \
+                 for a file named like that, write `./~…`",
+            ),
+        ] {
+            let text = format!("[general]\non_change = {written}\n");
+            let err = parse(&text).expect_err("on_change is rejected");
+            assert_eq!((err.line, err.column), (2, 13), "{written}");
+            assert_eq!(err.message, message, "{written}");
+        }
+    }
+
+    #[test]
+    fn on_change_that_is_no_array_of_strings_is_rejected_where_it_stands() {
+        for (written, column) in [("\"notify-send\"", 13), ("[\"notify-send\", 3]", 29)] {
+            let text = format!("[general]\non_change = {written}\n");
+            let err = parse(&text).expect_err("on_change is rejected");
+            assert_eq!((err.line, err.column), (2, column), "{written}");
+        }
+    }
+
+    #[test]
+    fn on_change_in_a_style_table_is_rejected() {
+        let err = parse("[dark]\non_change = [\"true\"]\n").expect_err("general only");
 
         assert_eq!((err.line, err.column), (2, 1));
     }

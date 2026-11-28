@@ -28,6 +28,8 @@ apply_mode = "slots"             # "slots": rotate two slot files, keys written 
 max_pixels = 100_000_000         # skip images with more pixels (width x height)
 pause_when_locked = false        # stop the timers while the screen is locked
 favorites_dir = "~/Pictures/Favorites"  # optional; where `gpaperctl favorite` copies
+on_change = ["notify-send", "Wallpaper changed"]  # optional; runs, with no shell, when
+                                 # the image changes; GPAPERD_* variables describe it
 
 [light]
 sources = [

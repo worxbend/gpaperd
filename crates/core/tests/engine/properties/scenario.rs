@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gpaperd_core::catalog::ItemId;
 use gpaperd_core::config::{
-    Config, EmptyStylePolicy, ExternalChangePolicy, Order, PictureOptions, Source,
+    Config, EmptyStylePolicy, ExternalChangePolicy, HookCommand, Order, PictureOptions, Source,
 };
 use gpaperd_core::control::{Command, StyleTarget};
 use gpaperd_core::event::ScreenLock;
@@ -216,10 +216,10 @@ fn picture_options() -> impl Strategy<Value = Option<PictureOptions>> {
 pub fn config() -> impl Strategy<Value = Config> {
     let general = (any::<bool>(), any::<bool>(), policy(), picture_options());
     let styles = (order(), order(), 60_u64..=3600, 60_u64..=3600);
-    let switches = (any::<bool>(), any::<bool>());
+    let switches = (any::<bool>(), any::<bool>(), any::<bool>());
     (general, styles, switches).prop_map(|(general, styles, switches)| {
         let (rotate_hidden, keep_current, on_external_change, picture_options) = general;
-        let (pause_when_locked, has_favorites_dir) = switches;
+        let (pause_when_locked, has_favorites_dir, has_hook) = switches;
         let (light_order, dark_order, light_secs, dark_secs) = styles;
         let mut config = Config::default();
         config.general.rotate_hidden = rotate_hidden;
@@ -228,6 +228,12 @@ pub fn config() -> impl Strategy<Value = Config> {
         config.general.pause_when_locked = pause_when_locked;
         if has_favorites_dir {
             config.general.favorites_dir = Some(PathBuf::from("/home/u/favorites"));
+        }
+        if has_hook {
+            config.general.on_change = Some(HookCommand {
+                program: PathBuf::from("wallpaper-hook"),
+                args: Vec::new(),
+            });
         }
         if keep_current {
             config.general.empty_style = EmptyStylePolicy::KeepCurrent;

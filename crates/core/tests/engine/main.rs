@@ -10,6 +10,7 @@ mod external_changes;
 mod favorite;
 mod files;
 mod hidden_refresh;
+mod hook;
 mod keys;
 mod lifecycle;
 mod locked_keys;
