@@ -3,7 +3,7 @@
 
 use super::Turn;
 use crate::config::{Config, General, StyleConfig};
-use crate::event::Effect;
+use crate::event::{Effect, Tile};
 use crate::style::Style;
 
 impl Turn<'_> {
@@ -12,7 +12,9 @@ impl Turn<'_> {
     pub(super) fn reload(&mut self, new: Config) {
         self.model.partial_move = None;
         self.fail_listed_reloads();
+        let old_tile = self.model.wanted_tile();
         let old = self.model.replace_config(new);
+        self.follow_tile(old_tile);
         // Before `apply_mode` clears the wallpapers and refills: an empty
         // style must not borrow the other catalog for sources still to scan.
         for style in Style::ALL {
@@ -30,6 +32,15 @@ impl Turn<'_> {
         self.reload_remotes();
         // A new `empty_style` or `apply_mode` leaves a style to be filled.
         self.fill_empty_slots();
+    }
+
+    /// Offers or withdraws the Settings tile when the running config wants
+    /// another one than `old` did.
+    fn follow_tile(&mut self, old: Option<Tile>) {
+        let wanted = self.model.wanted_tile();
+        if let Some(tile) = wanted.filter(|&tile| Some(tile) != old) {
+            self.effects.push(Effect::Tile(tile));
+        }
     }
 
     pub(super) fn reload_general(&mut self, old: &General) {

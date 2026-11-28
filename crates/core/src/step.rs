@@ -106,8 +106,9 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///   [`Event::Control`] is answered with [`Reply::Failed`], and
 ///   [`Event::ScreenLock`] is recorded. A second `Started` is ignored.
 /// - [`Event::Started`]: ask for the scan and the watch of each style's
-///   sources with [`Effect::Watch`], record the visible style, and keep the
-///   snapshot's keys as the original keys unless restored state already has
+///   sources with [`Effect::Watch`], offer the Settings tile in slots mode
+///   or withdraw it in uri mode with [`Effect::Tile`], record the visible
+///   style, and keep the snapshot's keys as the original keys unless restored state already has
 ///   some, or a key names its slot file or a file in the remote cache
 ///   (`ModelInit::remote_cache_dir`). Then the first apply, per style, hidden or not: a slot that is
 ///   missing or has another inode than the restored one is still to be
@@ -257,11 +258,15 @@ pub const GC_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///     [`Effect::DropRemote`].
 ///   - Every other setting is read when it is needed.
 ///
+///   When `apply_mode` or `picture_options` changes what the Settings tile
+///   must offer, [`Effect::Tile`] offers or withdraws it as at start.
+///
 ///   Any reload ends the pause of an external change and writes back every
 ///   key that something else holds. A daemon that started without a config
 ///   file (`ModelInit::config` is `None`) runs on the default config, which
-///   has no sources, and leaves the slots and the keys alone: it idles
-///   until the first `Ok` brings a config. Then every slot that is not
+///   has no sources, and leaves the slots, the keys and the Settings tile
+///   alone: it idles until the first `Ok` brings a config. Then the tile is
+///   offered or withdrawn, and every slot that is not
 ///   known to hold its current item is filled, as at a start.
 /// - [`Event::CacheLoaded`]: the remote cache is known. Each style's
 ///   catalog gets one remote item per URL of its sources that has a blob,
@@ -516,6 +521,9 @@ impl Turn<'_> {
         self.model.visible = gnome.visible;
         self.model.picture_options_owed = picture_options;
         self.watch_sources();
+        if let Some(tile) = self.model.wanted_tile() {
+            self.effects.push(Effect::Tile(tile));
+        }
         let saved = self.model.persisted();
         self.adopt_keys(&gnome);
         if self.model.persisted() != saved {

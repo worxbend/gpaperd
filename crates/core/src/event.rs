@@ -366,6 +366,21 @@ pub enum Effect {
     /// it: nothing comes back. A failure to start it and a non-zero exit
     /// are logged.
     RunHook(HookRun),
+    /// Offer or withdraw gpaperd's tile in the wallpaper picker of GNOME
+    /// Settings. Each one is done after the one before it. No event comes
+    /// back; a failure is logged.
+    Tile(Tile),
+}
+
+/// gpaperd's tile in the wallpaper picker of GNOME Settings, for
+/// [`Effect::Tile`]. Picking it writes both slot URIs to the keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tile {
+    /// Offer the two slot files, shown with these picture options. Nothing
+    /// is written when the tile already offers exactly that.
+    Offer(PictureOptions),
+    /// Remove the tile, when gpaperd wrote it.
+    Withdraw,
 }
 
 /// One run of the `on_change` command for [`Effect::RunHook`].

@@ -424,7 +424,11 @@ impl Daemon {
                 self.next_change = status.next_change;
                 None
             }
-            Effect::Watch { .. } | Effect::Persist | Effect::Ready | Effect::Changed { .. } => None,
+            Effect::Watch { .. }
+            | Effect::Persist
+            | Effect::Ready
+            | Effect::Changed { .. }
+            | Effect::Tile(_) => None,
             Effect::Reply { .. }
             | Effect::ReadConfig(_)
             | Effect::RestoreKeys { .. }

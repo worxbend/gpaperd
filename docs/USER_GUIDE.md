@@ -332,6 +332,15 @@ If you choose a wallpaper in GNOME Settings, gpaperd pauses that style
 config reload writes gpaperd's image back. The pause also ends when the
 key points at gpaperd again.
 
+In the default `apply_mode = "slots"`, Settings lists gpaperd among its
+wallpapers as **gpaperd rotation**. Picking that tile points both keys at
+gpaperd's slot files again, which ends the pause, and sets the picture
+options to `picture_options` (or `zoom` when unset). gpaperd writes the
+tile at start and when a config reload changes `apply_mode` or
+`picture_options`; with `apply_mode = "uri"` it removes it. After
+`gpaperctl restore`, picking the tile shows gpaperd's images but rotation
+stays paused until `gpaperctl resume`.
+
 ## 6. Update
 
 Save and read the current script again, as in section 2.1, then run it.
@@ -354,7 +363,8 @@ sh install.sh --uninstall
 ```
 
 This puts your original wallpaper back (`gpaperctl restore`), stops and
-disables the unit, and removes the binaries, man pages and unit. Your config
+disables the unit, and removes the binaries, man pages, unit and gpaperd's
+tile in Settings. Your config
 and state stay; add `--purge` to remove them too, along with the slot files
 and the download cache. When gpaperd is running, `--purge` stops with an
 error if `gpaperctl restore` fails: the slot files it would delete are what
@@ -371,7 +381,8 @@ rm ~/.config/systemd/user/gpaperd.service \
     ~/.local/bin/gpaperd ~/.local/bin/gpaperctl \
     ~/.local/share/man/man1/gpaperd.1 \
     ~/.local/share/man/man1/gpaperctl.1 \
-    ~/.local/share/man/man5/gpaperd.toml.5
+    ~/.local/share/man/man5/gpaperd.toml.5 \
+    ~/.local/share/gnome-background-properties/gpaperd.xml
 systemctl --user daemon-reload
 ```
 

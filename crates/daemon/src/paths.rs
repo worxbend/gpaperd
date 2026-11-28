@@ -14,6 +14,9 @@ pub struct Paths {
     /// `$XDG_DATA_HOME/gpaperd/slots`. Under data, not cache, so a cache
     /// cleaner cannot blank the desktop.
     pub slots_dir: PathBuf,
+    /// `$XDG_DATA_HOME/gnome-background-properties/gpaperd.xml`: gpaperd's
+    /// tile in the wallpaper picker of GNOME Settings.
+    pub settings_tile: PathBuf,
     /// `$XDG_STATE_HOME/gpaperd/state.json`.
     pub state_file: PathBuf,
     /// `$XDG_CACHE_HOME/gpaperd/remote`: one directory per remote URL.
@@ -45,11 +48,11 @@ impl Paths {
         config_override: Option<&Path>,
     ) -> Result<Paths, PathsError> {
         let home_dir = absolute_dir(env, "HOME").ok_or(PathsError::NoHome)?;
-        let app_dir = |variable: &str, fallback: &str| {
-            absolute_dir(env, variable)
-                .unwrap_or_else(|| home_dir.join(fallback))
-                .join(APP_DIR_NAME)
+        let base_dir = |variable: &str, fallback: &str| {
+            absolute_dir(env, variable).unwrap_or_else(|| home_dir.join(fallback))
         };
+        let app_dir =
+            |variable: &str, fallback: &str| base_dir(variable, fallback).join(APP_DIR_NAME);
         let config_file = match config_override {
             Some(config_override) => config_override.to_path_buf(),
             None => app_dir("XDG_CONFIG_HOME", ".config").join("config.toml"),
@@ -57,6 +60,9 @@ impl Paths {
         Ok(Paths {
             config_file,
             slots_dir: app_dir("XDG_DATA_HOME", ".local/share").join("slots"),
+            settings_tile: base_dir("XDG_DATA_HOME", ".local/share")
+                .join("gnome-background-properties")
+                .join(SETTINGS_TILE_NAME),
             state_file: app_dir("XDG_STATE_HOME", ".local/state").join("state.json"),
             remote_cache_dir: app_dir("XDG_CACHE_HOME", ".cache").join("remote"),
             home_dir,
@@ -72,6 +78,9 @@ impl Paths {
 
 /// gpaperd's directory inside each XDG base directory.
 const APP_DIR_NAME: &str = "gpaperd";
+
+/// The file name of gpaperd's tile among GNOME Settings' wallpapers.
+const SETTINGS_TILE_NAME: &str = "gpaperd.xml";
 
 /// The directory a variable names, or `None` when the variable is unset,
 /// empty or relative.
@@ -106,6 +115,8 @@ mod tests {
             Paths {
                 config_file: "/home/u/.config/gpaperd/config.toml".into(),
                 slots_dir: "/home/u/.local/share/gpaperd/slots".into(),
+                settings_tile: "/home/u/.local/share/gnome-background-properties/gpaperd.xml"
+                    .into(),
                 state_file: "/home/u/.local/state/gpaperd/state.json".into(),
                 remote_cache_dir: "/home/u/.cache/gpaperd/remote".into(),
                 home_dir: "/home/u".into(),
@@ -130,6 +141,7 @@ mod tests {
             Paths {
                 config_file: "/x/config/gpaperd/config.toml".into(),
                 slots_dir: "/x/data/gpaperd/slots".into(),
+                settings_tile: "/x/data/gnome-background-properties/gpaperd.xml".into(),
                 state_file: "/x/state/gpaperd/state.json".into(),
                 remote_cache_dir: "/x/cache/gpaperd/remote".into(),
                 home_dir: "/home/u".into(),

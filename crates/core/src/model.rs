@@ -20,7 +20,7 @@ use crate::control::{
     BadItem, Direction, History, PartialMove, ReplyId, Request, STATUS_VERSION, StatusReport,
     StyleReport,
 };
-use crate::event::{BackgroundKeys, Favorite, Pause, ScreenLock, Status};
+use crate::event::{BackgroundKeys, Favorite, Pause, ScreenLock, Status, Tile};
 use crate::key::{KeyState, Reassert};
 use crate::ordering::{ShuffleBag, is_remote_id, next_alphabetical};
 use crate::remote::Remotes;
@@ -586,6 +586,22 @@ impl Model {
     /// since. Until one does, no slot and no key is touched.
     pub(crate) fn awaits_config(&self) -> bool {
         self.awaits_config
+    }
+
+    /// What the running config wants of the Settings tile: offered in slots
+    /// mode, with `picture_options` or else `zoom`, and withdrawn in uri
+    /// mode. `None` while the daemon awaits a config: it touches nothing.
+    pub(crate) fn wanted_tile(&self) -> Option<Tile> {
+        if self.awaits_config {
+            return None;
+        }
+        let general = &self.config.general;
+        Some(match general.apply_mode {
+            ApplyMode::Slots => {
+                Tile::Offer(general.picture_options.unwrap_or(PictureOptions::Zoom))
+            }
+            ApplyMode::Uri => Tile::Withdraw,
+        })
     }
 
     /// The URI that `style`'s key must hold: its slot's in slots mode, its

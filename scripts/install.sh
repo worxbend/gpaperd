@@ -29,8 +29,8 @@ Usage: install.sh [options]
                   (default: ~/.local)
   --start         enable and start the user unit even outside GNOME
   --no-start      install only; do not enable or start the unit
-  --uninstall     stop the unit and remove what this script installed;
-                  config, state and cache stay
+  --uninstall     stop the unit and remove what this script installed,
+                  and gpaperd's tile in Settings; config, state and cache stay
   --purge         with --uninstall: also remove config, state, slots, cache
   -h, --help      show this help
 EOF
@@ -233,8 +233,10 @@ uninstall() {
     if have_systemd; then
         systemctl --user disable --now gpaperd.service >/dev/null 2>&1 || true
     fi
+    # The daemon writes its Settings tile; without the daemon it is stale.
     rm -f "$unit" "$bin_dir/gpaperd" "$bin_dir/gpaperctl" \
-        "$man_dir/man1/gpaperd.1" "$man_dir/man1/gpaperctl.1" "$man_dir/man5/gpaperd.toml.5"
+        "$man_dir/man1/gpaperd.1" "$man_dir/man1/gpaperctl.1" "$man_dir/man5/gpaperd.toml.5" \
+        "$data_home/gnome-background-properties/gpaperd.xml"
     if have_systemd; then systemctl --user daemon-reload || true; fi
     if [ "$purge" -eq 1 ]; then
         remove_abs_trees "$config_home/gpaperd" "$data_home/gpaperd" \

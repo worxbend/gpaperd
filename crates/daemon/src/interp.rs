@@ -33,6 +33,7 @@ use gpaperd_core::config::{Config, ConfigError, LinkPolicy, Source};
 use gpaperd_core::control::{Command, ReplyId};
 use gpaperd_core::event::{
     BackgroundKeys, Effect, Event, Favorite, FetchOutcome, Fired, GnomeEvent, ScreenLock, Status,
+    Tile,
 };
 use gpaperd_core::model::{Model, ModelInit, Persisted};
 use gpaperd_core::step::step;
@@ -54,7 +55,7 @@ use crate::probe::Prober;
 use crate::scan::Scan;
 use crate::timer::WallTimer;
 use crate::watch::{SlotsWatch, SourceNews, SourceWatch};
-use crate::{favorites, fetch, slots, state};
+use crate::{favorites, fetch, settings_tile, slots, state};
 
 /// The wall clock and the one alarm set on it.
 ///
@@ -178,6 +179,8 @@ pub struct Interpreter<G, C> {
     saves: Saves,
     /// The runs of `on_change` that are still running.
     hooks: Hooks,
+    /// The last write of the Settings tile. The next one waits for it.
+    tile_write: Option<JoinHandle<()>>,
 }
 
 /// What a run starts from, as read from disk.
@@ -520,6 +523,7 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             pending: PendingReplies::default(),
             saves: Saves::default(),
             hooks: Hooks::default(),
+            tile_write: None,
         })
     }
 
@@ -566,7 +570,9 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
                 fired = self.ports.clock.wait() => Event::Fired(fired?),
                 Some(answer) = self.answers.recv() => answer,
                 fetched = self.fetches.next() => fetched,
-                change = gnome_events.recv() => Event::Gnome(change.ok_or(GnomeError::Stopped)?),
+                change = gnome_events.recv() => {
+                    Event::Gnome(slot_uris_in_event(change.ok_or(GnomeError::Stopped)?, &self.paths))
+                }
                 (style, news) = self.sources.next() => catalog_event(style, news),
                 style = self.slots_watch.lost() => Event::SlotLost(style),
                 Some(request) = self.ports.control.requests.recv() => self.control_event(request),
@@ -607,7 +613,8 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
     /// The first event: GNOME's state and the slot files as they are before
     /// the daemon changes anything.
     async fn started(&self) -> Result<Event, GnomeError> {
-        let gnome = self.ports.gnome.snapshot().await?;
+        let mut gnome = self.ports.gnome.snapshot().await?;
+        gnome.keys = slot_uris_as_written(gnome.keys, &self.paths);
         let slots = PerStyle::from_fn(|style| slot_on_disk(&self.paths.slot(style)));
         Ok(Event::Started { gnome, slots })
     }
@@ -735,8 +742,40 @@ impl<G: GnomePort, C: Clock> Interpreter<G, C> {
             Effect::RestoreKeys { id, keys } => self.restore_keys(id, keys, config_file).await?,
             Effect::SaveFavorites { id, dir, images } => self.save_favorites_later(id, dir, images),
             Effect::RunHook(run) => self.hooks.run(run, Instant::now()),
+            Effect::Tile(tile) => self.show_tile_later(tile),
         }
         Ok(())
+    }
+
+    /// Offers or withdraws the Settings tile on the blocking pool, once the
+    /// tile write before it has ended, so that the last one wins. Nothing
+    /// waits for it; the outcome is logged.
+    fn show_tile_later(&mut self, tile: Tile) {
+        let file = self.paths.settings_tile.clone();
+        // `$XDG_DATA_HOME/gpaperd`: next to the tile's folder, which Settings
+        // reads, so the rename stays on one file system.
+        let staging_dir = self
+            .paths
+            .slots_dir
+            .parent()
+            .expect("the slots directory is in gpaperd's data directory")
+            .to_path_buf();
+        let slots = PerStyle::from_fn(|style| self.paths.slot(style));
+        let earlier = self.tile_write.take();
+        self.tile_write = Some(tokio::spawn(async move {
+            if let Some(earlier) = earlier {
+                // It logged its own outcome.
+                let _ = earlier.await;
+            }
+            let path = file.clone();
+            let applied = tokio::task::spawn_blocking(move || match tile {
+                Tile::Offer(options) => settings_tile::offer(&file, &staging_dir, &slots, options),
+                Tile::Withdraw => settings_tile::withdraw(&file, &slots),
+            })
+            .await
+            .unwrap_or_else(|failure| Err(io::Error::other(failure.to_string())));
+            log_tile(&path, &applied);
+        }));
     }
 
     /// Copies the favorites on the blocking pool, and answers with exactly
@@ -1161,6 +1200,58 @@ fn slot_on_disk(slot: &Path) -> Option<FileId> {
 fn slot_uri(paths: &Paths, style: Style) -> String {
     // Only a relative path has no URI, and `Paths` holds absolute ones.
     slots::file_uri(&paths.slot(style)).expect("an absolute slots directory")
+}
+
+/// `event` with [`slot_uris_as_written`] in the keys it reports.
+fn slot_uris_in_event(event: GnomeEvent, paths: &Paths) -> GnomeEvent {
+    match event {
+        GnomeEvent::KeysChanged(keys) => GnomeEvent::KeysChanged(slot_uris_as_written(keys, paths)),
+        other => other,
+    }
+}
+
+/// `keys` with each URI that names a slot file spelled as the daemon writes
+/// it. Settings writes the URI that GLib makes of a file name of the tile,
+/// which escapes `[`, `]` and `|` where [`slots::file_uri`] does not: the
+/// same slot must not read as an external change.
+fn slot_uris_as_written(keys: BackgroundKeys, paths: &Paths) -> BackgroundKeys {
+    BackgroundKeys {
+        picture_uri: slot_uri_as_written(keys.picture_uri, paths),
+        picture_uri_dark: keys
+            .picture_uri_dark
+            .map(|uri| slot_uri_as_written(uri, paths)),
+        picture_options: keys.picture_options,
+    }
+}
+
+/// The daemon's URI of the slot file that `uri` names, or `uri` as it is
+/// when it names no slot file.
+fn slot_uri_as_written(uri: String, paths: &Paths) -> String {
+    let named_path = Url::parse(&uri)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok());
+    let Some(path) = named_path else {
+        return uri;
+    };
+    Style::ALL
+        .into_iter()
+        .find(|&style| path == paths.slot(style))
+        .map_or(uri, |style| slot_uri(paths, style))
+}
+
+/// Logs what a write of the Settings tile did.
+fn log_tile(file: &Path, applied: &io::Result<settings_tile::Outcome>) {
+    let path = file.display();
+    match applied {
+        Ok(settings_tile::Outcome::Written) => tracing::info!(%path, "Settings tile written"),
+        Ok(settings_tile::Outcome::Removed) => tracing::info!(%path, "Settings tile removed"),
+        Ok(settings_tile::Outcome::Unchanged | settings_tile::Outcome::Absent) => {}
+        Ok(settings_tile::Outcome::NotOurs) => {
+            tracing::warn!(%path, "Settings tile kept: gpaperd did not write it");
+        }
+        Err(error) => tracing::warn!(%path, reason = %error, "Settings tile not updated"),
+    }
 }
 
 /// Logs a control request. A `Set` or an `Unban` names its image as the

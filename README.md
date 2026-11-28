@@ -46,6 +46,8 @@ every slide's texture, and the order is fixed when the file is generated.
 - Wall-clock deadlines on a `timerfd`: correct across suspend and clock
   changes, and no polling.
 - When something else changes the wallpaper, gpaperd pauses by default.
+  Settings lists a **gpaperd rotation** tile; picking it hands the
+  wallpaper back to gpaperd.
 - The config file reloads on change, symlinked dotfiles included.
 - Optional pause while the screen is locked (`pause_when_locked`).
 - Ban an image you are tired of (`gpaperctl ban`), or copy one you like into
@@ -152,7 +154,7 @@ has every key with a comment. The full reference is `gpaperd.toml(5)`.
 | `empty_style` | `"use-other-style"` | A style with no usable image shows the other style's image, or `"keep-current"` |
 | `remote_refresh` | `"startup"` | Revalidate URLs once per start, every duration of at least `1h` (e.g. `"24h"`), or `"never"` |
 | `link` | `true` | Fill slots by hardlink or reflink when possible. `false` always copies |
-| `apply_mode` | `"slots"` | `"slots"` replaces two slot files. `"uri"` writes each image's URI to the keys |
+| `apply_mode` | `"slots"` | `"slots"` replaces two slot files and offers them as a tile in Settings. `"uri"` writes each image's URI to the keys, and removes that tile |
 | `max_pixels` | `100_000_000` | Skip images larger than this, width times height |
 | `pause_when_locked` | `false` | Stop the timers while the screen is locked (`org.gnome.ScreenSaver`). A change that fell due happens at unlock |
 | `favorites_dir` | unset | Where `gpaperctl favorite` copies the image on screen. A path, expanded as source paths are; created when missing. Unset, `favorite` fails |
@@ -283,6 +285,7 @@ of an id that is not banned is `InvalidArgs` too.
 | --- | --- |
 | `~/.config/gpaperd/config.toml` | Config |
 | `~/.local/share/gpaperd/slots/{light,dark}` | Slot files the keys point at. Under data, not cache, so a cache cleaner cannot blank the desktop |
+| `~/.local/share/gnome-background-properties/gpaperd.xml` | gpaperd's tile in the wallpaper picker of GNOME Settings, in slots mode only. Picking it points both keys at the slots |
 | `~/.local/state/gpaperd/state.json` | Current images, shuffle bags, deadlines, pauses, history, banned images, your original keys |
 | `~/.local/state/gpaperd/state.json.corrupt` | The last state file that could not be read. A newer one replaces it |
 | `~/.cache/gpaperd/remote/` | Downloaded images |
@@ -293,8 +296,9 @@ Each path follows the matching `XDG_*_HOME` variable when it is set.
 
 - **The wallpaper never changes.** Run `gpaperctl status`. A style marked
   `paused: external change` means something else set the wallpaper; run
-  `gpaperctl resume`. If status shows rotations but the screen does not
-  change, slot reloading does not work on your GNOME release: set
+  `gpaperctl resume`, or pick the **gpaperd rotation** tile in Settings.
+  If status shows rotations but the screen does not change, slot
+  reloading does not work on your GNOME release: set
   `apply_mode = "uri"`.
 - **The unit is skipped.** `systemctl --user status gpaperd` says the
   condition failed: `XDG_CURRENT_DESKTOP` does not contain `GNOME`.

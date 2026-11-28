@@ -24,6 +24,7 @@ mod rotation;
 mod schedule;
 mod screen_lock;
 mod set;
+mod settings_tile;
 mod sparse_styles;
 mod startup;
 mod support;

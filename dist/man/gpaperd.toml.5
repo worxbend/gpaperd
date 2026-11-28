@@ -125,12 +125,17 @@ always copies, so editing an original in place never changes the desktop.
 .BR apply_mode " = \(dqslots\(dq"
 .B slots
 points the background keys at two slot files once and rotates by replacing
-the files.
+the files, and offers them as the \(lqgpaperd rotation\(rq tile in the
+wallpaper picker of GNOME Settings, shown with
+.B picture_options
+or else
+.BR zoom .
 .B uri
 writes each image's own
 .B file://
 URI to the keys instead: the fallback for a GNOME release that does not
 reload a replaced slot file.
+It removes the tile.
 .TP
 .BR max_pixels " = 100_000_000"
 Skip images whose width times height is larger.

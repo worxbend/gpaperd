@@ -181,17 +181,26 @@ impl World {
     /// A world whose daemon checks images by their magic bytes only, with
     /// [`MagicBytesOnly`]: for every scenario that is not about decoding.
     pub fn new() -> World {
-        World::with_image_check(|| Arc::new(MagicBytesOnly))
+        World::with_image_check(|| Arc::new(MagicBytesOnly), ".tmp")
+    }
+
+    /// A world like [`World::new`] whose files are all in a folder whose
+    /// name starts with `prefix`: for a path that has more than one URI.
+    pub fn in_a_folder_named(prefix: &str) -> World {
+        World::with_image_check(|| Arc::new(MagicBytesOnly), prefix)
     }
 
     /// A world whose daemon decodes each image with glycin, as `main` does.
     /// For a scenario that needs a decode; it asks [`glycin_decodes`] first.
     pub fn decoding_with_glycin() -> World {
-        World::with_image_check(|| Arc::new(Prober::new()))
+        World::with_image_check(|| Arc::new(Prober::new()), ".tmp")
     }
 
-    fn with_image_check(image_check: fn() -> Arc<dyn ImageCheck>) -> World {
-        let temp_dir = tempfile::tempdir().expect("create a temp dir");
+    fn with_image_check(image_check: fn() -> Arc<dyn ImageCheck>, prefix: &str) -> World {
+        let temp_dir = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create a temp dir");
         let root = fs::canonicalize(temp_dir.path()).expect("the real path of the temp dir");
         let log = LogBook::default();
         let world = World {
@@ -251,6 +260,9 @@ impl World {
         Paths {
             config_file: self.root.join("config/gpaperd/config.toml"),
             slots_dir: self.root.join("data/gpaperd/slots"),
+            settings_tile: self
+                .root
+                .join("data/gnome-background-properties/gpaperd.xml"),
             state_file: self.root.join("state/gpaperd/state.json"),
             remote_cache_dir: self.root.join("cache/gpaperd/remote"),
             home_dir: self.root.clone(),
@@ -812,6 +824,13 @@ impl FakeGnome {
                 Style::Dark => keys.picture_uri_dark = Some(uri.to_owned()),
             }
         }
+        self.report(GnomeEvent::KeysChanged(self.keys()));
+    }
+
+    /// Puts `keys` in all background keys in one apply, as Settings does
+    /// when the user picks a tile with a light and a dark file.
+    pub fn set_keys_from_outside(&self, keys: BackgroundKeys) {
+        self.session.snapshot.borrow_mut().keys = keys;
         self.report(GnomeEvent::KeysChanged(self.keys()));
     }
 

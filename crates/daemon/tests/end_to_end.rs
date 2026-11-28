@@ -8,7 +8,8 @@
 //! Slots rows, `keys` its GNOME rows, `reload` its Config rows, `remote`
 //! its Remote rows and `time` its Time rows. `control` drives the D-Bus
 //! control interface on a private bus, and `screen_lock` a fake GNOME
-//! screen saver on one.
+//! screen saver on one. `settings_tile` has gpaperd's tile in the
+//! wallpaper picker of GNOME Settings.
 
 #[path = "end_to_end/bus.rs"]
 mod bus;
@@ -26,6 +27,8 @@ mod reload;
 mod remote;
 #[path = "end_to_end/screen_lock.rs"]
 mod screen_lock;
+#[path = "end_to_end/settings_tile.rs"]
+mod settings_tile;
 #[path = "end_to_end/time.rs"]
 mod time;
 #[path = "end_to_end/world.rs"]

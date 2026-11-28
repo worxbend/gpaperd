@@ -383,6 +383,7 @@ mod tests {
         let paths = Paths {
             config_file: dir.path().join("config.toml"),
             slots_dir: dir.path().join("slots"),
+            settings_tile: dir.path().join("gpaperd.xml"),
             state_file: dir.path().join("state.json"),
             remote_cache_dir: dir.path().join("remote"),
             home_dir: dir.path().to_path_buf(),

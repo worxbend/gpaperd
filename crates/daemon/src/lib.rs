@@ -14,6 +14,7 @@ pub mod paths;
 pub mod probe;
 pub mod scan;
 pub mod screensaver;
+pub mod settings_tile;
 pub mod slots;
 pub mod state;
 pub mod timer;

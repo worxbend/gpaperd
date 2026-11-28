@@ -261,6 +261,16 @@ pub enum PictureOptions {
 }
 
 impl PictureOptions {
+    /// Every value, in the order of the GSettings enum.
+    pub const ALL: [PictureOptions; 6] = [
+        PictureOptions::Wallpaper,
+        PictureOptions::Centered,
+        PictureOptions::Scaled,
+        PictureOptions::Stretched,
+        PictureOptions::Zoom,
+        PictureOptions::Spanned,
+    ];
+
     /// The GSettings enum nick, for example `"zoom"`.
     pub const fn as_str(self) -> &'static str {
         match self {

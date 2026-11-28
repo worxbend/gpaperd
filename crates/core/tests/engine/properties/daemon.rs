@@ -1288,6 +1288,13 @@ impl<'a> Daemon<'a> {
                 }
             }
             Effect::Persist | Effect::CollectGarbage { .. } => {}
+            Effect::Tile(_) => {
+                let is_start_or_reload = matches!(
+                    cause,
+                    Event::Started { .. } | Event::ConfigChanged(Ok(_)) | Event::ConfigRead { .. }
+                );
+                prop_assert!(is_start_or_reload, "{effect:?} without a start or a reload");
+            }
             Effect::Fetch(url) | Effect::DropRemote(url) => {
                 prop_assert!(false, "{url} is in no config, yet its fetch changed");
             }

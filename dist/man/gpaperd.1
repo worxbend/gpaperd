@@ -208,6 +208,17 @@ The config file; see
 .IR $XDG_DATA_HOME/gpaperd/slots/light ", " .../slots/dark
 The slot files the background keys point at.
 .TP
+.I $XDG_DATA_HOME/gnome\-background\-properties/gpaperd.xml
+gpaperd's tile in the wallpaper picker of GNOME Settings, named
+\(lqgpaperd rotation\(rq.
+Written at start and when a reload changes
+.B apply_mode
+or
+.B picture_options
+in slots mode; removed in uri mode.
+Picking it points both background keys at the slot files, which ends an
+external-change pause.
+.TP
 .I $XDG_STATE_HOME/gpaperd/state.json
 Current images, bags, cursors, deadlines, pauses, history and the user's
 original background keys.

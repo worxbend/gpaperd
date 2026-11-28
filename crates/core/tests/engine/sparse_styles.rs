@@ -1,7 +1,7 @@
 //! Styles with no image or a single one.
 
-use gpaperd_core::config::{Config, EmptyStylePolicy};
-use gpaperd_core::event::{Effect, Status};
+use gpaperd_core::config::{Config, EmptyStylePolicy, PictureOptions};
+use gpaperd_core::event::{Effect, Status, Tile};
 use gpaperd_core::style::{PerStyle, Style};
 
 use crate::support::{
@@ -105,9 +105,11 @@ fn two_empty_styles_on_a_first_run_leave_the_users_wallpaper_alone() {
         style,
         sources: Vec::new(),
     };
+    // The Settings tile changes no key.
     let nothing_but_the_watches = [
         watch(Style::Light),
         watch(Style::Dark),
+        Effect::Tile(Tile::Offer(PictureOptions::Zoom)),
         Effect::Ready,
         Effect::Report(idle),
     ];
